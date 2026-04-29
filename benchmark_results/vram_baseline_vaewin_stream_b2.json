@@ -1,0 +1,60 @@
+{
+  "config": "baseline_vaewin",
+  "mode": "stream",
+  "duration_s": 60.0,
+  "steps": 12,
+  "batch": 2,
+  "use_dream_vae": false,
+  "load_s": 20.41,
+  "phase": {
+    "avg_tick_ms": 254.45889997354243,
+    "vae_decode_s": null,
+    "batch": 2
+  },
+  "events": [
+    {
+      "label": "process_start",
+      "alloc_gb": 0.0,
+      "peak_alloc_gb": 0.0,
+      "reserved_gb": 0.0,
+      "peak_reserved_gb": 0.0
+    },
+    {
+      "label": "after_session_load",
+      "alloc_gb": 5.892,
+      "peak_alloc_gb": 7.288,
+      "reserved_gb": 7.312,
+      "peak_reserved_gb": 7.312
+    },
+    {
+      "label": "after_encode_text",
+      "alloc_gb": 5.901,
+      "peak_alloc_gb": 7.288,
+      "reserved_gb": 7.322,
+      "peak_reserved_gb": 7.322
+    },
+    {
+      "label": "stream_pipe_built",
+      "alloc_gb": 5.902,
+      "peak_alloc_gb": 7.288,
+      "reserved_gb": 7.322,
+      "peak_reserved_gb": 7.322
+    },
+    {
+      "label": "stream_warmed_up",
+      "alloc_gb": 5.902,
+      "peak_alloc_gb": 7.288,
+      "reserved_gb": 7.322,
+      "peak_reserved_gb": 7.322
+    },
+    {
+      "label": "stream_steady_state",
+      "alloc_gb": 5.902,
+      "peak_alloc_gb": 5.98,
+      "reserved_gb": 7.322,
+      "peak_reserved_gb": 7.322
+    }
+  ],
+  "gpu": "NVIDIA GeForce RTX 5050 Laptop GPU",
+  "total_vram_gb": 7.96
+}

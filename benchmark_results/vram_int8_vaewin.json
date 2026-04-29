@@ -1,0 +1,55 @@
+{
+  "config": "int8_vaewin",
+  "duration_s": 60.0,
+  "steps": 12,
+  "load_s": 34.41,
+  "warmup_generate_s": 356.53,
+  "generate_s": 2.9,
+  "vae_decode_s": 0.5,
+  "events": [
+    {
+      "label": "process_start",
+      "alloc_gb": 0.0,
+      "peak_alloc_gb": 0.0,
+      "reserved_gb": 0.0,
+      "peak_reserved_gb": 0.0
+    },
+    {
+      "label": "after_session_load",
+      "alloc_gb": 3.673,
+      "peak_alloc_gb": 5.07,
+      "reserved_gb": 5.094,
+      "peak_reserved_gb": 5.094
+    },
+    {
+      "label": "after_encode_text",
+      "alloc_gb": 3.682,
+      "peak_alloc_gb": 3.736,
+      "reserved_gb": 5.104,
+      "peak_reserved_gb": 5.104
+    },
+    {
+      "label": "after_generate_warmup",
+      "alloc_gb": 3.682,
+      "peak_alloc_gb": 3.756,
+      "reserved_gb": 5.104,
+      "peak_reserved_gb": 5.104
+    },
+    {
+      "label": "after_generate_timed",
+      "alloc_gb": 3.682,
+      "peak_alloc_gb": 3.741,
+      "reserved_gb": 5.104,
+      "peak_reserved_gb": 5.104
+    },
+    {
+      "label": "after_vae_decode",
+      "alloc_gb": 3.842,
+      "peak_alloc_gb": 4.5,
+      "reserved_gb": 5.344,
+      "peak_reserved_gb": 5.344
+    }
+  ],
+  "gpu": "NVIDIA GeForce RTX 5050 Laptop GPU",
+  "total_vram_gb": 7.96
+}
