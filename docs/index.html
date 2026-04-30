@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="title" content="DEMON - Diffusion Engine for Musical Orchestrated Noise">
+  <meta name="description" content="Real-time diffusion engine for interactive music generation. 102ms per tick, 25Hz per-frame control, runs on a single consumer GPU.">
+  <meta name="author" content="RyanOnTheInside">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="DEMON: Diffusion Engine for Musical Orchestrated Noise">
+  <meta property="og:description" content="Real-time diffusion engine for interactive music generation. 102ms per tick, 25Hz per-frame control, runs on a single consumer GPU.">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="DEMON: Diffusion Engine for Musical Orchestrated Noise">
+  <meta name="twitter:description" content="Real-time diffusion engine for interactive music generation. 102ms per tick, 25Hz per-frame control, runs on a single consumer GPU.">
+
+  <title>DEMON - Diffusion Engine for Musical Orchestrated Noise</title>
+
+  <link rel="icon" type="image/x-icon" href="static/images/favicon.ico">
+
+  <link rel="stylesheet" href="static/css/bulma.min.css">
+  <link rel="stylesheet" href="static/css/fontawesome.all.min.css">
+  <link rel="stylesheet" href="static/css/index.css">
+
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <script defer src="static/js/fontawesome.all.min.js"></script>
+
+<style>
+  /* Stat badges (kept from prior page) */
+  .stat-badges {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 0.6rem;
+    margin: 1.5rem 0 0.5rem;
+  }
+  .stat-badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    padding: 0.4rem 0.9rem; border-radius: 999px;
+    font-size: 0.82rem; font-weight: 600;
+    background: var(--background-accent, #f1f5f9);
+    border: 1px solid var(--border-color, #e2e8f0);
+    color: var(--text-primary, #1e293b);
+  }
+  .stat-badge .num {
+    color: var(--primary-color, #2563eb);
+    font-family: 'SF Mono', 'Monaco', monospace;
+    font-size: 0.88rem;
+  }
+
+  /* Demo video card */
+  .demo-card {
+    background: var(--background-primary, #fff);
+    border: 1px solid var(--border-color, #e2e8f0);
+    border-radius: var(--border-radius, 12px);
+    overflow: hidden;
+    box-shadow: var(--shadow-sm);
+    transition: var(--transition);
+    display: flex; flex-direction: column;
+    height: 100%;
+  }
+  .demo-card:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md);
+  }
+  .demo-card .demo-video {
+    background: #1e1e2e;
+    aspect-ratio: 16 / 9;
+    display: block; width: 100%;
+    object-fit: cover;
+  }
+  .demo-card .demo-video-placeholder {
+    background: #1e1e2e;
+    aspect-ratio: 16 / 9;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255,255,255,0.4);
+    font-family: 'SF Mono', 'Monaco', monospace;
+    font-size: 0.8rem;
+  }
+  .demo-card .demo-body {
+    padding: 1rem 1.1rem 1.15rem;
+    display: flex; flex-direction: column; flex: 1;
+  }
+  .demo-card .demo-title {
+    font-weight: 700; font-size: 1.05rem; margin-bottom: 0.25rem;
+    color: var(--text-primary, #1e293b);
+  }
+  .demo-card .demo-desc {
+    font-size: 0.88rem; color: var(--text-secondary, #64748b);
+    line-height: 1.5; margin-bottom: 0.6rem;
+  }
+  .demo-card .demo-link {
+    font-size: 0.82rem; font-weight: 600; margin-top: auto;
+  }
+
+  /* Code block for install snippet */
+  .install-block {
+    background: #1e1e2e; color: #e2e8f0;
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    font-family: 'SF Mono', 'Monaco', monospace;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    overflow-x: auto;
+  }
+  .install-block .prompt { color: rgba(255,255,255,0.4); user-select: none; }
+  .install-block .comment { color: #94a3b8; }
+</style>
+</head>
+
+<body>
+
+<main id="main-content">
+
+<!-- ============================================================ -->
+<!-- HERO                                                          -->
+<!-- ============================================================ -->
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h1 class="title is-1 publication-title">DEMON</h1>
+          <h2 class="subtitle is-4" style="color:var(--text-secondary); margin-top:-0.5rem">
+            Diffusion Engine for Musical Orchestrated Noise
+          </h2>
+
+          <p class="is-size-5" style="max-width:680px; margin:1.25rem auto 0; color:var(--text-secondary)">
+            A real-time diffusion engine for interactive music generation. Twist a knob, hear the change in the next 102 milliseconds.
+          </p>
+
+          <div class="stat-badges">
+            <span class="stat-badge"><span class="num">102ms</span> per tick</span>
+            <span class="stat-badge"><span class="num">12.3</span> gen/s</span>
+            <span class="stat-badge"><span class="num">25Hz</span> per-frame control</span>
+            <span class="stat-badge">consumer GPU</span>
+          </div>
+
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <span class="link-block">
+                <a href="https://github.com/RyanOnTheInside/DEMON" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fab fa-github"></i></span>
+                  <span>GitHub</span>
+                </a>
+              </span>
+              <span class="link-block">
+                <a href="https://pypi.org/project/demon-engine/" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fab fa-python"></i></span>
+                  <span>PyPI</span>
+                </a>
+              </span>
+              <span class="link-block">
+                <a href="#" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fas fa-file-pdf"></i></span>
+                  <span>Paper</span>
+                </a>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- WHAT IT IS                                                    -->
+<!-- ============================================================ -->
+<section class="section hero is-light">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">What it is</h2>
+        <div class="content has-text-centered" style="font-size:1.05rem">
+          <p>
+            DEMON wraps the ACE-Step v1.5 model with a streaming pipeline that produces one finished generation every <strong>~80 milliseconds</strong> on an RTX 5090, and exposes denoising as a per-frame control surface at <strong>25Hz</strong>. Six per-frame curves (velocity, SDE source blending, guidance, noise injection, init mixing, latent morphing) replace the usual scalar parameters, so you can shape an entire generation continuously instead of picking one number.
+          </p>
+          <p>
+            The result is something close to a synthesizer for diffusion: a MIDI knob, webcam motion, or any 25Hz signal can drive the generation while it plays. Same model, same weights as ACE-Step. New engine around them.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- LIVE DEMOS                                                    -->
+<!-- ============================================================ -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3 has-text-centered">See it in action</h2>
+    <p class="content has-text-centered" style="margin-bottom:2rem; color:var(--text-secondary)">
+      Three ways to drive the engine.
+    </p>
+
+    <div class="columns is-multiline">
+      <div class="column is-4">
+        <div class="demo-card">
+          <video class="demo-video" autoplay muted loop playsinline preload="metadata" poster="">
+            <source src="static/videos/midi_demo.mp4" type="video/mp4">
+          </video>
+          <div class="demo-body">
+            <div class="demo-title">Live MIDI Performance</div>
+            <div class="demo-desc">Hardware MIDI knobs drive denoise strength, SDE curves, guidance, and shift in real time. Your physical controller becomes a diffusion synth.</div>
+            <a class="demo-link" href="https://github.com/RyanOnTheInside/DEMON#live-demo-midi-controlled-generation">See the docs &rarr;</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="column is-4">
+        <div class="demo-card">
+          <video class="demo-video" autoplay muted loop playsinline preload="metadata" poster="">
+            <source src="static/videos/web_demo.mp4" type="video/mp4">
+          </video>
+          <div class="demo-body">
+            <div class="demo-title">Browser Web App</div>
+            <div class="demo-desc">No install on the client side. Web MIDI, webcam motion, and an audio-reactive WebGL background. Connects to a remote GPU server.</div>
+            <a class="demo-link" href="https://github.com/RyanOnTheInside/DEMON/tree/main/demos/realtime_motion_graph_web">See the docs &rarr;</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="column is-4">
+        <div class="demo-card">
+          <video class="demo-video" autoplay muted loop playsinline preload="metadata" poster="">
+            <source src="static/videos/vst_demo.mp4" type="video/mp4">
+          </video>
+          <div class="demo-body">
+            <div class="demo-title">VST Plugin</div>
+            <div class="demo-desc">Run DEMON inside your DAW. Generation reacts to playback in real time, automatable with whatever you already use to control plugins.</div>
+            <a class="demo-link" href="#">Coming soon</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- QUICK START                                                   -->
+<!-- ============================================================ -->
+<section class="section hero is-light">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3 has-text-centered">Quick start</h2>
+        <p class="content has-text-centered" style="margin-bottom:1.5rem; color:var(--text-secondary)">
+          Requires Python 3.11 and a CUDA GPU. ACE-Step weights download automatically on first run.
+        </p>
+
+        <div class="install-block">
+<span class="comment"># clone and install</span>
+<span class="prompt">$</span> git clone https://github.com/RyanOnTheInside/DEMON
+<span class="prompt">$</span> cd DEMON
+<span class="prompt">$</span> uv sync
+
+<span class="comment"># launch the realtime MIDI demo</span>
+<span class="prompt">$</span> uv run python -m demos.realtime_motion_graph --midi --audio source.wav
+        </div>
+
+        <p class="content has-text-centered" style="margin-top:1.5rem; color:var(--text-secondary); font-size:0.9rem">
+          Full setup, TensorRT engine builds, and the Session API are documented in the
+          <a href="https://github.com/RyanOnTheInside/DEMON#readme">repo README</a>.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<!-- ACKNOWLEDGMENTS                                               -->
+<!-- ============================================================ -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Acknowledgments</h2>
+        <div class="content" style="font-size:1rem">
+          <p>
+            DEMON is built on top of <a href="https://github.com/ace-step/ACE-Step" target="_blank">ACE-Step</a>. The base diffusion model, VAE, text encoder, and 5Hz LM are all ACE-Step's work &mdash; without them, none of this exists. Huge thanks to the ACE-Step team for releasing the v1.5 weights and code under MIT.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="footer">
+  <div class="container">
+    <div class="columns is-centered">
+      <div class="column is-8">
+        <div class="content has-text-centered" style="font-size:0.85rem; color:var(--text-secondary)">
+          <p>
+            DEMON is released under the MIT license. Built on
+            <a href="https://github.com/ace-step/ACE-Step" target="_blank">ACE-Step</a>,
+            also MIT.
+          </p>
+          <p>
+            Page template adapted from the
+            <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank">Academic Project Page Template</a>
+            (CC BY-SA 4.0).
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

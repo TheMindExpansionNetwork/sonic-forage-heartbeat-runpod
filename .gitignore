@@ -6,6 +6,12 @@
 *.mov
 *.webm
 
+# Project page assets need to ship with the docs/ site
+!docs/**/*.wav
+!docs/**/*.mp3
+!docs/**/*.mp4
+!docs/**/*.webm
+
 # Model weights, checkpoints, and inference blobs
 *.pt
 *.pth
