@@ -383,6 +383,16 @@ class StreamVAEDecode(BaseNode):
                     description="Ambient audio playhead injected by host",
                     hidden=True,
                 ),
+                NodeParam(
+                    name="cyclic", type="boolean", default=False,
+                    description=(
+                        "Treat the latent as cyclic: pull missing left/right "
+                        "context from the opposite end of the latent instead "
+                        "of clamping. Use only when the audio is intended to "
+                        "loop, otherwise the song's tail will bleed into the "
+                        "head's decode through the VAE receptive field."
+                    ),
+                ),
             ),
         )
 
@@ -396,6 +406,7 @@ class StreamVAEDecode(BaseNode):
         playhead_seconds = kwargs.get("playhead_seconds")
         mse_skip_threshold = float(kwargs.get("mse_skip_threshold", 1e-3))
         prefetch_seconds = float(kwargs.get("prefetch_seconds", 1.0))
+        cyclic = bool(kwargs.get("cyclic", False))
 
         use_playhead = (
             follow_playhead
@@ -455,8 +466,9 @@ class StreamVAEDecode(BaseNode):
         # Playhead-follow clamp: the demo does
         # ``t_pos = min(t_pos, eff_dur - vae_window)`` to keep the
         # window inside the latent; frame-quantization below already
-        # handles the floor.
-        if use_playhead:
+        # handles the floor. In cyclic mode we let the playhead reach
+        # the end and rely on wrapped context for the right margin.
+        if use_playhead and not cyclic:
             max_t = max(0.0, (T / self.FRAMES_PER_SEC) - window_s)
             t_start = min(t_start, max_t)
 
@@ -464,15 +476,35 @@ class StreamVAEDecode(BaseNode):
         keep_end = min(T, keep_start + win_frames)
         keep_start = max(0, keep_end - win_frames)
 
-        decode_start = max(0, keep_start - ovl_frames)
-        decode_end = min(T, keep_end + ovl_frames)
+        if cyclic:
+            # Pull missing context from the opposite end so boundary
+            # frames see a full receptive field, instead of clamping to
+            # zero context (which makes frame 0 / frame T-1 sound less
+            # denoised than every interior frame).
+            decode_start = keep_start - ovl_frames
+            decode_end = keep_end + ovl_frames
+            pieces = []
+            if decode_start < 0:
+                pieces.append(tensor[:, T + decode_start:, :])
+                pieces.append(tensor[:, :decode_end, :])
+            elif decode_end > T:
+                pieces.append(tensor[:, decode_start:, :])
+                pieces.append(tensor[:, :decode_end - T, :])
+            else:
+                pieces.append(tensor[:, decode_start:decode_end, :])
+            chunk_lat = Latent(tensor=torch.cat(pieces, dim=1).contiguous())
+            pre_margin_frames = ovl_frames
+        else:
+            decode_start = max(0, keep_start - ovl_frames)
+            decode_end = min(T, keep_end + ovl_frames)
+            chunk_lat = Latent(
+                tensor=tensor[:, decode_start:decode_end, :].contiguous()
+            )
+            pre_margin_frames = keep_start - decode_start
 
-        chunk_lat = Latent(
-            tensor=tensor[:, decode_start:decode_end, :].contiguous()
-        )
         chunk_audio = VAEDecodeAudio().execute(vae=vae, latent=chunk_lat)["audio"]
 
-        pre_margin = (keep_start - decode_start) * self.SAMPLES_PER_FRAME
+        pre_margin = pre_margin_frames * self.SAMPLES_PER_FRAME
         keep_samples = (keep_end - keep_start) * self.SAMPLES_PER_FRAME
         trimmed = chunk_audio.waveform[:, :, pre_margin:pre_margin + keep_samples]
 

@@ -408,7 +408,7 @@ class Session:
     # Decoding
     # ------------------------------------------------------------------
 
-    def decode(self, latent: Latent, t_start: float = 0.0) -> Audio:
+    def decode(self, latent: Latent, t_start: float = 0.0, cyclic: bool = False) -> Audio:
         """VAE decode latent to audio waveform.
 
         Always routes through :class:`StreamVAEDecode`, which collapses
@@ -422,6 +422,11 @@ class Session:
             t_start: When ``vae_window`` > 0, the start time (seconds)
                 of the window to decode. Ignored when ``vae_window``
                 is 0.
+            cyclic: When ``vae_window`` > 0 and the audio is meant to
+                loop, pull the boundary context from the opposite end
+                of the latent so frames near 0 and T-1 don't lose
+                receptive-field context. Off by default — only enable
+                for callers whose audio is genuinely cyclic.
         """
         from acestep.nodes.vae_nodes import StreamVAEDecode
 
@@ -431,6 +436,7 @@ class Session:
             vae_window=self._vae_window,
             vae_overlap=self._vae_overlap,
             t_start=t_start,
+            cyclic=cyclic,
         )["audio"]
 
     # ------------------------------------------------------------------
