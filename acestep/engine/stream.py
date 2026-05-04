@@ -838,6 +838,12 @@ class StreamPipeline:
              ``v_blended``), :func:`ode_steps.step_sde_curve`, or
              :func:`ode_steps.step_sde_renoise`.
         """
+        # Advance the feature bank's frame counter once per tick.
+        # ``cache_interval`` gates fire on this; without it, the bank
+        # writes on every forward and ``cache_interval`` is a no-op.
+        if self._feature_bank is not None:
+            self._feature_bank.tick()
+
         # --- Per-slot preprocessing ---
         # Two tensors per slot:
         #   xt_mask      : mask_pre_blend applied (or raw xt if no mask).
@@ -1209,27 +1215,35 @@ class StreamPipeline:
         self,
         layer_indices: Optional[Tuple[int, ...]] = None,
         strength: float = 1.0,
+        cache_depth: int = 1,
+        cache_interval: int = 4,
+        fi_enabled: bool = True,
+        fi_strength: float = 0.8,
+        fi_threshold: float = 0.98,
+        fi_layers: Optional[Tuple[int, ...]] = None,
+        tome_enabled: bool = False,
+        tome_ratio: float = 0.5,
     ) -> "FeatureBank":
-        """Install the feature-bank patch on the PyTorch decoder.
+        """Install the StreamV2V-faithful feature bank on the PyTorch decoder.
 
-        ``strength`` controls how much softmax mass the banked tokens
-        receive relative to current K/V. 1.0 = equal weighting (raw
-        concat); 0.5 = banked positions get half the weight current
-        would; 0.0 = bank fully masked out. Hot-updatable via
-        ``pipe.feature_bank.strength = ...`` between ticks.
+        Defaults mirror StreamV2V's ``utils/wrapper.py``:
+        ``cache_maxframes=1`` (-> ``cache_depth=1``), ``cache_interval=4``,
+        FF on at ``α=0.8`` / ``threshold=0.98``, ToMe off.
+
+        ``strength`` is our extension to StreamV2V's raw-concat behavior:
+        an additive log-bias on the bank columns. ``1.0`` = raw concat
+        (StreamV2V semantics), ``0.0`` = bank fully masked out.
+        Hot-updatable via ``pipe.feature_bank.strength = ...``.
 
         Refuses when a TRT engine is loaded -- the eager bank path
         requires the PyTorch decoder. The decoder must also not be
         ``torch.compile``'d at install time; compile after if needed.
 
         ``num_steps`` for the bank's step axis is taken from
-        ``config.infer_steps``, which equals the number of forward
-        passes per slot (slots at step_idx == infer_steps are
-        evicted before forward). Bank tensors are lazy-allocated on
+        ``config.infer_steps``. Bank tensors are lazy-allocated on
         first forward.
 
-        Returns the ``FeatureBank`` for ``reset()`` / ``strength``
-        / ``num_entries()`` access.
+        Returns the ``FeatureBank`` for further hot-tuning.
         """
         if self._trt_engine is not None:
             raise RuntimeError(
@@ -1238,14 +1252,23 @@ class StreamPipeline:
                 "before enabling."
             )
         from .feature_bank import (
-            FeatureBank, DEFAULT_BANKED_LAYERS,
+            FeatureBank, DEFAULT_BANKED_LAYERS, DEFAULT_FF_LAYERS,
             enable_feature_bank_on_decoder,
         )
         layers = layer_indices if layer_indices is not None else DEFAULT_BANKED_LAYERS
+        ff_layers = fi_layers if fi_layers is not None else DEFAULT_FF_LAYERS
         bank = FeatureBank(
             banked_layers=tuple(layers),
             num_steps=self.config.infer_steps,
+            cache_depth=cache_depth,
+            cache_interval=cache_interval,
             strength=strength,
+            fi_enabled=fi_enabled,
+            fi_strength=fi_strength,
+            fi_threshold=fi_threshold,
+            fi_layers=tuple(ff_layers),
+            tome_enabled=tome_enabled,
+            tome_ratio=tome_ratio,
         )
         enable_feature_bank_on_decoder(self.decoder, bank)
         self._feature_bank = bank

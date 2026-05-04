@@ -196,6 +196,10 @@ class PipelineRunner:
         last_channel_gains = [1.0] * (len(CHANNEL_GROUPS) + len(KEYSTONE_CHANNELS))
         last_bank_strength = -1.0  # force first-tick apply
         last_bank_clear_seq = 0
+        last_bank_cache_depth = -1  # forces a set_cache_depth on first apply
+        last_bank_cache_interval = -1
+        last_bank_fi_strength = -1.0
+        last_bank_fi_threshold = -1.0
         current_shift = self.stream.base_kwargs["shift"]
         prev_src_T = self.stream.source.latent.tensor.shape[1]
 
@@ -219,6 +223,17 @@ class PipelineRunner:
                 last_wav = None
                 last_decode_pos = None
                 prev_src_T = cur_src_T
+                # Bank tensors are sized to the source's T; on a song
+                # swap the new T won't match. ``reset()`` drops the
+                # storage dicts so the next forward re-allocates at
+                # the new shape (and clears any prior song's K/V).
+                bank_pipe_for_T = getattr(self.stream, "pipeline", None)
+                bank_for_T = (
+                    getattr(bank_pipe_for_T, "feature_bank", None)
+                    if bank_pipe_for_T is not None else None
+                )
+                if bank_for_T is not None:
+                    bank_for_T.reset()
             if self.use_midi:
                 raw = self.midi_knobs.get_all_values()
             else:
@@ -285,17 +300,55 @@ class PipelineRunner:
 
             bank = getattr(bank_pipe, "feature_bank", None) if bank_pipe is not None else None
             if bank is not None:
+                # Strength: continuous, hot-update via property setter.
                 bank_str = self.midi_knobs.get_param("bank_strength") if self.use_midi else 0.0
                 if abs(bank_str - last_bank_strength) > 0.02:
                     last_bank_strength = bank_str
                     bank.strength = float(bank_str)
+                # On/off + freeze (write_enabled): bool toggles.
                 want_enabled = bool(raw.get("bank_enabled", True))
                 if want_enabled != bank.enabled:
                     bank.enabled = want_enabled
+                want_freeze = bool(raw.get("bank_freeze", False))
+                want_write = not want_freeze
+                if want_write != bank.write_enabled:
+                    bank.write_enabled = want_write
+                # Clear button: monotonic seq, server resets when it advances.
                 clear_seq = int(raw.get("bank_clear_seq", 0))
                 if clear_seq != last_bank_clear_seq:
                     last_bank_clear_seq = clear_seq
                     bank.reset()
+                # Cache depth: storage-bound. ``set_cache_depth`` clears
+                # state and forces re-allocation on next forward.
+                want_depth = int(raw.get("bank_cache_depth", bank.cache_depth))
+                if want_depth != last_bank_cache_depth:
+                    last_bank_cache_depth = want_depth
+                    try:
+                        bank.set_cache_depth(want_depth)
+                    except Exception as exc:
+                        print(f"[Pipeline] WARNING: set_cache_depth failed: {exc}")
+                # Cache interval: simple int field, no realloc.
+                want_interval = max(1, int(raw.get("bank_cache_interval", bank.cache_interval)))
+                if want_interval != last_bank_cache_interval:
+                    last_bank_cache_interval = want_interval
+                    bank.cache_interval = want_interval
+                # Feature Fusion knobs.
+                want_fi_enabled = bool(raw.get("bank_fi_enabled", bank.fi_enabled))
+                if want_fi_enabled != bank.fi_enabled:
+                    bank.fi_enabled = want_fi_enabled
+                fi_str = float(raw.get("bank_fi_strength", bank.fi_strength))
+                if abs(fi_str - last_bank_fi_strength) > 0.01:
+                    last_bank_fi_strength = fi_str
+                    bank.fi_strength = fi_str
+                fi_thr = float(raw.get("bank_fi_threshold", bank.fi_threshold))
+                if abs(fi_thr - last_bank_fi_threshold) > 0.01:
+                    last_bank_fi_threshold = fi_thr
+                    bank.fi_threshold = fi_thr
+                # ToMe toggle (ratio is fixed at 0.5 since the merge
+                # only resolves to T cleanly at that ratio).
+                want_tome = bool(raw.get("bank_tome_enabled", bank.tome_enabled))
+                if want_tome != bank.tome_enabled:
+                    bank.tome_enabled = want_tome
 
             noise_sharing = self.midi_knobs.get_param("noise_share") if self.use_midi else 0.0
 
