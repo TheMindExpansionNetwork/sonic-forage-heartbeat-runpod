@@ -17,10 +17,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from acestep.paths import (
     EngineNotBuiltError,
-    _TRT_ENGINE_PROFILES,
     available_trt_engines,
+    max_profile_duration_s,
     select_trt_engines,
+    smallest_fitting_profile_duration_s,
     trt_engine_path,
+    trt_engine_profiles,
 )
 
 
@@ -33,9 +35,14 @@ def tmp_models_dir(monkeypatch, tmp_path):
     return tmp_path
 
 
-def _create_engine_files(tmp_path: Path, max_dur: float, keys: tuple[str, ...]) -> None:
+def _create_engine_files(
+    tmp_path: Path,
+    max_dur: float,
+    keys: tuple[str, ...],
+    checkpoint: str = "acestep-v15-turbo",
+) -> None:
     """Create empty engine files for one profile so existence checks pass."""
-    profile = _TRT_ENGINE_PROFILES[max_dur]
+    profile = trt_engine_profiles(checkpoint)[max_dur]
     for k in keys:
         engine_name = profile[k]
         engine_path = trt_engine_path(engine_name)
@@ -80,6 +87,28 @@ class TestSelectTrtEngines:
         paths = select_trt_engines(duration_s=10_000.0)
         assert "_240s" in paths["decoder"]
 
+    def test_picks_xl_decoder_for_xl_checkpoint(self):
+        paths = select_trt_engines(
+            duration_s=30.0,
+            checkpoint="acestep-v15-xl-turbo",
+        )
+        assert "decoder_xl-turbo_mixed_refit_b1_60s" in paths["decoder"]
+        assert "vae_encode_fp16_60s" in paths["vae_encode"]
+
+    def test_xl_checkpoint_has_120s_max_profile(self):
+        assert max_profile_duration_s(checkpoint="acestep-v15-xl-turbo") == 120.0
+        assert smallest_fitting_profile_duration_s(
+            80.0,
+            checkpoint="acestep-v15-xl-turbo",
+        ) == 120.0
+
+    def test_unknown_checkpoint_is_rejected(self):
+        with pytest.raises(ValueError, match="No canonical TRT engine profiles"):
+            select_trt_engines(
+                duration_s=30.0,
+                checkpoint="acestep-v15-xl-base",
+            )
+
 
 # -----------------------------------------------------------------------
 # available_trt_engines: existence-aware picker (IO)
@@ -99,6 +128,20 @@ class TestAvailableTrtEnginesHappyPath:
             _create_engine_files(tmp_models_dir, d, keys=("decoder", "vae_encode", "vae_decode"))
         _, picked = available_trt_engines(duration_s=119.0)
         assert picked == 120.0
+
+    def test_xl_checkpoint_uses_xl_decoder_profiles(self, tmp_models_dir):
+        _create_engine_files(
+            tmp_models_dir,
+            120.0,
+            keys=("decoder", "vae_encode", "vae_decode"),
+            checkpoint="acestep-v15-xl-turbo",
+        )
+        paths, picked = available_trt_engines(
+            duration_s=80.0,
+            checkpoint="acestep-v15-xl-turbo",
+        )
+        assert picked == 120.0
+        assert "decoder_xl-turbo_mixed_refit_b1_120s" in paths["decoder"]
 
 
 class TestAvailableTrtEnginesFallback:
@@ -140,6 +183,19 @@ class TestAvailableTrtEnginesNeedsParameter:
         )
         assert picked == 60.0
 
+    def test_vae_only_session_uses_shared_profiles_for_unregistered_checkpoint(
+        self,
+        tmp_models_dir,
+    ):
+        _create_engine_files(tmp_models_dir, 60.0, keys=("vae_encode", "vae_decode"))
+        paths, picked = available_trt_engines(
+            duration_s=30.0,
+            needs=("vae_encode", "vae_decode"),
+            checkpoint="acestep-v15-xl-base",
+        )
+        assert picked == 60.0
+        assert "vae_encode_fp16_60s" in paths["vae_encode"]
+
 
 # -----------------------------------------------------------------------
 # EngineNotBuiltError: actionable build command
@@ -169,3 +225,18 @@ class TestEngineNotBuiltError:
             available_trt_engines(duration_s=80.0, needs=("decoder",))
         assert excinfo.value.duration_s == 80.0
         assert excinfo.value.needs == ("decoder",)
+
+    def test_xl_missing_engine_recommends_xl_build_command(self, tmp_models_dir):
+        with pytest.raises(EngineNotBuiltError) as excinfo:
+            available_trt_engines(
+                duration_s=30.0,
+                needs=("decoder",),
+                checkpoint="acestep-v15-xl-turbo",
+            )
+        command = excinfo.value.build_command
+        assert command is not None
+        assert "--checkpoint acestep-v15-xl-turbo" in command
+        assert "--decoder-only" in command
+        assert "--duration 60" in command
+        assert "--batch-max 1" in command
+        assert "--decoder-precision bf16_mixed" in command

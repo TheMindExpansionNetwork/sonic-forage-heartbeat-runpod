@@ -119,7 +119,7 @@ checkpoint-specific. VAE ONNX is shared across DiT variants.
   - User-facing API that wires TRT backends into a `Session`.
 
 - `acestep/paths.py`
-  - Canonical 2B engine profile registration and path helpers.
+  - Canonical 2B and XL turbo engine profile registration and path helpers.
 
 ## Build Script Basics
 
@@ -407,7 +407,11 @@ uv run python -u -m demos.realtime_motion_graph_web --port 8765 --accel eager --
 connection time. It measures the uploaded or fixture audio duration, then calls:
 
 ```python
-available_trt_engines(duration_s=audio_duration_s, needs=tuple(needs))
+available_trt_engines(
+    duration_s=audio_duration_s,
+    needs=tuple(needs),
+    checkpoint=checkpoint,
+)
 ```
 
 `needs` is based on the selected backends:
@@ -415,15 +419,14 @@ available_trt_engines(duration_s=audio_duration_s, needs=tuple(needs))
 - `decoder_backend == "tensorrt"` requires `decoder`.
 - `vae_backend == "tensorrt"` requires `vae_encode` and `vae_decode`.
 
-The picker walks the canonical profiles in `acestep.paths._TRT_ENGINE_PROFILES`
-and selects the smallest built profile that can fit the audio duration. If the
+The picker walks the canonical profile set for the selected checkpoint and
+selects the smallest built profile that can fit the audio duration. If the
 smallest fitting profile is missing, it can fall back to the next larger built
 profile and logs a warning about extra VRAM cost. If no suitable built profile
 exists, the server sends an `engine_not_built` error to the UI and closes the
 WebSocket.
 
-Important: the automatic picker currently points at the canonical 2B turbo
-engine names:
+For `acestep-v15-turbo`, the decoder profiles are:
 
 ```text
 decoder_mixed_refit_b8_60s
@@ -433,11 +436,19 @@ vae_encode_fp16_*
 vae_decode_fp16_*
 ```
 
-So the realtime demo's automatic TensorRT mode is currently for
-`acestep-v15-turbo` unless the path registry is extended for XL. Do not launch
-the web demo with `--checkpoint acestep-v15-xl-turbo --accel tensorrt` and
-assume it will automatically pick `decoder_xl-turbo_mixed_refit_b1_*`; that
-mapping is not registered in `acestep.paths._TRT_ENGINE_PROFILES` yet.
+For `acestep-v15-xl-turbo`, the decoder profiles are:
+
+```text
+decoder_xl-turbo_mixed_refit_b1_60s
+decoder_xl-turbo_mixed_refit_b1_120s
+vae_encode_fp16_*
+vae_decode_fp16_*
+```
+
+VAE engines are shared across the 2B and XL turbo checkpoints. The demo caps
+incoming audio at the largest registered profile for the selected checkpoint
+before engine selection, so XL TRT mode currently accepts audio up to the
+registered 120s XL profile.
 
 ### Recommended 2B Turbo Demo Flow
 
@@ -492,30 +503,39 @@ use DreamVAE as the TRT VAE decode engine when a matching DreamVAE engine is
 built; otherwise it logs a warning and falls back to the standard VAE decode
 engine.
 
-### Using XL With The Demo Today
+### Recommended XL Turbo Demo Flow
 
-XL TRT decoder engines have been built and validated, but the realtime demo
-does not yet expose CLI flags for explicit engine paths and does not yet have
-XL profiles registered in `acestep.paths._TRT_ENGINE_PROFILES`.
-
-Today, use XL TRT through `Session` directly with explicit engine paths, as
-shown above. To make XL first-class in the web demo, add one of these:
-
-- Register XL profile names in `acestep.paths` and teach
-  `available_trt_engines()` to select profiles by checkpoint or variant.
-- Add server CLI flags for explicit engine paths, for example
-  `--trt-decoder`, `--trt-vae-encode`, and `--trt-vae-decode`, then pass those
-  paths through to `Session`.
-
-Until then, the safe web-demo XL command is a mixed mode that avoids loading the
-2B TRT decoder for the XL checkpoint:
+Build the XL checkpoint:
 
 ```powershell
-uv run python -u -m demos.realtime_motion_graph_web --port 8765 --checkpoint acestep-v15-xl-turbo --decoder-accel eager --vae-accel tensorrt
+uv run acestep-download --model acestep-v15-xl-turbo --skip-main
 ```
 
-That uses the XL PyTorch decoder and TRT VAE engines. It is useful for
-functional XL demo testing, but it is not the XL TRT decoder path.
+Build the 60s XL TRT profile. This builds the XL decoder and any missing shared
+VAE engines for the same duration:
+
+```powershell
+uv run python -m acestep.engine.trt.build --all --checkpoint acestep-v15-xl-turbo --duration 60 --batch-max 1 --workspace-gb 16 --export-locally --decoder-precision bf16_mixed
+```
+
+Build the 120s XL TRT profile when the source audio needs it:
+
+```powershell
+uv run python -m acestep.engine.trt.build --all --checkpoint acestep-v15-xl-turbo --duration 120 --batch-max 1 --workspace-gb 16 --export-locally --decoder-precision bf16_mixed
+```
+
+Start the demo in full TRT mode:
+
+```powershell
+uv run python -u -m demos.realtime_motion_graph_web --port 8765 --accel tensorrt --checkpoint acestep-v15-xl-turbo
+```
+
+The backend now passes `checkpoint` into `available_trt_engines()`, so this
+selects `decoder_xl-turbo_mixed_refit_b1_60s` or
+`decoder_xl-turbo_mixed_refit_b1_120s` instead of the 2B decoder profiles.
+The streaming decoder path micro-batches rows when the selected TRT engine has
+a smaller batch profile than the active pipeline batch, so the validated XL
+`b1` engines can run with normal demo pipeline depths.
 
 ### Demo Troubleshooting
 
@@ -539,6 +559,17 @@ If cold start uses more VRAM than expected:
 - Disable DreamVAE or build the matching DreamVAE profile if `fast_vae=true`.
 - Use `--decoder-accel tensorrt --vae-accel eager` or the inverse to isolate a
   backend.
+
+If TensorRT reports a static batch mismatch such as:
+
+```text
+Static dimension mismatch while setting input shape for hidden_states.
+Set dimensions are [2,...]. Expected dimensions are [1,-1,64].
+```
+
+make sure the stream micro-batching changes in `acestep/engine/stream.py` are
+present. XL turbo `b1` engines only accept one decoder row per TRT execution;
+the stream should split larger active batches into `B=1` chunks automatically.
 
 ## Validation Commands
 
@@ -723,5 +754,5 @@ Before relying on a TRT engine in a demo or benchmark:
 4. Check `build_report.csv` for status, build time, and size.
 5. Load the engine once through `TRTDecoder` or `Session`.
 6. Assert finite latent and audio tensors on a short generation.
-7. Keep explicit engine paths for XL until XL profiles are added to
-   `acestep.paths._TRT_ENGINE_PROFILES`.
+7. For web-demo runs, verify the selected `--checkpoint` has registered TRT
+   profiles in `acestep.paths`.

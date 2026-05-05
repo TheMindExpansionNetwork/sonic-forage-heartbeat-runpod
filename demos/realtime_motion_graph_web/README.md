@@ -54,11 +54,15 @@ uv run python -u -m demos.realtime_motion_graph_web \
 ```
 
 `--checkpoint <name>` selects which DiT checkpoint to load. The name
-must match a directory under `<checkpoints_dir>/` (auto-downloaded from
-HF on first use). Currently `acestep-v15-turbo` (default, 2B) is the
-only vendored variant; other entries in
-`acestep.model_downloader.SUBMODEL_REGISTRY` will load once their
-modeling files are vendored into `acestep/models/`.
+must match a directory under `<checkpoints_dir>/`. Full TensorRT mode is
+registered for `acestep-v15-turbo` (default, 2B) and
+`acestep-v15-xl-turbo` (XL). For XL, build the `b1` TRT decoder profile
+first, then launch with:
+
+```bash
+uv run python -u -m demos.realtime_motion_graph_web \
+    --accel tensorrt --checkpoint acestep-v15-xl-turbo
+```
 
 Then from any laptop on the same network:
 
