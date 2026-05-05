@@ -420,7 +420,10 @@ async function decodeAudioBuffer(arrayBuf) {
   const rendered = await offline.startRendering();
 
   let frames = rendered.length;
-  frames = Math.min(frames, Math.floor(60.0 * SAMPLE_RATE));
+  // Cap at the largest engine profile the server is built for (240 s).
+  // The server applies the same cap via max_profile_duration_s(); a
+  // client cap shorter than that just truncates uploads needlessly.
+  frames = Math.min(frames, Math.floor(240.0 * SAMPLE_RATE));
   const pool = 1920 * 5;
   frames = frames - (frames % pool);
 
@@ -1273,21 +1276,14 @@ class Session {
     if (this.hasAnyVideo) {
       this.videoLayer.setVideos(this.videos);
       this.videoLayer.play(this.videos[0], "none");
-
-      // Mirror the playing video into the blurred ambient back layer so
-      // the side gutters fill with motion-matched ambience.
-      const ambient = document.getElementById("install-ambient");
-      if (ambient) {
-        ambient.src = `videos/${this.videos[0]}`;
-        ambient.muted = true;
-        ambient.loop = true;
-        ambient.play().catch(() => {});
-      }
+      // The legacy #install-ambient back-layer video is permanently
+      // display:none in style.css (the design settled on a pure-black
+      // backdrop with the focal square as the only thing the eye locks
+      // onto). Loading + decoding it would just cost a second video
+      // pipeline for zero visible output, so leave its src empty.
     } else {
       // Hide video DOM so the focal area stays dark instead of showing
       // a stuck black <video> tile. Effects canvas is also a no-op below.
-      const ambient = document.getElementById("install-ambient");
-      if (ambient) ambient.removeAttribute("src");
       videoA.removeAttribute("src");
       videoB.removeAttribute("src");
     }

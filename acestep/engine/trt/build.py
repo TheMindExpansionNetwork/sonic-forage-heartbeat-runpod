@@ -335,15 +335,29 @@ def _ensure_onnx(
     decoder_mixed: bool,
     skip_onnx: bool,
     force_onnx: bool = False,
+    export_locally: bool = False,
 ) -> dict[str, str]:
-    """Detect existing ONNX, load model if needed, export missing files.
+    """Resolve ONNX paths for the build, fetching from HF when missing.
 
-    Returns dict mapping component names to ONNX paths.
+    Resolution order for each needed component:
+      1. Local cache present -> reuse, unless ``force_onnx`` is set.
+      2. ``skip_onnx``       -> error (no fetch, no export).
+      3. ``force_onnx``      -> re-export from the model checkpoint.
+      4. ``export_locally``  -> export missing files from the checkpoint.
+      5. Default             -> download missing files from HF via ``onnx_hub``.
 
-    VAE ONNX exports are stored in a shared ``_onnx_vae/`` directory
-    (sibling to onnx_dir) since all DiT variants share the same VAE.
-    Decoder ONNX exports live in onnx_dir (checkpoint-specific).
+    HF-first is the clean default: machines that don't have the model
+    checkpoint can build engines without ever touching torch's model
+    loader, and CI / cloud runs skip a multi-minute model load. Pass
+    ``--export-locally`` to recover the old behavior, e.g. when iterating
+    on the export code itself.
+
+    VAE ONNX is stored in a shared ``_onnx_vae/`` directory (sibling to
+    ``onnx_dir``) since all DiT variants share the same VAE. Decoder
+    ONNX lives in ``onnx_dir`` (checkpoint-specific).
     """
+    from .onnx_hub import fetch_onnx
+
     # VAE is shared across checkpoints; decoder is checkpoint-specific
     vae_onnx_dir = os.path.join(os.path.dirname(onnx_dir), "_onnx_vae")
     os.makedirs(vae_onnx_dir, exist_ok=True)
@@ -355,7 +369,7 @@ def _ensure_onnx(
         "decoder_refit": os.path.join(onnx_dir, "decoder_refit", "decoder_refit.onnx"),
     }
 
-    # Also check old _onnx/ location for VAE (backward compat)
+    # Also check old _onnx/ location for VAE (backward compat).
     old_onnx_dir = os.path.join(os.path.dirname(onnx_dir), "_onnx")
     for key in ("vae_encode", "vae_decode"):
         if not os.path.exists(paths[key]):
@@ -364,75 +378,90 @@ def _ensure_onnx(
                 logger.info("Found VAE ONNX at old location: {}", old_path)
                 paths[key] = old_path
 
-    # Determine what actually needs exporting
-    export_vae = False
-    export_decoder_std = False
-    export_decoder_refit = False
-
-    if need_vae and not skip_onnx:
-        if force_onnx or not os.path.exists(paths["vae_encode"]) or not os.path.exists(paths["vae_decode"]):
-            export_vae = True
-            if force_onnx:
-                logger.info("Forcing VAE ONNX re-export")
+    # Build the list of (component, fetch_kwargs) pairs that the caller
+    # actually needs and that aren't yet on disk. With --force-onnx, all
+    # requested components are included so the checkpoint exporter overwrites
+    # stale or suspect ONNX files.
+    requested: list[tuple[str, dict]] = []
+    if need_vae:
+        if force_onnx or not os.path.exists(paths["vae_encode"]):
+            requested.append(("vae_encode", {}))
         else:
-            logger.info("Reusing existing VAE ONNX exports in {}", onnx_dir)
-
-    if need_decoder_std and not skip_onnx:
-        if force_onnx or not os.path.exists(paths["decoder"]):
-            export_decoder_std = True
-            if force_onnx:
-                logger.info("Forcing decoder ONNX re-export: {}", paths["decoder"])
+            logger.info("Reusing existing VAE encoder ONNX: {}", paths["vae_encode"])
+        if force_onnx or not os.path.exists(paths["vae_decode"]):
+            requested.append(("vae_decode", {}))
         else:
-            logger.info("Reusing existing decoder ONNX: {}", paths["decoder"])
+            logger.info("Reusing existing VAE decoder ONNX: {}", paths["vae_decode"])
+    if need_decoder_std and (force_onnx or not os.path.exists(paths["decoder"])):
+        requested.append(("decoder", {"checkpoint": checkpoint}))
+    elif need_decoder_std:
+        logger.info("Reusing existing decoder ONNX: {}", paths["decoder"])
+    if need_decoder_refit and (force_onnx or not os.path.exists(paths["decoder_refit"])):
+        requested.append(("decoder_refit", {"checkpoint": checkpoint}))
+    elif need_decoder_refit:
+        logger.info("Reusing existing decoder ONNX (refit): {}", paths["decoder_refit"])
 
-    if need_decoder_refit and not skip_onnx:
-        if force_onnx or not os.path.exists(paths["decoder_refit"]):
-            export_decoder_refit = True
-            if force_onnx:
-                logger.info("Forcing decoder ONNX re-export (refit): {}", paths["decoder_refit"])
-        else:
-            logger.info("Reusing existing decoder ONNX (refit): {}", paths["decoder_refit"])
-
-    # Validate --skip-onnx
+    # --skip-onnx: no resolution path. Error if anything's missing.
     if skip_onnx:
-        missing = []
-        if need_vae:
-            for k in ("vae_encode", "vae_decode"):
-                if not os.path.exists(paths[k]):
-                    missing.append(paths[k])
-        if need_decoder_std and not os.path.exists(paths["decoder"]):
-            missing.append(paths["decoder"])
-        if need_decoder_refit and not os.path.exists(paths["decoder_refit"]):
-            missing.append(paths["decoder_refit"])
-        if missing:
-            for f in missing:
-                logger.error("Missing ONNX file: {}", f)
+        if requested:
+            for comp, _ in requested:
+                logger.error(
+                    "Missing ONNX file (refusing to fetch/export with --skip-onnx): {}",
+                    paths[comp],
+                )
             sys.exit(1)
-        logger.info("Skipping ONNX export (--skip-onnx)")
+        logger.info("All ONNX exports found, --skip-onnx satisfied.")
+        return paths
 
-    # Load model only if we need to export something
-    need_model = export_vae or export_decoder_std or export_decoder_refit
+    if not requested:
+        logger.info("All ONNX exports already present, nothing to fetch or export.")
+        return paths
 
-    handler = None
-    if need_model:
-        logger.info("Loading model from checkpoints/{}...", checkpoint)
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        from acestep.engine.model_context import ModelContext
-        handler = ModelContext(
-            project_root=project_root,
-            config_path=checkpoint,
-            device=device,
-            use_flash_attention=False,
-            compile_decoder=False,
-            compile_vae=False,
-            skip_vae=not need_vae,
-        )
-        logger.info("Model loaded.")
-    else:
-        logger.info("All ONNX exports found, skipping model load.")
+    # HF-first path. Each fetch lands the file at the same local path
+    # the local exporter would write, so the rest of the pipeline
+    # downstream doesn't care about the source.
+    if not export_locally and not force_onnx:
+        local_root = os.path.dirname(onnx_dir)  # the trt_engines dir
+        try:
+            for comp, kw in requested:
+                fetched = fetch_onnx(comp, local_root=local_root, **kw)
+                # fetch_onnx returns the canonical local path; the
+                # ``paths`` dict already points at the same location, but
+                # update it in case the registry's local_subdir ever
+                # diverges from this function's hardcoded layout.
+                paths[comp] = str(fetched)
+            return paths
+        except Exception as exc:
+            logger.error(
+                "ONNX fetch from HuggingFace failed: {}. "
+                "Re-run with --export-locally to export from the model "
+                "checkpoint instead, or with --skip-onnx if you have the "
+                "files in a non-standard location.",
+                exc,
+            )
+            sys.exit(1)
 
-    # Export missing ONNX files
+    # --export-locally / --force-onnx path: load the model and export from weights.
+    export_vae = any(c.startswith("vae_") for c, _ in requested)
+    export_decoder_refit = any(c == "decoder_refit" for c, _ in requested)
+    export_decoder_std = any(c == "decoder" for c, _ in requested)
+
+    mode = "--force-onnx" if force_onnx else "--export-locally"
+    logger.info("Loading model from checkpoints/{} ({})...", checkpoint, mode)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from acestep.engine.model_context import ModelContext
+    handler = ModelContext(
+        project_root=project_root,
+        config_path=checkpoint,
+        device=device,
+        use_flash_attention=False,
+        compile_decoder=False,
+        compile_vae=False,
+        skip_vae=not export_vae,
+    )
+    logger.info("Model loaded.")
+
     if export_vae:
         from .vae_export import (
             export_vae_encoder_onnx, export_vae_decoder_onnx, VAEExportConfig,
@@ -555,6 +584,58 @@ def _build_vae_engines(
     return results
 
 
+def _build_windowed_vae_decode_engine(
+    *,
+    output_dir: str,
+    onnx_paths: dict[str, str],
+    workspace_gb: float,
+    force_rebuild: bool = False,
+) -> tuple[str, str, float, str]:
+    """Build the single windowed (3-30 s) VAE decode engine.
+
+    This profile is shared across all duration tiers — it's selected
+    by the runtime when ``vae_window > 0`` regardless of the song
+    length, because the chunk size fed to the engine is bounded by
+    the user-facing window (5-30 s) plus overlap, never by the full
+    song duration. Building it costs ~75 s and saves ~7.7 GB of TRT
+    workspace at session-creation time vs the canonical 240 s engine.
+    """
+    from .vae_export import build_vae_decode_engine, VAETRTBuildConfig
+    from acestep.paths import (
+        WINDOWED_VAE_DECODE_NAME,
+        WINDOWED_VAE_PROFILE_FRAMES,
+    )
+
+    name = WINDOWED_VAE_DECODE_NAME
+    engine_dir = os.path.join(output_dir, name)
+    engine_path = os.path.join(engine_dir, f"{name}.engine")
+    label = "VAE decode windowed (3-30s)"
+
+    if not force_rebuild and os.path.exists(engine_path):
+        size_mb = os.path.getsize(engine_path) / 1e6
+        logger.info("SKIP %s (%.0f MB)", name, size_mb)
+        return (label, engine_path, 0.0, "SKIPPED")
+
+    min_f, opt_f, max_f = WINDOWED_VAE_PROFILE_FRAMES
+    config = VAETRTBuildConfig(
+        workspace_gb=workspace_gb,
+        decode_min_frames=min_f,
+        decode_opt_frames=opt_f,
+        decode_max_frames=max_f,
+    )
+
+    logger.info("=" * 60)
+    logger.info("VAE TRT BUILD (windowed): %s (min=%d opt=%d max=%d)",
+                name, min_f, opt_f, max_f)
+    logger.info("=" * 60)
+
+    t0 = time.time()
+    build_vae_decode_engine(onnx_paths["vae_decode"], engine_path, config=config)
+    elapsed = time.time() - t0
+    logger.info("Built in %.0fs", elapsed)
+    return (label, engine_path, elapsed, "OK")
+
+
 def _checkpoint_to_variant(checkpoint: str) -> str:
     """Extract short variant name from checkpoint path.
 
@@ -642,10 +723,15 @@ def _build_decoder_engine(
 # ------------------------------------------------------------------
 
 def _print_matrix(durations, build_vae, build_decoder, output_dir, batch_max,
-                   checkpoint="acestep-v15-turbo"):
+                   checkpoint="acestep-v15-turbo", build_dreamvae=False):
     """Print the build matrix for --all mode, showing existing vs new."""
     variant = _checkpoint_to_variant(checkpoint)
     vtag = f"_{variant}" if variant != "turbo" else ""
+
+    from acestep.paths import (
+        WINDOWED_VAE_DECODE_NAME,
+        WINDOWED_DREAMVAE_DECODE_NAME,
+    )
 
     # (label, engine_dir_name) pairs
     jobs = []
@@ -655,6 +741,15 @@ def _print_matrix(durations, build_vae, build_decoder, output_dir, batch_max,
             jobs.append((f"VAE encode {dur}s", f"vae_encode_fp16_{dur}s"))
         if build_decoder:
             jobs.append((f"Decoder {variant} {dur}s, refit", f"decoder{vtag}_mixed_refit_b{batch_max}_{dur}s"))
+        if build_dreamvae:
+            jobs.append((f"DreamVAE decode {dur}s", f"dreamvae_decode_fp16_{dur}s"))
+
+    # Windowed engines are duration-independent (single shared 3-30s
+    # profile) so they're appended once, outside the duration loop.
+    if build_vae:
+        jobs.append(("VAE decode windowed (3-30s)", WINDOWED_VAE_DECODE_NAME))
+    if build_dreamvae:
+        jobs.append(("DreamVAE decode windowed (3-30s)", WINDOWED_DREAMVAE_DECODE_NAME))
 
     to_build = 0
     to_skip = 0
@@ -758,6 +853,13 @@ def main():
                        help="Only build decoder engines (skip VAE)")
     batch.add_argument("--vae-only", action="store_true",
                        help="Only build VAE engines (skip decoder)")
+    batch.add_argument("--with-dreamvae", action="store_true",
+                       help="Also build dreamvae (distilled decoder) engines "
+                            "for each duration. ONNX is fetched from "
+                            "huggingface.co/daydreamlive/DreamVAE on first use.")
+    batch.add_argument("--dreamvae-only", action="store_true",
+                       help="Build ONLY dreamvae engines (skip standard "
+                            "VAE/decoder builds). Implies --with-dreamvae.")
 
     # Shared / single mode
     single = parser.add_argument_group("single mode / shared options")
@@ -768,11 +870,17 @@ def main():
     single.add_argument("--checkpoint", default="acestep-v15-turbo",
                         help="Model checkpoint directory name")
     single.add_argument("--skip-onnx", action="store_true",
-                        help="Force-skip ONNX export (error if files missing). "
-                             "Normally ONNX files in _onnx/ are auto-detected "
-                             "and reused without this flag.")
+                        help="Don't fetch or export ONNX. Error if any "
+                             "needed ONNX file is missing locally.")
     single.add_argument("--force-onnx", action="store_true",
-                        help="Re-export ONNX files even if matching files already exist.")
+                        help="Re-export ONNX files from the model checkpoint "
+                             "even if matching files already exist. Implies "
+                             "--export-locally.")
+    single.add_argument("--export-locally", action="store_true",
+                        help="Re-export ONNX from the model checkpoint "
+                             "instead of fetching from HuggingFace. The "
+                             "default is HF-first; use this when iterating "
+                             "on the export code or when offline.")
     single.add_argument("--max-duration", type=int, default=240,
                         help="Max audio duration in seconds for single mode "
                              "(default: 240 = 4min)")
@@ -795,6 +903,8 @@ def main():
     args = parser.parse_args()
     if args.skip_onnx and args.force_onnx:
         parser.error("--skip-onnx and --force-onnx are mutually exclusive")
+    if args.force_onnx:
+        args.export_locally = True
 
     checkpoints_root = _default_checkpoints_dir()
     env = None if args.dry_run else _preflight(args.device)
@@ -814,30 +924,45 @@ def main():
 def _run_all(args, project_root, onnx_dir, env):
     """Build the full engine matrix."""
     durations = tuple(args.duration) if args.duration else (60, 120, 240)
-    build_vae = not args.decoder_only
-    build_decoder = not args.vae_only
+    # --dreamvae-only is shorthand for "skip standard VAE/decoder, only
+    # build dreamvae". --with-dreamvae adds dreamvae on top of the
+    # standard build. Both forms enable the dreamvae build.
+    build_dreamvae = args.with_dreamvae or args.dreamvae_only
+    if args.dreamvae_only:
+        build_vae = False
+        build_decoder = False
+    else:
+        build_vae = not args.decoder_only
+        build_decoder = not args.vae_only
 
     # Print matrix
     _print_matrix(durations, build_vae, build_decoder,
-                  args.output_dir, args.batch_max, args.checkpoint)
+                  args.output_dir, args.batch_max, args.checkpoint,
+                  build_dreamvae=build_dreamvae)
 
     if args.dry_run:
         return
 
-    # ONNX phase (once, shared across all durations)
-    # Only refit-enabled decoder ONNX is needed
-    onnx_paths = _ensure_onnx(
-        onnx_dir=onnx_dir,
-        project_root=project_root,
-        checkpoint=args.checkpoint,
-        device=args.device,
-        need_vae=build_vae,
-        need_decoder_std=False,
-        need_decoder_refit=build_decoder,
-        decoder_mixed=True,
-        skip_onnx=args.skip_onnx,
-        force_onnx=args.force_onnx,
-    )
+    # ONNX phase (once, shared across all durations).  Only refit-enabled
+    # decoder ONNX is needed for the standard build; dreamvae has its
+    # own ONNX, fetched lazily from HF inside _build_dreamvae_engines so
+    # we don't pay network cost when --dreamvae isn't requested.
+    if build_vae or build_decoder:
+        onnx_paths = _ensure_onnx(
+            onnx_dir=onnx_dir,
+            project_root=project_root,
+            checkpoint=args.checkpoint,
+            device=args.device,
+            need_vae=build_vae,
+            need_decoder_std=False,
+            need_decoder_refit=build_decoder,
+            decoder_mixed=True,
+            skip_onnx=args.skip_onnx,
+            force_onnx=args.force_onnx,
+            export_locally=args.export_locally,
+        )
+    else:
+        onnx_paths = {}
 
     # Engine phase
     results = []
@@ -865,6 +990,37 @@ def _run_all(args, project_root, onnx_dir, env):
                 checkpoint=args.checkpoint,
             ))
 
+    # Windowed VAE decode (single 3-30s profile, duration-independent).
+    # Auto-selected by Session when vae_window > 0.
+    if build_vae:
+        results.append(_build_windowed_vae_decode_engine(
+            output_dir=args.output_dir,
+            onnx_paths=onnx_paths,
+            workspace_gb=args.workspace_gb,
+            force_rebuild=args.force_rebuild,
+        ))
+
+    if build_dreamvae:
+        # dreamvae fetches its own ONNX from HF on first use; no shared
+        # ONNX state with the loop above. Built last so a missing HF
+        # token / network error doesn't tank an otherwise-successful
+        # standard build.
+        from .dreamvae_export import (
+            build_dreamvae_engines,
+            build_windowed_dreamvae_engine,
+        )
+        results.extend(build_dreamvae_engines(
+            output_dir=args.output_dir,
+            durations=durations,
+            workspace_gb=args.workspace_gb,
+            force_rebuild=args.force_rebuild,
+        ))
+        results.append(build_windowed_dreamvae_engine(
+            output_dir=args.output_dir,
+            workspace_gb=args.workspace_gb,
+            force_rebuild=args.force_rebuild,
+        ))
+
     # Summary
     failures = _print_summary(results, args.output_dir)
     _save_build_report(results, args.output_dir)
@@ -890,6 +1046,7 @@ def _run_single(args, project_root, onnx_dir, env):
         decoder_mixed=args.decoder_mixed,
         skip_onnx=args.skip_onnx,
         force_onnx=args.force_onnx,
+        export_locally=args.export_locally,
     )
 
     # Engine phase

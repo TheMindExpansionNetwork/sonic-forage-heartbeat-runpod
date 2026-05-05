@@ -33,9 +33,13 @@ from acestep.engine.session import Session
 from acestep.nodes.types import Audio
 from acestep.paths import (
     EngineNotBuiltError,
+    available_dreamvae_decode_engine,
     available_trt_engines,
     checkpoints_dir,
+    dreamvae_decode_engine_name,
     loras_dir,
+    max_profile_duration_s,
+    smallest_fitting_profile_duration_s,
     trt_engine_path,
 )
 
@@ -147,7 +151,13 @@ def handle_client(
         num_samples, channels,
     )
     waveform = torch.from_numpy(audio_np.T.copy())
-    waveform = waveform[:2, :int(60.0 * SAMPLE_RATE)]
+    # Cap at the largest registered TRT engine profile rather than
+    # hardcoding 60 s. Anything longer than the largest profile can't
+    # be handled by any built engine, but we let the operator stretch
+    # all the way up to that ceiling — picking the smallest-fitting
+    # engine happens below in available_trt_engines().
+    max_seconds = max_profile_duration_s()
+    waveform = waveform[:2, :int(max_seconds * SAMPLE_RATE)]
     pool = 1920 * 5
     rem = waveform.shape[-1] % pool
     if rem:
@@ -217,14 +227,16 @@ def handle_client(
                 pass
             ws.close(1011, "TRT engine not built")
             return
-        if picked_dur > audio_duration_s and picked_dur > 60.0:
-            # Fell back to a larger profile than strictly needed. Worth
-            # logging because the larger profile reserves noticeably more
-            # VRAM at TRT context-creation time.
+        # Only warn when a *smaller* registered profile would have fit
+        # but wasn't built (so we genuinely fell back). For a 119.8 s
+        # source the 120 s engine is the smallest fitting profile, not
+        # a fallback — the previous predicate fired on that case.
+        ideal_dur = smallest_fitting_profile_duration_s(audio_duration_s)
+        if picked_dur > ideal_dur:
             print(
                 f"[Server] WARNING: using {picked_dur:.0f}s engine for "
-                f"{audio_duration_s:.1f}s audio (fallback; smaller profile "
-                f"not built — extra VRAM cost)"
+                f"{audio_duration_s:.1f}s audio (fallback; {ideal_dur:.0f}s "
+                f"profile not built — extra VRAM cost)"
             )
         # Prune unused keys for the same reason as before:
         # validate_backends() rejects engine entries whose backend isn't
@@ -239,13 +251,16 @@ def handle_client(
     if fast_vae and vae_backend == "tensorrt":
         # fast_vae uses the dreamvae distilled decoder; profile must match
         # the same duration we picked above. dreamvae engines aren't in
-        # _TRT_ENGINE_PROFILES (different decoder weights), so we resolve
-        # the path by name and check existence directly.
-        fast_name = f"dreamvae_decode_fp16_{int(picked_dur)}s"
-        if Path(str(trt_engine_path(fast_name))).exists():
-            trt_engines["vae_decode"] = str(trt_engine_path(fast_name))
+        # _TRT_ENGINE_PROFILES (different decoder weights), so we look
+        # them up via the dedicated helper which knows the naming
+        # convention and falls back to a larger fitting profile when the
+        # exact one isn't built (same logic as available_trt_engines).
+        dv_path = available_dreamvae_decode_engine(picked_dur)
+        if dv_path is not None:
+            trt_engines["vae_decode"] = str(dv_path)
         else:
-            print(f"[Server] WARNING: {fast_name} engine missing, falling back to {Path(trt_engines['vae_decode']).stem}")
+            wanted = dreamvae_decode_engine_name(int(picked_dur))
+            print(f"[Server] WARNING: {wanted} engine missing, falling back to {Path(trt_engines['vae_decode']).stem}")
             fast_vae = False
     elif fast_vae:
         print(f"[Server] WARNING: fast_vae requires vae_backend=tensorrt; ignoring with vae_backend={vae_backend}")
@@ -325,7 +340,7 @@ def handle_client(
         tags=prompt,
         instruction=TASK_INSTRUCTIONS["cover"],
         refer_latent=source.latent,
-        bpm=detected_bpm, duration=60.0, key=detected_key,
+        bpm=detected_bpm, duration=audio_duration_s, key=detected_key,
     )
 
     print("[Server] Creating stream...")
@@ -407,6 +422,7 @@ def handle_client(
     source_ref = [source]
     bpm_ref = [detected_bpm]
     key_ref = [detected_key]
+    duration_ref = [audio_duration_s]
     n_channels_ref = [n_channels]
 
     # Client mirror: tracks what audio the client currently has. Replaced
@@ -545,7 +561,7 @@ def handle_client(
                                 tags=data["tags"],
                                 instruction=TASK_INSTRUCTIONS["cover"],
                                 refer_latent=source_ref[0].latent,
-                                bpm=bpm_ref[0], duration=60.0,
+                                bpm=bpm_ref[0], duration=duration_ref[0],
                                 key=data.get("key") or key_ref[0],
                             )
                             stream.conditioning = cond
@@ -648,12 +664,16 @@ def handle_client(
                 new_samples, new_channels,
             )
             new_wf = torch.from_numpy(new_np.T.copy())
-            new_wf = new_wf[:2, :int(60.0 * SAMPLE_RATE)]
+            # Cap at the same ceiling the initial upload used so swaps
+            # take advantage of every built engine profile, not a stale
+            # 60 s default.
+            new_wf = new_wf[:2, :int(max_seconds * SAMPLE_RATE)]
             rem = new_wf.shape[-1] % pool
             if rem:
                 new_wf = new_wf[:, :new_wf.shape[-1] - rem]
+            new_audio_duration_s = new_wf.shape[1] / SAMPLE_RATE
             print(
-                f"[Server] Swapping source ({new_wf.shape[1] / SAMPLE_RATE:.1f}s, "
+                f"[Server] Swapping source ({new_audio_duration_s:.1f}s, "
                 f"{new_wf.shape[0]}ch)..."
             )
 
@@ -670,7 +690,7 @@ def handle_client(
                 tags=tags,
                 instruction=TASK_INSTRUCTIONS["cover"],
                 refer_latent=new_source.latent,
-                bpm=new_bpm, duration=60.0,
+                bpm=new_bpm, duration=new_audio_duration_s,
                 key=requested_key or new_key,
             )
 
@@ -680,6 +700,7 @@ def handle_client(
             source_ref[0] = new_source
             bpm_ref[0] = new_bpm
             key_ref[0] = new_key
+            duration_ref[0] = new_audio_duration_s
             prompt_text[0] = tags
             r = runner_holder[0]
             if r is not None:
