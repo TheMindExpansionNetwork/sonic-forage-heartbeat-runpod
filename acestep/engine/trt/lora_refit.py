@@ -170,7 +170,21 @@ class TRTLoRAManager(LoRAManagerBase):
                 if entry.deltas and param_name in entry.deltas:
                     buf.add_(entry.deltas[param_name], alpha=entry.strength)
 
-            refitter.set_named_weights(trt_name, buf.numpy())
+            arr = buf.numpy()
+            ok = refitter.set_named_weights(trt_name, arr)
+            if not ok:
+                proto_desc = "unknown"
+                if hasattr(refitter, "get_weights_prototype"):
+                    try:
+                        proto = refitter.get_weights_prototype(trt_name)
+                        proto_desc = f"dtype={proto.dtype}, size={proto.size}"
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    "TRT rejected refit weights for "
+                    f"{trt_name}: array dtype={arr.dtype}, shape={arr.shape}; "
+                    f"engine prototype {proto_desc}"
+                )
             count += 1
 
         if count > 0:

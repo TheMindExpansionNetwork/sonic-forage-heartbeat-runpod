@@ -131,16 +131,31 @@ class DiffusionEngine:
         self._trt_stream = _get_trt_stream()
         self._trt_buf_cache = {}
 
-        # Detect I/O dtypes from engine (fp16 for mixed-precision, fp32 for legacy)
+        # Detect per-tensor I/O dtypes from the engine. Strongly-typed
+        # builds may use fp16/bf16/fp32 on different inputs, and TensorRT
+        # interprets buffers by the serialized tensor dtype.
         import tensorrt as trt
         _trt_dtype_map = {
             trt.float32: torch.float32,
             trt.float16: torch.float16,
-            trt.bfloat16: torch.bfloat16,
         }
-        hs_trt_dtype = self._trt_engine.get_tensor_dtype("hidden_states")
-        self._trt_io_dtype = _trt_dtype_map.get(hs_trt_dtype, torch.float32)
-        logger.info("TRT decoder engine ready (io_dtype=%s)", self._trt_io_dtype)
+        if hasattr(trt, "bfloat16"):
+            _trt_dtype_map[trt.bfloat16] = torch.bfloat16
+
+        input_names = ("hidden_states", "timestep", "encoder_hidden_states", "context_latents")
+        self._trt_input_dtypes = {
+            name: _trt_dtype_map.get(self._trt_engine.get_tensor_dtype(name), torch.float32)
+            for name in input_names
+        }
+        self._trt_output_dtype = _trt_dtype_map.get(
+            self._trt_engine.get_tensor_dtype("velocity"), torch.float32
+        )
+        self._trt_io_dtype = self._trt_input_dtypes["hidden_states"]
+        logger.info(
+            "TRT decoder engine ready (input_dtypes={}, output_dtype={})",
+            self._trt_input_dtypes,
+            self._trt_output_dtype,
+        )
 
         # Try to initialize LoRA refit manager (requires REFIT-enabled engine)
         self._lora_manager = None
@@ -315,21 +330,28 @@ class DiffusionEngine:
             ctx = self._trt_ctx
             dev = hidden_states.device
             hs_shape, ts_shape, enc_shape, cl_shape = key
-            io_dtype = self._trt_io_dtype
+            in_dtypes = self._trt_input_dtypes
 
             bufs = {
-                "hidden_states": torch.empty(hs_shape, dtype=io_dtype, device=dev),
-                "timestep": torch.empty(ts_shape, dtype=torch.float32, device=dev),
-                "encoder_hidden_states": torch.empty(enc_shape, dtype=io_dtype, device=dev),
-                "context_latents": torch.empty(cl_shape, dtype=io_dtype, device=dev),
+                "hidden_states": torch.empty(hs_shape, dtype=in_dtypes["hidden_states"], device=dev),
+                "timestep": torch.empty(ts_shape, dtype=in_dtypes["timestep"], device=dev),
+                "encoder_hidden_states": torch.empty(enc_shape, dtype=in_dtypes["encoder_hidden_states"], device=dev),
+                "context_latents": torch.empty(cl_shape, dtype=in_dtypes["context_latents"], device=dev),
             }
             for name, buf in bufs.items():
-                ctx.set_input_shape(name, tuple(buf.shape))
-                ctx.set_tensor_address(name, buf.data_ptr())
+                if not ctx.set_input_shape(name, tuple(buf.shape)):
+                    raise RuntimeError(f"TRT decoder rejected input shape for {name}: {tuple(buf.shape)}")
+                if not ctx.set_tensor_address(name, buf.data_ptr()):
+                    raise RuntimeError(f"TRT decoder rejected input address for {name}")
+
+            missing = ctx.infer_shapes()
+            if missing:
+                raise RuntimeError(f"TRT decoder shapes are insufficiently specified: {missing}")
 
             out_shape = tuple(ctx.get_tensor_shape("velocity"))
-            out_buf = torch.empty(out_shape, dtype=io_dtype, device=dev)
-            ctx.set_tensor_address("velocity", out_buf.data_ptr())
+            out_buf = torch.empty(out_shape, dtype=self._trt_output_dtype, device=dev)
+            if not ctx.set_tensor_address("velocity", out_buf.data_ptr()):
+                raise RuntimeError("TRT decoder rejected output address for velocity")
 
             self._trt_buf_cache[key] = {"bufs": bufs, "output": out_buf}
             logger.info(
@@ -353,10 +375,13 @@ class DiffusionEngine:
 
         ctx = self._trt_ctx
         for name, buf in bufs.items():
-            ctx.set_tensor_address(name, buf.data_ptr())
-        ctx.set_tensor_address("velocity", entry["output"].data_ptr())
+            if not ctx.set_tensor_address(name, buf.data_ptr()):
+                raise RuntimeError(f"TRT decoder rejected input address for {name}")
+        if not ctx.set_tensor_address("velocity", entry["output"].data_ptr()):
+            raise RuntimeError("TRT decoder rejected output address for velocity")
 
-        ctx.execute_async_v3(self._trt_stream.ptr)
+        if not ctx.execute_async_v3(self._trt_stream.ptr):
+            raise RuntimeError("TRT decoder execution failed")
         self._trt_stream.synchronize()
 
         output = entry["output"]

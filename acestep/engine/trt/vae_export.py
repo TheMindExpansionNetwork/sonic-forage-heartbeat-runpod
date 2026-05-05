@@ -230,9 +230,8 @@ def build_vae_trt_engine(
 
     trt_logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(trt_logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    )
+    # TensorRT 10 networks are always explicit-batch.
+    network = builder.create_network(0)
     parser = trt.OnnxParser(network, trt_logger)
 
     # parse_from_file resolves external data relative to the ONNX path
@@ -257,7 +256,9 @@ def build_vae_trt_engine(
         opt=(1, input_dims, opt_dynamic),
         max=(1, input_dims, max_dynamic),
     )
-    build_config.add_optimization_profile(profile)
+    profile_idx = build_config.add_optimization_profile(profile)
+    if profile_idx < 0:
+        raise RuntimeError("Failed to add TensorRT optimization profile")
 
     logger.info(
         "Building TRT engine: %s [%d, %d, %d]",

@@ -130,10 +130,14 @@ The `workflows/covers/` directory contains standalone scripts demonstrating indi
 
 ## Running with TensorRT
 
+DEMON targets TensorRT 10.16.x for optional acceleration. TensorRT plans are
+version- and GPU-architecture-specific by default, so rebuild engines after
+changing TensorRT, CUDA, driver, or the GPU used for inference.
+
 Build TRT engines:
 
 ```bash
-# Build all engines (60s + 240s, VAE + decoder, refit + non-refit)
+# Build all engines (60s + 120s + 240s, VAE + refit decoder)
 uv run python -m acestep.engine.trt.build --all
 
 # Build 60s engines only (recommended starting point)
@@ -144,6 +148,9 @@ uv run python -m acestep.engine.trt.build --all --dry-run
 
 # Force rebuild even if engines already exist (skipped by default)
 uv run python -m acestep.engine.trt.build --all --force-rebuild
+
+# Force ONNX re-export as well as engine rebuild
+uv run python -m acestep.engine.trt.build --all --duration 60 --force-rebuild --force-onnx
 
 # Only decoders or only VAE
 uv run python -m acestep.engine.trt.build --all --decoder-only

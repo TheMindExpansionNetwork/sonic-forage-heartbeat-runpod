@@ -999,8 +999,8 @@ def build_trt_engine(
     trt_logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(trt_logger)
 
-    # Network creation flags
-    net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    # TensorRT 10 networks are always explicit-batch; only opt into strong typing.
+    net_flags = 0
     if config.strongly_typed and hasattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED"):
         net_flags |= 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
         logger.info("Using STRONGLY_TYPED network (precision from ONNX graph)")
@@ -1072,7 +1072,9 @@ def build_trt_engine(
         min=(Bmin, Smin, 128), opt=(Bopt, Sopt, 128), max=(Bmax, Smax, 128),
     )
 
-    build_config.add_optimization_profile(profile)
+    profile_idx = build_config.add_optimization_profile(profile)
+    if profile_idx < 0:
+        raise RuntimeError("Failed to add TensorRT optimization profile")
 
     logger.info(
         "Building TRT engine (fp16=%s, bf16=%s, opt_level=%d) ...",
