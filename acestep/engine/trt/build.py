@@ -66,6 +66,17 @@ import torch
 _SUPPORTED_TRT_MIN = (10, 16)
 _SUPPORTED_TRT_MAX = (10, 17)
 _ENGINE_METADATA_SCHEMA = 1
+_DECODER_PRECISION_CHOICES = (
+    "auto",
+    "fp32",
+    "fp16_mixed",
+    "fp16_attn_safe",
+    "bf16",
+    "bf16_mixed",
+    "bf16_layer_fp16",
+    "bf16_matmul_fp16",
+    "bf16_mlp_fp16",
+)
 
 
 # ------------------------------------------------------------------
@@ -214,6 +225,45 @@ def _config_dict(config) -> dict:
     return dict(vars(config))
 
 
+def _looks_like_xl_checkpoint(checkpoint: str) -> bool:
+    return "xl" in os.path.basename(checkpoint).lower()
+
+
+def _resolve_decoder_precision(
+    *,
+    checkpoint: str,
+    requested: str,
+    decoder_mixed: bool,
+) -> str:
+    """Resolve the decoder ONNX precision recipe for this checkpoint.
+
+    ``decoder_mixed`` preserves the legacy 2B behavior: when callers ask
+    for the old mixed path, ``auto`` maps to the fp16 mixed export recipe.
+    XL checkpoints need bf16 range, so their ``auto`` default is bf16_mixed.
+    """
+    if requested != "auto":
+        return requested
+    if _looks_like_xl_checkpoint(checkpoint):
+        return "bf16_mixed"
+    if decoder_mixed:
+        return "fp16_mixed"
+    return "fp32"
+
+
+def _decoder_precision_is_strongly_typed(decoder_precision: str, decoder_mixed: bool) -> bool:
+    if decoder_precision == "fp16_mixed":
+        return True
+    if decoder_precision in {
+        "fp16_attn_safe",
+        "bf16_mixed",
+        "bf16_layer_fp16",
+        "bf16_matmul_fp16",
+        "bf16_mlp_fp16",
+    }:
+        return True
+    return decoder_mixed
+
+
 def _metadata_path(engine_path: str | os.PathLike[str]) -> Path:
     return Path(str(engine_path) + ".metadata.json")
 
@@ -332,7 +382,7 @@ def _ensure_onnx(
     need_vae: bool,
     need_decoder_std: bool,
     need_decoder_refit: bool,
-    decoder_mixed: bool,
+    decoder_precision: str,
     skip_onnx: bool,
     force_onnx: bool = False,
     export_locally: bool = False,
@@ -486,26 +536,42 @@ def _ensure_onnx(
 
     if export_decoder_refit or export_decoder_std:
         from .export import OnnxExportConfig, export_decoder_onnx
+
+        def decoder_export_config(*, for_refit: bool) -> OnnxExportConfig:
+            if decoder_precision == "fp16_mixed":
+                return OnnxExportConfig(mixed_precision=True, for_refit=for_refit)
+            return OnnxExportConfig(
+                precision=decoder_precision,
+                mixed_precision=False,
+                for_refit=for_refit,
+            )
+
         with handler._load_model_context("model"):
             if export_decoder_refit:
                 logger.info("=" * 60)
-                logger.info("DECODER ONNX EXPORT (refit-enabled)")
+                logger.info(
+                    "DECODER ONNX EXPORT (refit-enabled, precision={})",
+                    decoder_precision,
+                )
                 logger.info("=" * 60)
                 t0 = time.time()
                 export_decoder_onnx(
                     handler.model, paths["decoder_refit"], device=device,
-                    config=OnnxExportConfig(mixed_precision=decoder_mixed, for_refit=True),
+                    config=decoder_export_config(for_refit=True),
                 )
                 logger.info("Decoder ONNX (refit) exported in {:.1f}s", time.time() - t0)
 
             if export_decoder_std:
                 logger.info("=" * 60)
-                logger.info("DECODER ONNX EXPORT (standard)")
+                logger.info(
+                    "DECODER ONNX EXPORT (standard, precision={})",
+                    decoder_precision,
+                )
                 logger.info("=" * 60)
                 t0 = time.time()
                 export_decoder_onnx(
                     handler.model, paths["decoder"], device=device,
-                    config=OnnxExportConfig(mixed_precision=decoder_mixed, for_refit=False),
+                    config=decoder_export_config(for_refit=False),
                 )
                 logger.info("Decoder ONNX (standard) exported in {:.1f}s", time.time() - t0)
 
@@ -663,6 +729,8 @@ def _build_decoder_engine(
     env: dict,
     force_rebuild: bool = False,
     checkpoint: str = "acestep-v15-turbo",
+    decoder_precision: str = "fp16_mixed",
+    strongly_typed: bool = True,
 ) -> tuple[str, str, float, str]:
     """Build one decoder TRT engine.
 
@@ -674,12 +742,13 @@ def _build_decoder_engine(
     variant = _checkpoint_to_variant(checkpoint)
     config = TRTBuildConfig(
         fp16=True,
-        strongly_typed=mixed,
+        strongly_typed=strongly_typed,
         refit=refit,
         workspace_gb=workspace_gb,
         batch_max=batch_max,
         seq_max=duration * 25,
         variant=variant,
+        onnx_precision=decoder_precision,
     )
 
     name = config.engine_filename().replace(".engine", "")
@@ -705,8 +774,10 @@ def _build_decoder_engine(
         logger.info("REBUILD {} ({})", name, reason)
 
     logger.info("=" * 60)
-    logger.info("DECODER TRT BUILD (refit={}, mixed={}) -> {}",
-                refit, mixed, engine_path)
+    logger.info(
+        "DECODER TRT BUILD (refit={}, mixed={}, precision={}) -> {}",
+        refit, mixed, decoder_precision, engine_path,
+    )
     logger.info("=" * 60)
 
     t0 = time.time()
@@ -891,6 +962,13 @@ def main():
                         help="Build decoder engine(s)")
     single.add_argument("--decoder-mixed", action="store_true",
                         help="Use mixed precision for decoder")
+    single.add_argument("--decoder-precision",
+                        choices=_DECODER_PRECISION_CHOICES,
+                        default="auto",
+                        help="Decoder ONNX export precision recipe. "
+                             "'auto' keeps the legacy fp16_mixed recipe for "
+                             "2B mixed builds and uses bf16_mixed for XL "
+                             "checkpoints.")
     single.add_argument("--decoder-refit",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Build refit-enabled decoder for LoRA "
@@ -924,6 +1002,14 @@ def main():
 def _run_all(args, project_root, onnx_dir, env):
     """Build the full engine matrix."""
     durations = tuple(args.duration) if args.duration else (60, 120, 240)
+    decoder_precision = _resolve_decoder_precision(
+        checkpoint=args.checkpoint,
+        requested=args.decoder_precision,
+        decoder_mixed=True,
+    )
+    decoder_strongly_typed = _decoder_precision_is_strongly_typed(
+        decoder_precision, decoder_mixed=True,
+    )
     # --dreamvae-only is shorthand for "skip standard VAE/decoder, only
     # build dreamvae". --with-dreamvae adds dreamvae on top of the
     # standard build. Both forms enable the dreamvae build.
@@ -956,7 +1042,7 @@ def _run_all(args, project_root, onnx_dir, env):
             need_vae=build_vae,
             need_decoder_std=False,
             need_decoder_refit=build_decoder,
-            decoder_mixed=True,
+            decoder_precision=decoder_precision,
             skip_onnx=args.skip_onnx,
             force_onnx=args.force_onnx,
             export_locally=args.export_locally,
@@ -988,6 +1074,8 @@ def _run_all(args, project_root, onnx_dir, env):
                 env=env,
                 force_rebuild=args.force_rebuild,
                 checkpoint=args.checkpoint,
+                decoder_precision=decoder_precision,
+                strongly_typed=decoder_strongly_typed,
             ))
 
     # Windowed VAE decode (single 3-30s profile, duration-independent).
@@ -1033,6 +1121,14 @@ def _run_single(args, project_root, onnx_dir, env):
     """Build a single engine configuration."""
     build_vae = not args.skip_vae
     build_decoder = args.decoder
+    decoder_precision = _resolve_decoder_precision(
+        checkpoint=args.checkpoint,
+        requested=args.decoder_precision,
+        decoder_mixed=args.decoder_mixed,
+    )
+    decoder_strongly_typed = _decoder_precision_is_strongly_typed(
+        decoder_precision, decoder_mixed=args.decoder_mixed,
+    )
 
     # ONNX phase
     onnx_paths = _ensure_onnx(
@@ -1043,7 +1139,7 @@ def _run_single(args, project_root, onnx_dir, env):
         need_vae=build_vae,
         need_decoder_std=build_decoder and not args.decoder_refit,
         need_decoder_refit=build_decoder and args.decoder_refit,
-        decoder_mixed=args.decoder_mixed,
+        decoder_precision=decoder_precision,
         skip_onnx=args.skip_onnx,
         force_onnx=args.force_onnx,
         export_locally=args.export_locally,
@@ -1077,6 +1173,8 @@ def _run_single(args, project_root, onnx_dir, env):
             env=env,
             force_rebuild=args.force_rebuild,
             checkpoint=args.checkpoint,
+            decoder_precision=decoder_precision,
+            strongly_typed=decoder_strongly_typed,
         )
         label, path, elapsed, status = result
         if status == "OK":

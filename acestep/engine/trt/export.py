@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 from typing import Optional, Tuple, Union
 
 from loguru import logger
@@ -851,6 +852,13 @@ def export_decoder_onnx(
 
     with torch.no_grad():
         if use_dynamo:
+            # torch.onnx's dynamo path prints Unicode status markers. On
+            # Windows cp1252 consoles those can raise UnicodeEncodeError
+            # after graph capture succeeds, aborting an otherwise valid export.
+            for stream in (sys.stdout, sys.stderr):
+                if hasattr(stream, "reconfigure"):
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+
             # Dynamo path: pass tensors as positional args, use dynamic_shapes
             # API instead of dynamic_axes. Dynamo requires opset >= 18; the
             # downconversion to 17 fails for some ops, so don't force a
@@ -944,6 +952,11 @@ class TRTBuildConfig:
     # DiT variant name, included in engine filename when not "turbo"
     # so engines from different checkpoints coexist in the same directory.
     variant: str = "turbo"
+
+    # ONNX export precision recipe used to produce the parsed graph.
+    # This is metadata-only for engine selection/rebuild decisions; TensorRT
+    # precision flags are still governed by fp16/bf16/strongly_typed above.
+    onnx_precision: str = "fp32"
 
     @property
     def max_duration_s(self) -> int:
