@@ -135,10 +135,12 @@ def handle_client(
     decoder_backend: str = "tensorrt",
     vae_backend: str = "tensorrt",
     checkpoint: str = "acestep-v15-turbo",
+    offload_text_encoder: bool = False,
 ):
     print(
         f"[Server] Client connected "
-        f"(decoder={decoder_backend}, vae={vae_backend}, ckpt={checkpoint})"
+        f"(decoder={decoder_backend}, vae={vae_backend}, ckpt={checkpoint}, "
+        f"text_encoder={'offload' if offload_text_encoder else 'resident'})"
     )
 
     # ---- Phase 1: Init ----
@@ -295,6 +297,7 @@ def handle_client(
         config_path=checkpoint,
         decoder_backend=decoder_backend,
         vae_backend=vae_backend,
+        offload_text_encoder=offload_text_encoder,
         trt_engines=trt_engines,
         vae_window=vae_window,
     )

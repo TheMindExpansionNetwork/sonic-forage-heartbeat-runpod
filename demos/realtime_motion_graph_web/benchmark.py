@@ -288,6 +288,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Use DreamVAE TRT decode when available.",
     )
+    parser.add_argument(
+        "--offload-text-encoder",
+        action="store_true",
+        help=(
+            "Offload the text encoder after setup text encoding to reduce "
+            "steady VRAM. By default it stays resident."
+        ),
+    )
 
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--iters", type=int, default=24)
@@ -467,6 +475,7 @@ def main() -> None:
             config_path=args.checkpoint,
             decoder_backend=decoder_backend,
             vae_backend=vae_backend,
+            offload_text_encoder=args.offload_text_encoder,
             trt_engines=trt_engines,
             vae_window=vae_window,
         )
@@ -670,6 +679,7 @@ def main() -> None:
             "steps": steps,
             "depth": depth,
             "vae_window_s": vae_window,
+            "offload_text_encoder": args.offload_text_encoder,
             "prompt": prompt,
             "bpm": bpm,
             "key": key,

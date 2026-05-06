@@ -322,6 +322,7 @@ def main():
 
     args = sys.argv[1:]
     no_backend = "--no-backend" in args or "--ui-only" in args
+    offload_text_encoder = "--offload-text-encoder" in args
     if "--host" in args:
         idx = args.index("--host")
         host = args[idx + 1]
@@ -401,6 +402,7 @@ def main():
                 decoder_backend=decoder_accel,
                 vae_backend=vae_accel,
                 checkpoint=checkpoint,
+                offload_text_encoder=offload_text_encoder,
             )
 
     print(f"[Server] Starting single-port HTTP+WS on :{port}")
@@ -418,6 +420,8 @@ def main():
     extras = [f"mode={default_mode}"]
     if kiosk:
         extras.append("kiosk")
+    if offload_text_encoder:
+        extras.append("text_encoder=offload")
     extras.append(f"ckpt={checkpoint}")
     extra_str = " " + " ".join(f"[{e}]" for e in extras)
     if decoder_accel == vae_accel:

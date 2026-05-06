@@ -53,6 +53,10 @@ uv run python -u -m demos.realtime_motion_graph_web \
     --accel tensorrt --vae-accel eager
 ```
 
+The text encoder stays resident in VRAM by default so live prompt edits do not
+pay CPU/GPU transfer cost. Add `--offload-text-encoder` on lower-VRAM GPUs to
+restore the previous lower-memory behavior.
+
 `--checkpoint <name>` selects which DiT checkpoint to load. The name
 must match a directory under `<checkpoints_dir>/`. Full TensorRT mode is
 registered for `acestep-v15-turbo` (default, 2B) and
@@ -105,6 +109,21 @@ uv run python -u -m demos.realtime_motion_graph_web.benchmark \
 By default, `--skip-threshold -1` disables decode skipping so VAE decode
 latency is measured on every completed generation. Set `--no-decode` for
 decoder-only throughput.
+
+To isolate live prompt-change cost, use the prompt benchmark. It keeps setup
+timings separate, then repeatedly runs the same server-side path used for
+prompt edits: text encode, conditioning fusion with the current source latent,
+and `stream.conditioning` swap.
+
+```bash
+uv run python -u -m demos.realtime_motion_graph_web.prompt_benchmark \
+    --accel tensorrt --checkpoint acestep-v15-xl-turbo \
+    --json runs/xl-prompt-bench.json
+```
+
+It reports `text_encoder`, `conditioning_fusion`, `apply_swap`, total apply
+latency, and CUDA allocated/reserved peaks for each measured prompt change.
+Add `--offload-text-encoder` to test the lower-VRAM, higher-latency fallback.
 
 Then from any laptop on the same network:
 
