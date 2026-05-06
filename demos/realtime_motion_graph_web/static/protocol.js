@@ -290,6 +290,20 @@ export class RemoteBackend extends EventTarget {
   }
 
   /**
+   * Toggle 5Hz-LM-generated hints on/off. When ON, the server runs the
+   * 5Hz LM against the current tags+lyrics, dequantizes via the DiT's
+   * FSQ codebook, and uses the resulting 25Hz tensor as the alpha=0
+   * endpoint of the structure-strength fader (replacing silence).
+   * Regenerated server-side on prompt changes and source swaps.
+   */
+  sendLmHints(on) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ type: "lm_hints", on: !!on }));
+    } catch {}
+  }
+
+  /**
    * Replace the source audio in-flight. The server pauses generation,
    * re-runs prepare_source / encode_text on the new waveform, swaps
    * stream.source/conditioning, and replies with a swap_ready event +

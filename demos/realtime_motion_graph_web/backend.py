@@ -172,6 +172,7 @@ def handle_client(
     steps = config.get("steps", 8)
     prompt = config.get("prompt", "instrumental music")
     lyrics = config.get("lyrics", "")
+    use_lm_hints_initial = bool(config.get("use_lm_hints", False))
     fast_vae = config.get("fast_vae", False)
 
     # LoRA selection.  ``enabled_loras`` is the new id-keyed protocol;
@@ -417,6 +418,15 @@ def handle_client(
     params = {"num_gens": 0, "tick_ms": 0.0, "dec_ms": 0.0}
     prompt_text = [prompt]
     lyrics_text = [lyrics]
+    # 5Hz LM hints: lazy-loaded generator + pending Latent for the runner
+    # thread to install via runner.set_alt_hint_latent() next tick.
+    lm_hints_state = {
+        "on": use_lm_hints_initial,
+        "generator": None,  # LMHintGenerator, loaded lazily
+        "latent": None,     # Latent, last-built; None means "use silence"
+    }
+    pending_alt_hint = {"set": False, "latent": None}  # staged for runner
+    pending_alt_hint_lock = threading.Lock()
     sde_curve_display = [None]
     motion_val = [0.0]
     motion_lock = threading.Lock()
@@ -507,6 +517,74 @@ def handle_client(
                 print(f"[Server] enable_lora({lid}) failed: {e}")
         _send_catalog_update()
 
+    # --- 5Hz LM hints: lazy-load generator and (re)build hint latent ---
+    def _ensure_lm_generator():
+        if lm_hints_state["generator"] is not None:
+            return lm_hints_state["generator"]
+        from acestep.lm_hints import LMHintGenerator
+        print("[Server] Loading 5Hz LM (first toggle ON)...")
+        try:
+            gen = LMHintGenerator()
+        except Exception as exc:
+            print(f"[Server] 5Hz LM load failed: {exc}")
+            return None
+        lm_hints_state["generator"] = gen
+        return gen
+
+    def _rebuild_lm_hints():
+        """Run the 5Hz LM and stage the result for the runner thread.
+
+        Safe to call from the recv thread — uses ``_load_model_context``
+        for the DiT detokenize step the same way ``encode_text`` does.
+        Returns the staged Latent, or None on failure / toggle-off.
+        """
+        if not lm_hints_state["on"]:
+            with pending_alt_hint_lock:
+                pending_alt_hint["set"] = True
+                pending_alt_hint["latent"] = None
+            lm_hints_state["latent"] = None
+            return None
+        gen = _ensure_lm_generator()
+        if gen is None:
+            return None
+        target_T = source_ref[0].latent.tensor.shape[1]
+        try:
+            t0 = time.time()
+            latent = session.generate_lm_hints(
+                lm_generator=gen,
+                tags=prompt_text[0],
+                lyrics=lyrics_text[0],
+                bpm=bpm_ref[0],
+                key=key_ref[0],
+                duration=duration_ref[0],
+                target_T_25Hz=target_T,
+            )
+            dt = time.time() - t0
+            print(
+                f"[LM-HINTS] generated {latent.tensor.shape} in {dt:.2f}s"
+            )
+        except Exception as exc:
+            print(f"[Server] LM hint generation failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            return None
+        lm_hints_state["latent"] = latent
+        with pending_alt_hint_lock:
+            pending_alt_hint["set"] = True
+            pending_alt_hint["latent"] = latent
+        return latent
+
+    def apply_alt_hint_pending():
+        with pending_alt_hint_lock:
+            if not pending_alt_hint["set"]:
+                return
+            latent = pending_alt_hint["latent"]
+            pending_alt_hint["set"] = False
+            pending_alt_hint["latent"] = None
+        r = runner_holder[0]
+        if r is not None:
+            r.set_alt_hint_latent(latent)
+
     # --- on_audio_ready: delta-encode and send to client ---
     def on_audio_ready(wav_np, win_start=None, win_end=None):
         audio_eng.swap(wav_np)
@@ -575,12 +653,38 @@ def handle_client(
                             stream.conditioning = cond
                             prompt_text[0] = data["tags"]
                             lyrics_text[0] = new_lyrics
+                            # If LM-hints are enabled, regenerate against
+                            # the new tags+lyrics so the alpha=0 endpoint
+                            # of the structure-strength fader tracks the
+                            # operator's prompt edits.
+                            if lm_hints_state["on"]:
+                                _rebuild_lm_hints()
                             try:
                                 with send_lock:
                                     ws.send(json.dumps({
                                         "type": "prompt_applied",
                                         "tags": data["tags"],
                                         "lyrics": new_lyrics,
+                                    }))
+                            except ConnectionClosed:
+                                running[0] = False
+                                break
+                        elif mtype == "lm_hints":
+                            new_on = bool(data.get("on", False))
+                            lm_hints_state["on"] = new_on
+                            if new_on:
+                                _rebuild_lm_hints()
+                            else:
+                                # Clear: alpha=0 endpoint reverts to silence.
+                                lm_hints_state["latent"] = None
+                                with pending_alt_hint_lock:
+                                    pending_alt_hint["set"] = True
+                                    pending_alt_hint["latent"] = None
+                            try:
+                                with send_lock:
+                                    ws.send(json.dumps({
+                                        "type": "lm_hints_applied",
+                                        "on": new_on,
                                     }))
                             except ConnectionClosed:
                                 running[0] = False
@@ -719,6 +823,10 @@ def handle_client(
             duration_ref[0] = new_audio_duration_s
             prompt_text[0] = tags
             lyrics_text[0] = effective_lyrics
+            # New source -> new latent length; regenerate LM hints if on
+            # so the alpha=0 endpoint matches the new T_25Hz.
+            if lm_hints_state["on"]:
+                _rebuild_lm_hints()
             r = runner_holder[0]
             if r is not None:
                 # Source latent length may have changed; rebuild silence so
@@ -768,6 +876,7 @@ def handle_client(
     def apply_pending():
         apply_lora_pending()
         apply_swap_if_pending()
+        apply_alt_hint_pending()
 
     # --- PipelineRunner: the SAME code as local ---
     runner = PipelineRunner(
@@ -785,6 +894,11 @@ def handle_client(
         before_tick=apply_pending,
     )
     runner_holder[0] = runner
+
+    # If the client connected with LM hints enabled, build the initial
+    # alt-hint latent now so the first tick already has it staged.
+    if lm_hints_state["on"]:
+        _rebuild_lm_hints()
 
     try:
         print("[Server] Pipeline running...")
