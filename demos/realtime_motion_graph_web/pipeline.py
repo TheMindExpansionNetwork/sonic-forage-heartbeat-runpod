@@ -259,24 +259,42 @@ class PipelineRunner:
                 ode_noise_val = self.midi_knobs.get_param("ode_noise") if self.use_midi else 0.0
                 ode_curve = torch.full((1, src_T, 1), ode_noise_val) if ode_noise_val > 0.01 else None
 
-            # Source lock: x0_target_curve from client overrides the legacy
-            # scalar x0_target knob. When the curve is present, we blend each
-            # frame of the denoised x0 prediction toward the source latent by
-            # curve[t] (0 = free, 1 = pure source). Server requires both
-            # x0_target and x0_target_curve to be set for the advanced path.
+            # Source lock: x0_target_curve from client overrides the
+            # scalar x0_target_strength knob. The latent is attached
+            # unconditionally so that a strength bump via the shared
+            # override can engage the blend on in-flight slots that
+            # were submitted while strength was 0.
             x0_target_curve = _curve_from_spec(raw.get("x0_target_curve"), src_T)
             if x0_target_curve is not None:
-                x0_tgt = Latent(tensor=self.stream.source.latent.tensor)
                 x0_str = 0.0
             else:
                 x0_str = self.midi_knobs.get_param("x0_target") if self.use_midi else 0.0
-                x0_tgt = Latent(tensor=self.stream.source.latent.tensor) if x0_str > 0.01 else None
+            x0_tgt = Latent(tensor=self.stream.source.latent.tensor)
 
             velocity_curve = _curve_from_spec(raw.get("velocity_scale_curve"), src_T)
             initial_noise_curve = _curve_from_spec(raw.get("initial_noise_curve"), src_T)
 
             if self.use_midi:
                 last_channel_gains = self._sync_channel_guidance(raw, last_channel_gains)
+
+            # Route every curve-capable parameter through the shared
+            # mutable curve system so knob changes take effect on ALL
+            # in-flight slots on the next step, bypassing the ring
+            # buffer drain (~depth ticks of latency on the per-slot
+            # path). ``set_shared_curve(name, None)`` clears the
+            # override; ``set_shared_curve(name, scalar)`` lifts to
+            # ``[1, 1, 1]``; tensors flow through unchanged.
+            #
+            # ``self.stream.pipeline`` is None until the first tick
+            # constructs it; on that warmup iteration the submitted
+            # slot uses default per-slot fields, then the shared
+            # overrides take over from tick 2 onward.
+            pipe = self.stream.pipeline
+            if pipe is not None:
+                pipe.set_shared_curve("sde_denoise_curve", sde_curve)
+                pipe.set_shared_curve("ode_noise_curve", ode_curve)
+                pipe.set_shared_curve("velocity_scale", velocity_curve)
+                pipe.set_shared_curve("x0_target_strength", x0_str)
 
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -287,14 +305,10 @@ class PipelineRunner:
                     Latent(tensor=source_lat) if source_lat is not None
                     else self.stream.source.latent
                 ),
-                sde_denoise_curve=sde_curve,
-                ode_noise_curve=ode_curve,
                 x0_target=x0_tgt,
-                x0_target_strength=x0_str,
                 x0_target_curve=x0_target_curve,
                 shift=current_shift,
                 noise_sharing=noise_sharing,
-                velocity_scale=velocity_curve,
                 initial_noise_curve=initial_noise_curve,
                 # DCW (wavelet-domain post-step correction). Forwarded
                 # every tick so toggle / mode / wavelet changes from the
