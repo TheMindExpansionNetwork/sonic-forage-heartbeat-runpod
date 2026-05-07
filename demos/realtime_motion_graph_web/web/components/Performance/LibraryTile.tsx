@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 import { listLoras } from "@/engine/lora/listLoras";
+import { LOCAL_MODE } from "@/lib/runtime";
 import { useLoraStore } from "@/store/useLoraStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
@@ -132,14 +133,12 @@ function LoraRow({ id, name }: RowProps) {
 export function LibraryTile() {
   const catalog = useLoraStore((s) => s.catalog);
   const setCatalog = useLoraStore((s) => s.setCatalog);
-  // /api/pod/* requires ?session=<id>; without it the proxy 401s. Wait
-  // for the queue to admit us before fetching so we don't spam 401s
-  // pre-admission. The fetch fires the moment sessionWsUrl flips truthy
-  // and re-runs whenever it changes.
+  // Daydream-webapp queue-admit gate: standalone DEMON has no queue
+  // (LOCAL_MODE), so we skip the wait there.
   const sessionWsUrl = useSessionStore((s) => s.wsUrl);
 
   useEffect(() => {
-    if (!sessionWsUrl) return;
+    if (!sessionWsUrl && !LOCAL_MODE) return;
     void listLoras().then(setCatalog).catch(() => {});
   }, [setCatalog, sessionWsUrl]);
 

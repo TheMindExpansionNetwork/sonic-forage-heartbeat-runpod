@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { decodeAudioFile, listFixtures } from "@/engine/audio/loadFixture";
 import { togglePauseAndAudio } from "@/engine/audio/togglePauseAndAudio";
+import { LOCAL_MODE } from "@/lib/runtime";
 import { useCurveStore } from "@/store/useCurveStore";
 import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
@@ -42,11 +43,11 @@ export function OperatorStrip() {
   // power users will keep relying on while the advanced controls strip
   // is open. Both surfaces drive the same setFixture() / addCustomTrack()
   // path, so picking from either re-triggers useFixtureSwap identically.
+  // Daydream-webapp queue-admit gate: standalone DEMON has no queue
+  // (LOCAL_MODE), so we skip the wait there.
   const sessionWsUrl = useSessionStore((s) => s.wsUrl);
   useEffect(() => {
-    // Pre-admit the proxy returns 401, so don't fetch until the queue
-    // hands us a wsUrl.
-    if (!sessionWsUrl) return;
+    if (!sessionWsUrl && !LOCAL_MODE) return;
     void listFixtures()
       .then((names) => {
         setFixtures(names);

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 
 import { decodeAudioFile, listFixtures } from "@/engine/audio/loadFixture";
+import { LOCAL_MODE } from "@/lib/runtime";
 import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
@@ -60,11 +61,11 @@ export function AudioSourceCrate() {
   const placardRef = useRef<HTMLButtonElement | null>(null);
   const fanRef = useRef<HTMLDivElement | null>(null);
 
-  // Fetch the catalog only AFTER the queue admits us. The pod proxy at
-  // /api/pod/* returns 401 without a session id, so calling pre-admit
-  // would just spam 401s in the network tab for no benefit.
+  // Daydream-webapp queue-admit gate: /api/pod/* returns 401 pre-admit,
+  // so prod waits for wsUrl before fetching. Standalone DEMON has no
+  // queue (LOCAL_MODE), so we skip the wait there.
   useEffect(() => {
-    if (!sessionWsUrl) return;
+    if (!sessionWsUrl && !LOCAL_MODE) return;
     void listFixtures()
       .then((names) => {
         setFixtures(names);

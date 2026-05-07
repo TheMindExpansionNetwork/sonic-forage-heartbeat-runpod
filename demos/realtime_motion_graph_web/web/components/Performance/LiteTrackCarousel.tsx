@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { decodeAudioFile, listFixtures } from "@/engine/audio/loadFixture";
+import { LOCAL_MODE } from "@/lib/runtime";
 import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
@@ -50,9 +51,10 @@ export function LiteTrackCarousel() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
 
-  // Same fetch contract as AudioSourceCrate — wait for queue admission.
+  // Daydream-webapp queue-admit gate: standalone DEMON has no queue
+  // (LOCAL_MODE), so we skip the wait there.
   useEffect(() => {
-    if (!sessionWsUrl) return;
+    if (!sessionWsUrl && !LOCAL_MODE) return;
     void listFixtures()
       .then((names) => {
         setFixtures(names);
