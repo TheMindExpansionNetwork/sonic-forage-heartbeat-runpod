@@ -1493,7 +1493,7 @@ class Session {
 
 // ── Session lifecycle ──
 
-async function startSession(interleaved, channels, frames, videos) {
+async function startSession(interleaved, channels, frames, videos, fixtureName) {
   if (session) {
     session.stop();
     session.closeAudio();
@@ -1524,6 +1524,7 @@ async function startSession(interleaved, channels, frames, videos) {
         key: activeKey,
         enabled_loras: getEnabledLoraIdsForConfig(),
         lora_strengths: getEnabledLoraStrengthsForConfig(),
+        fixture_name: fixtureName,
       };
       remote = new RemoteBackend(wsUrlInput.value.trim(), interleaved, channels, config);
       await remote.connect();
@@ -1595,7 +1596,7 @@ async function loadFixtureAudio(name) {
 async function startWithFixture(name) {
   showStatus(`Decoding ${name}...`);
   const { interleaved, channels, frames } = await loadFixtureAudio(name);
-  await startSession(interleaved, channels, frames, availableVideos);
+  await startSession(interleaved, channels, frames, availableVideos, name);
 }
 
 // Populate the fixture selector on page load so the user can pick a
@@ -1656,7 +1657,7 @@ async function swapToFixture(name) {
 
   const remote = session?.remote;
   if (!remote || serverInfo.no_backend) {
-    await startSession(interleaved, channels, frames, availableVideos);
+    await startSession(interleaved, channels, frames, availableVideos, name);
     return;
   }
 
@@ -1683,7 +1684,7 @@ async function swapToFixture(name) {
     };
     remote.addEventListener("swap_ready", onReady);
     remote.addEventListener("swap_failed", onFail);
-    const ok = remote.sendSwapSource(interleaved, channels, activePrompt, activeKey);
+    const ok = remote.sendSwapSource(interleaved, channels, activePrompt, activeKey, name);
     if (!ok) {
       remote.removeEventListener("swap_ready", onReady);
       remote.removeEventListener("swap_failed", onFail);
@@ -1694,7 +1695,7 @@ async function swapToFixture(name) {
   if (!swapped) {
     // Server-side swap failed; fall back to a full session restart so
     // the user still ends up on the requested fixture.
-    await startSession(interleaved, channels, frames, availableVideos);
+    await startSession(interleaved, channels, frames, availableVideos, name);
     return;
   }
   hideStatus();

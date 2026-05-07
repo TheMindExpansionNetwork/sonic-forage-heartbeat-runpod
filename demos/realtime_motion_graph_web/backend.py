@@ -29,8 +29,9 @@ from websockets.exceptions import ConnectionClosed
 
 from acestep.audio.key_detection import detect_key
 from acestep.constants import TASK_INSTRUCTIONS
-from acestep.engine.session import Session
-from acestep.nodes.types import Audio
+from acestep.engine.session import PreparedSource, Session
+from acestep.fixtures import FixtureSidecar, fixture_sidecar
+from acestep.nodes.types import Audio, Latent
 from acestep.paths import (
     EngineNotBuiltError,
     available_dreamvae_decode_engine,
@@ -53,6 +54,99 @@ from .protocol import (
     T,
 )
 from .pipeline import PipelineRunner
+
+
+# ---------------------------------------------------------------------------
+# Source / conditioning resolver (sidecar-aware)
+# ---------------------------------------------------------------------------
+
+def _try_load_sidecar(
+    fixture_name: str | None, *, checkpoint: str, samples: int,
+) -> FixtureSidecar | None:
+    """Look up a fixture sidecar; return None on miss / mismatch.
+
+    Length check guards against runtime truncation that disagrees with
+    what the sidecar was precomputed for (e.g. a smaller TRT profile
+    cap kicking in). The caller falls back to live computation in that
+    case so cached tensor shapes can't poison the streaming pipeline.
+    """
+    if not fixture_name:
+        return None
+    try:
+        sc = fixture_sidecar(fixture_name, checkpoint=checkpoint)
+    except Exception as e:
+        print(f"[Server] sidecar lookup failed for {fixture_name!r}: {e}")
+        return None
+    if sc is None:
+        return None
+    if sc.samples != samples:
+        print(
+            f"[Server] sidecar length mismatch for {fixture_name}: "
+            f"sidecar samples={sc.samples} vs runtime samples={samples}; "
+            f"ignoring sidecar"
+        )
+        return None
+    return sc
+
+
+def _resolve_bpm_key_source(
+    session: Session,
+    *,
+    audio_in: Audio,
+    fixture_name: str | None,
+    samples: int,
+    checkpoint: str,
+    key_override: str | None = None,
+) -> tuple[PreparedSource, int, str]:
+    """Resolve (source, bpm, key) for a (fixture, audio) pair.
+
+    For known fixtures with a sidecar present (JSON+safetensors in the
+    dataset or local staging dir, matching checkpoint and audio length),
+    returns the cached source latent + context_latent and reads BPM /
+    key from the sidecar JSON. Skips librosa beat tracking, CNN key
+    detection, and ``Session.prepare_source`` — the prompt-independent
+    half of the per-connect work.
+
+    Conditioning is *not* cached (see fixtures.py). Callers run
+    ``Session.encode_text`` against ``source.latent`` themselves; with
+    the source latent already on GPU this is ~60ms warm.
+
+    Falls through to live librosa + detect_key + prepare_source when:
+      - ``fixture_name`` is None / unknown
+      - sidecar files aren't in the dataset yet
+      - checkpoint mismatch (tensors are tied to a specific build)
+      - audio-length truncation mismatch (e.g. operator's TRT profile
+        cap is smaller than the natural fixture length)
+
+    ``key_override`` is the swap-source operator override; if supplied,
+    it wins over both sidecar.key and detect_key.
+    """
+    sc = _try_load_sidecar(fixture_name, checkpoint=checkpoint, samples=samples)
+
+    if sc is not None:
+        device = session.handler.device
+        dtype = session.handler.dtype
+        source = PreparedSource(
+            latent=Latent(tensor=sc.latent.to(device, dtype).contiguous()),
+            context_latent=Latent(tensor=sc.context_latent.to(device, dtype).contiguous()),
+        )
+        bpm = sc.bpm
+        key = key_override or sc.key
+        print(f"[Server] sidecar hit ({fixture_name}): bpm={bpm} key={key!r}")
+        return source, bpm, key
+
+    # Live path: librosa BPM, CNN key detection, full prepare_source.
+    import librosa
+    print("[Server] Detecting BPM + key...")
+    mono_np = audio_in.waveform.mean(dim=0).numpy()
+    bpm_raw, _ = librosa.beat.beat_track(y=mono_np, sr=SAMPLE_RATE)
+    bpm = int(round(float(np.asarray(bpm_raw).flat[0])))
+    key = key_override or detect_key(mono_np, SAMPLE_RATE)
+    print(f"  BPM: {bpm}  Key: {key}")
+
+    print("[Server] Preparing source...")
+    source = session.prepare_source(audio_in)
+    return source, bpm, key
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +266,10 @@ def handle_client(
     steps = config.get("steps", 8)
     prompt = config.get("prompt", "instrumental music")
     fast_vae = config.get("fast_vae", False)
+    # Optional fixture-name hint enables sidecar lookup (precomputed BPM,
+    # key, source latent, conditioning). Absent / unknown name -> fully
+    # live path; same behavior as before sidecars existed.
+    fixture_name = config.get("fixture_name")
 
     # LoRA selection.  ``enabled_loras`` is the new id-keyed protocol;
     # ``lora_paths`` / ``lora_path`` are interpreted as filesystem paths
@@ -324,16 +422,13 @@ def handle_client(
 
     audio_in = Audio(waveform=waveform, sample_rate=SAMPLE_RATE)
 
-    print("[Server] Detecting BPM + key...")
-    import librosa
-    mono_np = waveform.mean(dim=0).numpy()
-    detected_bpm, _ = librosa.beat.beat_track(y=mono_np, sr=SAMPLE_RATE)
-    detected_bpm = int(round(float(np.asarray(detected_bpm).flat[0])))
-    detected_key = detect_key(mono_np, SAMPLE_RATE)
-    print(f"  BPM: {detected_bpm}  Key: {detected_key}")
-
-    print("[Server] Preparing source...")
-    source = session.prepare_source(audio_in)
+    source, detected_bpm, detected_key = _resolve_bpm_key_source(
+        session,
+        audio_in=audio_in,
+        fixture_name=fixture_name,
+        samples=int(waveform.shape[1]),
+        checkpoint=checkpoint,
+    )
 
     print("[Server] Text encode...")
     conditioning = session.encode_text(
@@ -610,6 +705,7 @@ def handle_client(
                                 swap_pending["bytes"] = audio_msg
                                 swap_pending["tags"] = tags
                                 swap_pending["key"] = data.get("key")
+                                swap_pending["fixture_name"] = data.get("fixture_name")
             except TimeoutError:
                 pass
             except ConnectionClosed:
@@ -653,11 +749,13 @@ def handle_client(
             audio_msg = swap_pending.get("bytes")
             tags = swap_pending.get("tags")
             requested_key = swap_pending.get("key")
+            new_fixture_name = swap_pending.get("fixture_name")
             if audio_msg is None:
                 return
             swap_pending["bytes"] = None
             swap_pending["tags"] = None
             swap_pending["key"] = None
+            swap_pending["fixture_name"] = None
         try:
             new_channels, new_samples = struct.unpack("<II", audio_msg[:8])
             new_np = np.frombuffer(audio_msg[8:], dtype=np.float32).reshape(
@@ -677,21 +775,20 @@ def handle_client(
                 f"{new_wf.shape[0]}ch)..."
             )
 
-            # Detect on the new audio. Same code path as init.
-            new_mono = new_wf.mean(dim=0).numpy()
-            new_bpm, _ = librosa.beat.beat_track(y=new_mono, sr=SAMPLE_RATE)
-            new_bpm = int(round(float(np.asarray(new_bpm).flat[0])))
-            new_key = detect_key(new_mono, SAMPLE_RATE)
-            print(f"  new BPM: {new_bpm}  new Key: {new_key}")
-
             new_audio_in = Audio(waveform=new_wf, sample_rate=SAMPLE_RATE)
-            new_source = session.prepare_source(new_audio_in)
+            new_source, new_bpm, new_key = _resolve_bpm_key_source(
+                session,
+                audio_in=new_audio_in,
+                fixture_name=new_fixture_name,
+                samples=int(new_wf.shape[1]),
+                checkpoint=checkpoint,
+                key_override=requested_key,
+            )
             new_cond = session.encode_text(
                 tags=tags,
                 instruction=TASK_INSTRUCTIONS["cover"],
                 refer_latent=new_source.latent,
-                bpm=new_bpm, duration=new_audio_duration_s,
-                key=requested_key or new_key,
+                bpm=new_bpm, duration=new_audio_duration_s, key=new_key,
             )
 
             stream.source = new_source

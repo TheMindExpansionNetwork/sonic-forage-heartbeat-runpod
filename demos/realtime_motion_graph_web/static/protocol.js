@@ -297,13 +297,17 @@ export class RemoteBackend extends EventTarget {
    * @param {number} channels
    * @param {string} [tags]  current prompt; falls back to server-side
    * @param {string} [key]   override; otherwise server uses detected key
+   * @param {string} [fixtureName]  identifier the server uses to look up
+   *   precomputed sidecars (BPM, key, source latent, conditioning).
+   *   Omit for ad-hoc uploads.
    */
-  sendSwapSource(interleaved, channels, tags, key) {
+  sendSwapSource(interleaved, channels, tags, key, fixtureName) {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
     try {
       const msg = { type: "swap_source" };
       if (tags) msg.tags = tags;
       if (key) msg.key = key;
+      if (fixtureName) msg.fixture_name = fixtureName;
       this.ws.send(JSON.stringify(msg));
       const samples = interleaved.length / channels;
       const hdr = new ArrayBuffer(8);

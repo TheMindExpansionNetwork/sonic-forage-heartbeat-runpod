@@ -185,6 +185,46 @@ sidecars to generate. Drop the source video into `static/videos/`
 and run the server as usual. If WebGL2 is unavailable the canvas is
 hidden and the plain video plays as fallback.
 
+## Test fixtures
+
+The eight files in `acestep.fixtures.KNOWN_FIXTURES` ship with sidecar
+files in the `daydreamlive/demon-fixtures` HF dataset:
+
+```
+<name>.sidecar.json         # bpm, key, duration metadata
+<name>.sidecar.safetensors  # source latent + context_latent
+```
+
+When the client sends `fixture_name` for a known fixture, the server
+loads the cached source latent + context latent and reads BPM / key
+from the JSON, skipping librosa beat tracking, the CNN key
+classifier, and `Session.prepare_source`. `Session.encode_text` still
+runs live every connect (it depends on the prompt and the demo's
+blended-prompt UI typically diverges from any baked tags within
+seconds of connecting; the ~60ms warm cost isn't worth the cache
+complication). For ad-hoc uploads (no `fixture_name`), the full live
+path runs as before.
+
+The runtime checks `out/fixture_sidecars/` first (so local edits are
+tested without an upload round-trip) and falls through to the
+dataset.
+
+If you want to override the BPM or key for a fixture, edit the
+`<name>.sidecar.json` and re-run the precompute script. Editing the
+JSON's `bpm` / `key` fields and re-running preserves them (the
+script only re-derives values that aren't already pinned). To
+forcibly re-derive everything from scratch, pass `--force`:
+
+```bash
+uv run python -m scripts.precompute_fixture_sidecars
+uv run python -m scripts.precompute_fixture_sidecars --force
+uv run python -m scripts.precompute_fixture_sidecars --only \
+    inside_confusion_loop_60s_gsm.wav
+```
+
+After editing, upload the regenerated `<name>.sidecar.json` and
+`<name>.sidecar.safetensors` pair back to the HF dataset.
+
 ## Browser notes
 
 - **Web Audio**: an `AudioWorkletNode` drives a shared PCM buffer that

@@ -9,16 +9,49 @@ cache and are effectively free.
 Adding a new fixture is a two-step process:
   1. ``huggingface-cli upload daydreamlive/demon-fixtures <file> --repo-type dataset``
   2. Add the filename to :data:`KNOWN_FIXTURES`.
+
+Each fixture optionally has a sidecar pair in the same dataset, used
+by the realtime demo to skip the prompt-independent half of per-connect
+preprocessing:
+
+  ``<name>.sidecar.json``
+      bpm, key, duration metadata.
+  ``<name>.sidecar.safetensors``
+      pre-encoded source latent + semantic context_latent.
+
+Conditioning (encode_text) is intentionally *not* cached: the demo's
+blended-prompt UI typically drifts off any baked tags within seconds,
+and encode_text is cheap enough (~60ms warm) that caching it is not
+worth the complexity. See :func:`fixture_sidecar`. Sidecars are
+produced by ``scripts/precompute_fixture_sidecars.py`` and uploaded
+to the dataset alongside the WAVs.
 """
 
 from __future__ import annotations
 
+import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
+import torch
 from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError
 
 REPO_ID = "daydreamlive/demon-fixtures"
 REPO_TYPE = "dataset"
+
+# Local staging dir for sidecars that haven't been pushed to HF yet.
+# scripts/precompute_fixture_sidecars.py defaults its --out here, and
+# fixture_sidecar() checks this first before falling through to the HF
+# dataset. Override via DEMON_FIXTURE_SIDECARS_DIR.
+_DEFAULT_LOCAL_SIDECAR_DIR = Path(__file__).resolve().parents[1] / "out" / "fixture_sidecars"
+
+
+def _local_sidecar_dir() -> Path:
+    override = os.environ.get("DEMON_FIXTURE_SIDECARS_DIR")
+    return Path(override) if override else _DEFAULT_LOCAL_SIDECAR_DIR
 
 KNOWN_FIXTURES: frozenset[str] = frozenset({
     "inside_confusion_loop_60s_gsm.wav",
@@ -30,6 +63,10 @@ KNOWN_FIXTURES: frozenset[str] = frozenset({
     "thrash_metal_loop_60s_enm.wav",
     "thrash_metal_loop_120s_enm.wav",
 })
+
+# Sidecar schema version. Bump when the on-disk format changes in a way
+# that prior sidecars can't satisfy. Loader refuses mismatches.
+SIDECAR_FORMAT_VERSION = 2
 
 
 def audio_fixture(name: str) -> Path:
@@ -49,3 +86,174 @@ def audio_fixture(name: str) -> Path:
 def ensure_all() -> list[Path]:
     """Pre-warm every known fixture. Returns the local paths in sorted order."""
     return [audio_fixture(name) for name in sorted(KNOWN_FIXTURES)]
+
+
+# ---------------------------------------------------------------------------
+# Key abbreviation parsing
+# ---------------------------------------------------------------------------
+
+# Filenames carry the ground-truth key as a trailing token, since the CNN
+# detector misclassifies enough of the test set to be unreliable. The
+# convention is ``<note><modifier><mode>``:
+#
+#   note      a-g (lowercase)
+#   modifier  s = sharp, n = natural, f = flat (optional in 2-letter form)
+#   mode      m = minor, M = major
+#
+# ``gsm`` -> "G# minor", ``gnm`` -> "G minor", ``enm`` -> "E minor".
+# This is a one-time bridge to seed sidecars; once a fixture has a
+# sidecar JSON, that JSON is authoritative and the filename stops being
+# consulted.
+
+_NOTE_TO_PITCH = {
+    "a": "A", "b": "B", "c": "C", "d": "D",
+    "e": "E", "f": "F", "g": "G",
+}
+_MODIFIER_TO_ACCIDENTAL = {"s": "#", "n": "", "f": "b"}
+
+
+def _parse_key_suffix(suffix: str) -> Optional[str]:
+    """Parse a bare suffix like 'gsm' / 'enm' / 'cM'. Returns None on failure."""
+    if not suffix:
+        return None
+    mode_ch = suffix[-1]
+    if mode_ch == "m":
+        mode = "minor"
+    elif mode_ch == "M":
+        mode = "major"
+    else:
+        return None
+    body = suffix[:-1]
+    if not body:
+        return None
+    note = _NOTE_TO_PITCH.get(body[0].lower())
+    if note is None:
+        return None
+    if len(body) == 1:
+        accidental = ""
+    elif len(body) == 2:
+        accidental = _MODIFIER_TO_ACCIDENTAL.get(body[1].lower())
+        if accidental is None:
+            return None
+    else:
+        return None
+    return f"{note}{accidental} {mode}"
+
+
+def parse_key_from_filename(name: str) -> Optional[str]:
+    """Extract the ACE-Step key string from a fixture filename.
+
+    Splits on the last underscore in the stem and parses the trailing
+    token. ``inside_confusion_loop_60s_gsm.wav`` -> ``"G# minor"``.
+    Returns ``None`` if the suffix isn't recognized.
+    """
+    stem = Path(name).stem
+    suffix = stem.rsplit("_", 1)[-1] if "_" in stem else stem
+    return _parse_key_suffix(suffix)
+
+
+# ---------------------------------------------------------------------------
+# Sidecar loader
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FixtureSidecar:
+    """Loaded sidecar bundle for a known fixture.
+
+    Caches the deterministic, prompt-independent preprocessing the
+    realtime demo would otherwise do on every connect: BPM (librosa),
+    key (parsed from the filename suffix, since the CNN classifier
+    misclassifies enough of the test set to be unreliable), and the
+    source latent + semantic context_latent from
+    ``Session.prepare_source``. Conditioning (encode_text) is *not*
+    cached; the demo's blended-prompt UI means the client typically
+    diverges from any baked tags within seconds of connecting, and
+    encode_text is cheap enough (~60ms warm) that the cache savings
+    don't justify the server-authoritative complication.
+    """
+
+    name: str
+    bpm: int
+    key: str
+    duration_s: float
+    samples: int
+    sample_rate: int
+    channels: int
+    checkpoint: str
+    latent: torch.Tensor
+    context_latent: torch.Tensor
+
+
+def _resolve_sidecar_file(name: str) -> Optional[Path]:
+    """Locate a sidecar file by name. Local staging dir wins over HF.
+
+    Returns None on miss (caller falls back to live computation). The
+    local-first ordering means precompute output can be tested without
+    pushing to the HF dataset; once uploaded, fresh clones get the
+    sidecars from HF on first use.
+    """
+    local = _local_sidecar_dir() / name
+    if local.is_file():
+        return local
+    try:
+        return Path(hf_hub_download(repo_id=REPO_ID, filename=name, repo_type=REPO_TYPE))
+    except EntryNotFoundError:
+        return None
+    except Exception:
+        # Treat any other download error (network, permissions) the same
+        # as a miss so the demo stays usable offline or before sidecars
+        # have been uploaded.
+        return None
+
+
+def fixture_sidecar(name: str, *, checkpoint: str) -> Optional[FixtureSidecar]:
+    """Load the sidecar bundle for ``name`` if available and fresh.
+
+    Returns ``None`` (not an exception) on any of:
+      - ``name`` not in :data:`KNOWN_FIXTURES`
+      - sidecar JSON or safetensors not present in the dataset
+      - format_version mismatch
+      - checkpoint mismatch (sidecar tensors are tied to a specific
+        VAE / DiT build)
+    """
+    if name not in KNOWN_FIXTURES:
+        return None
+
+    json_path = _resolve_sidecar_file(f"{name}.sidecar.json")
+    if json_path is None:
+        return None
+    sf_path = _resolve_sidecar_file(f"{name}.sidecar.safetensors")
+    if sf_path is None:
+        return None
+
+    try:
+        meta = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if int(meta.get("format_version", 0)) != SIDECAR_FORMAT_VERSION:
+        return None
+    if str(meta.get("checkpoint", "")) != checkpoint:
+        return None
+
+    # Lazy import so the basic fixture path doesn't pull torch on import.
+    from safetensors import safe_open
+
+    try:
+        with safe_open(str(sf_path), framework="pt", device="cpu") as f:
+            latent = f.get_tensor("latent")
+            context_latent = f.get_tensor("context_latent")
+    except Exception:
+        return None
+
+    return FixtureSidecar(
+        name=name,
+        bpm=int(meta["bpm"]),
+        key=str(meta["key"]),
+        duration_s=float(meta["duration_s"]),
+        samples=int(meta["samples"]),
+        sample_rate=int(meta["sample_rate"]),
+        channels=int(meta["channels"]),
+        checkpoint=str(meta["checkpoint"]),
+        latent=latent,
+        context_latent=context_latent,
+    )
