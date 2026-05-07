@@ -12,11 +12,14 @@ import type { LoraCatalogEntry } from "@/types/protocol";
 // arrives via /api/loras (cheap filesystem scan, available before WS) and
 // is updated mid-session via the WS "lora_catalog" frame.
 
-// LoRAs flipped on the first time the catalog arrives populated. Matches the
-// safetensors filename stems delivered by /api/loras (see scripts/loras.default.txt).
-// One-shot: a later WS lora_catalog re-broadcast won't re-enable a LoRA the
-// user has explicitly disabled.
-const DEFAULT_ENABLED_LORAS = new Set(["deathstep", "synthpop"]);
+// Preferred LoRA stems flipped on the first time the catalog arrives
+// populated. If a preferred stem isn't in the catalog (different LoRA
+// library locally), the slot falls back to the catalog entry at the
+// same index, then to the next unclaimed entry — so a fresh page-load
+// always lands with two LoRAs hot regardless of which files are on disk.
+// One-shot: a later WS lora_catalog re-broadcast won't re-enable a LoRA
+// the user has explicitly disabled.
+const PREFERRED_DEFAULT_LORAS = ["deathstep", "synthpop"] as const;
 
 interface LoraState {
   catalog: LoraCatalogEntry[];
@@ -44,28 +47,47 @@ export const useLoraStore = create<LoraState>((set) => ({
   setCatalog: (catalog) =>
     set((s) => {
       // Seed missing strengths from the server's reported defaults so a
-      // freshly-arrived LoRA picks up its on-disk default. If the server
-      // omits `strength` (current Python backend behavior), fall back to
-      // LORA_DEFAULT_STRENGTH_FRACTION so the slider lands at a useful
-      // initial level instead of silently sitting at 0.
+      // freshly-arrived LoRA picks up its on-disk default. The Python
+      // backend currently echoes 0.0 for every entry, which we treat as
+      // "unset" and fall back to LORA_DEFAULT_STRENGTH_FRACTION so the
+      // slider lands at a useful initial level. A genuine non-zero
+      // server default still wins.
       const next: Record<string, number> = { ...s.strengths };
       for (const entry of catalog) {
         if (!(entry.id in next)) {
           next[entry.id] =
-            typeof entry.strength === "number"
+            typeof entry.strength === "number" && entry.strength > 0
               ? entry.strength
               : LORA_DEFAULT_STRENGTH_FRACTION * LORA_SLIDER_MAX;
         }
       }
-      // First populated catalog: flip on the canonical default LoRAs so the
-      // demo plays with its intended sound out of the box. Skipped on later
-      // re-broadcasts so disabling a default LoRA sticks.
+      // First populated catalog: flip on the preferred default LoRAs so the
+      // demo plays with its intended sound out of the box. If a preferred
+      // stem isn't in the catalog, fall back to the catalog entry at that
+      // slot index (with dedup so two missing defaults don't both claim the
+      // first entry). Skipped on later re-broadcasts so disabling a seeded
+      // LoRA sticks.
       let enabled = s.enabled;
       let seeded = s._seeded;
       if (!s._seeded && catalog.length > 0) {
         const nextEnabled = new Set(s.enabled);
-        for (const entry of catalog) {
-          if (DEFAULT_ENABLED_LORAS.has(entry.id)) nextEnabled.add(entry.id);
+        const present = new Set(catalog.map((e) => e.id));
+        const claimed = new Set<string>();
+        for (let i = 0; i < PREFERRED_DEFAULT_LORAS.length; i++) {
+          const preferred = PREFERRED_DEFAULT_LORAS[i];
+          let pick: string | undefined;
+          if (present.has(preferred) && !claimed.has(preferred)) {
+            pick = preferred;
+          } else {
+            const slot = catalog[i]?.id;
+            pick = slot && !claimed.has(slot)
+              ? slot
+              : catalog.find((e) => !claimed.has(e.id))?.id;
+          }
+          if (pick) {
+            nextEnabled.add(pick);
+            claimed.add(pick);
+          }
         }
         enabled = nextEnabled;
         seeded = true;
