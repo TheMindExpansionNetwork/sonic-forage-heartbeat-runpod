@@ -357,6 +357,58 @@ class DiffusionEngine:
                 "path, the decoder must have parameters loaded."
             )
 
+    def close(self) -> None:
+        """Release per-engine TRT + LoRA state.
+
+        Called by :meth:`acestep.engine.model_context.ModelContext.close`
+        as part of the :meth:`acestep.engine.session.Session.close` chain.
+        Drops:
+
+        - the TRT execution context (the dominant non-PyTorch GPU buffer:
+          activation/workspace memory, ~1–2 GB for a turbo decoder profile)
+        - the deserialized engine itself (~1.5–3 GB GPU)
+        - the per-shape input/output buffer cache (``_trt_buf_cache``)
+        - the LoRA manager (CPU base/refit buffers + GPU mirror on the
+          eager backend)
+
+        These are *not* freed by Python GC reliably — the polygraphy /
+        pycuda objects keep CUDA references alive until their finalizers
+        run, which can be arbitrarily delayed under reference cycles.
+        Explicit ``del`` here forces the destructor chain immediately.
+
+        Idempotent: subsequent calls are no-ops.
+        """
+        # Drop the buffer cache first (each entry holds a torch.Tensor on
+        # CUDA); it indirectly references the engine via the context.
+        self._trt_buf_cache.clear()
+        # LoRA manager next. It holds a Refitter, which holds an engine
+        # reference. Closing it before the engine clears that ref.
+        if self._lora_manager is not None:
+            try:
+                self._lora_manager.close()
+            except Exception as e:
+                logger.warning("LoRAManagerBase.close raised: %s", e)
+            self._lora_manager = None
+        # Now the TRT context + engine. ``del`` on the instance attribute
+        # is what triggers the polygraphy/pycuda finalizer that frees the
+        # CUDA workspace. Rebinding to None works only when no other
+        # name holds the previous value; ``del`` removes the binding
+        # unconditionally.
+        for attr in ("_trt_ctx", "_trt_engine"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        # Re-establish the attributes as None so the rest of the API
+        # (load_trt_engine, etc.) keeps working if the engine is reused.
+        self._trt_ctx = None
+        self._trt_engine = None
+        # The CUDA stream is process-shared (see vae_nodes._get_trt_stream)
+        # so we just drop our reference, not destroy the stream.
+        self._trt_stream = None
+        # Drop the decoder reference too — it pins the DiT graph that
+        # ModelContext is about to release.
+        self.decoder = None
+        self.model = None
+
     def _trt_decoder_step(
         self,
         hidden_states: torch.Tensor,
