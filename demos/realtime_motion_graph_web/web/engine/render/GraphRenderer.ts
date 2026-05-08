@@ -157,9 +157,21 @@ const BASELINE_BURST_SPARKS = 7; // was 4; denser single trail reads more clearl
 // rate-limit), so the kick still reads — it just gets a wandering
 // single-line trail instead of the full-cluster blast.
 const CHORUS_THRESH = 0.5;
-const CHORUS_FIRE_PROB = 0.55;
+// Probability that a strong-kick disarm fires the full multi-line burst
+// (vs. falling through to a single-line baseline trail). Lower means
+// chorus moments stay rarer / more special; higher means more crowded
+// graph during dense passages. Tuned by feel.
+const CHORUS_FIRE_PROB = 0.45;
 const CHORUS_BURST_BASE = 6;
 const CHORUS_BURST_PEAK = 6; // up to +6 more sparks per line scaled by peakPulse
+
+// Bouncy spark trait. Each spawned spark has BOUNCE_PROB chance of
+// being tagged bouncy; bouncy sparks bounce ONCE off their spawn-line
+// y when gravity pulls them across it, then fall through normally.
+// Reads as a "skipping stone" off the polyline — gives the eye a hint
+// of physics interaction with the line geometry.
+const BOUNCE_PROB = 0.35;
+const BOUNCE_DAMPING = 0.55;
 
 // Pool size. Sized so a full chorus burst (~20 lines × up to 12 sparks
 // = 240) plus baseline trails (~7 / 250 ms = ~36 alive over a 1.3 s
@@ -201,6 +213,12 @@ export class GraphRenderer {
   private readonly _spBirth = new Float32Array(MAX_SPARKS);
   private readonly _spColor = new Uint16Array(MAX_SPARKS);
   private readonly _spAlive = new Uint8Array(MAX_SPARKS);
+  // Bouncy flag — when set, the spark bounces once off its spawn-line
+  // y when gravity pulls it back across that y. One-bounce-only so the
+  // effect reads as a "skip" off the line rather than continuous chatter.
+  // Cleared after the bounce. Set probabilistically at spawn.
+  private readonly _spBouncy = new Uint8Array(MAX_SPARKS);
+  private readonly _spBounceY = new Float32Array(MAX_SPARKS);
   // Hint for the allocator's free-slot search. Always start scanning
   // from here; advance past whatever we hand out. When the pool is
   // mostly empty, this gives O(1) allocation; when full, the scan
@@ -478,15 +496,32 @@ export class GraphRenderer {
               SPARK_MIN_SPEED +
               Math.random() * (SPARK_MAX_SPEED - SPARK_MIN_SPEED);
             const slot = this._allocSpark(now);
+            const bouncy = Math.random() < BOUNCE_PROB ? 1 : 0;
             this._spX[slot] = playheadX;
             this._spY[slot] = sparkY;
             this._spVX[slot] = Math.cos(sa) * sp;
-            this._spVY[slot] = Math.sin(sa) * sp;
+            // Bouncy sparks need controlled upward velocity at spawn so
+            // they (a) actually rise above the spawn line (b) fall back
+            // within the spark's lifetime. Free-running sa would put
+            // half of them moving DOWN at spawn (instant bounce, no
+            // visible skip) and the other half moving UP fast enough to
+            // exceed lifetime before gravity drags them back. -2 to -3
+            // gives a peak height of ~30 px above the line and a 1.1 s
+            // round-trip — well within SPARK_LIFE_MS.
+            this._spVY[slot] = bouncy
+              ? -(2 + Math.random())
+              : Math.sin(sa) * sp;
             this._spAge[slot] = 0;
             this._spLife[slot] = SPARK_LIFE_MS - 150 + Math.random() * 300;
             this._spBirth[slot] = burstBirthAt;
             this._spColor[slot] = colorIdx;
             this._spAlive[slot] = 1;
+            // Bouncy trait — coin flip per spark. Bounce target is the
+            // spawn-line y at the spark's birth x; once it crosses back
+            // through this y under gravity, vy flips with damping and
+            // bouncy clears (one bounce only).
+            this._spBouncy[slot] = bouncy;
+            this._spBounceY[slot] = sparkY;
           }
         }
       }
@@ -494,9 +529,11 @@ export class GraphRenderer {
       // Sparks — physics + render in a single pool walk. Alpha is
       // applied via globalAlpha (one numeric assignment) instead of a
       // per-spark `rgba(...)` string allocation; fillStyle changes only
-      // when the next alive spark belongs to a different line. fillRect
-      // skips the path tessellation cost of arc(); at 2.5 px in motion
-      // the visual is indistinguishable from circles.
+      // when the next alive spark belongs to a different line. Disc
+      // shape uses arc()+fill() so dots read as round at any size; the
+      // per-spark cost is negligible (~3x of fillRect, still sub-ms for
+      // ~MAX_SPARKS sparks per frame on M-class hardware).
+      const TAU = Math.PI * 2;
       let lastColorIdx = -1;
       for (let i = 0; i < MAX_SPARKS; i++) {
         if (!this._spAlive[i]) continue;
@@ -508,10 +545,28 @@ export class GraphRenderer {
           continue;
         }
         this._spAge[i] = age;
-        const newVY = this._spVY[i] + SPARK_GRAVITY * dtScale;
-        this._spVY[i] = newVY;
+        let newVY = this._spVY[i] + SPARK_GRAVITY * dtScale;
+        const prevY = this._spY[i];
         const x = this._spX[i] + this._spVX[i] * dtScale;
-        const y = this._spY[i] + newVY * dtScale;
+        let y = prevY + newVY * dtScale;
+        // Bounce: if this spark is bouncy and we just crossed its
+        // spawn-line y while moving down, clamp to the line and flip
+        // vy with damping. One bounce per spark — bouncy clears so
+        // subsequent frames fall through normally. Strict `<` on
+        // prevY: at spawn, prevY === bY, so without strictness the
+        // first frame's downward delta would trigger a sham bounce.
+        // Combined with the upward-velocity force in the spawn loop,
+        // every bouncy spark rises clear of bY first, then falls back
+        // and crosses strictly from above — that's the visible skip.
+        if (this._spBouncy[i] && newVY > 0) {
+          const bY = this._spBounceY[i];
+          if (prevY < bY && y > bY) {
+            y = bY;
+            newVY = -newVY * BOUNCE_DAMPING;
+            this._spBouncy[i] = 0;
+          }
+        }
+        this._spVY[i] = newVY;
         this._spX[i] = x;
         this._spY[i] = y;
         const f = age / life;
@@ -523,8 +578,9 @@ export class GraphRenderer {
           lastColorIdx = colorIdx;
         }
         ctx.globalAlpha = 1 - f;
-        const d = radius + radius;
-        ctx.fillRect(x - radius, y - radius, d, d);
+        ctx.beginPath();
+        ctx.arc(x, y, radius, 0, TAU);
+        ctx.fill();
       }
       ctx.globalAlpha = 1;
 
