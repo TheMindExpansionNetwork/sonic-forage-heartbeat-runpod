@@ -116,6 +116,12 @@ interface Spark {
   vy: number;
   age: number;
   life: number;
+  // Wall-clock millis at which the spark "activates". Sparks with
+  // birthAt > now are skipped entirely — no aging, no rendering — so
+  // chorus bursts can stagger per line and read as a cascade across
+  // the cluster instead of one synchronized cloud. For non-staggered
+  // (baseline) sparks, set birthAt = now at spawn.
+  birthAt: number;
   r: number;
   g: number;
   b: number;
@@ -125,11 +131,18 @@ interface Spark {
 // are tuned long + flat so they extend visibly along the rendered
 // line history rather than arcing down quickly.
 const SPARK_GRAVITY = 0.06; // was 0.10 (cursor 0.16); even flatter for trails along the line
-const SPARK_RADIUS = 2; // matches SPARK_RADIUS in cursor.ts (4px diameter)
+const SPARK_RADIUS = 2.5; // bumped from 2 for more visible streaks
 const SPARK_MIN_SPEED = 4.5;
 const SPARK_MAX_SPEED = 8.5;
-const SPARK_LIFE_MS = 1200; // was 900; longer so trails reach further into the history
+const SPARK_LIFE_MS = 1300; // longer so trails reach further into the history
 const SPARK_CONE_RAD = Math.PI / 5; // ~36° spread around the leftward axis
+
+// Per-line cascade stagger on chorus moments. When chorus fires, each
+// line's sparks get a small `birthAt` offset so they don't all spawn
+// on the same frame — reads as a brief sweep across the cluster
+// instead of one big synchronized cloud. Hash-based per line so the
+// cascade order is stable per name.
+const CHORUS_STAGGER_MAX_MS = 120;
 const LEFT_ANGLE = Math.PI; // 180° — pure leftward, toward the past
 
 // Baseline trigger — fires on the falling edge of small/medium kicks
@@ -139,19 +152,20 @@ const LEFT_ANGLE = Math.PI; // 180° — pure leftward, toward the past
 // silent for longer than BASELINE_MAX_INTERVAL_MS, fires anyway so
 // the graph never goes fully still.
 const BEAT_THRESH = 0.3;
-const BASELINE_MIN_INTERVAL_MS = 400;
-const BASELINE_MAX_INTERVAL_MS = 1500;
-const BASELINE_BURST_SPARKS = 4;
+const BASELINE_MIN_INTERVAL_MS = 250; // was 400; allows ~every-beat firing at 120 BPM
+const BASELINE_MAX_INTERVAL_MS = 1200; // was 1500; silence fallback fires a little sooner
+const BASELINE_BURST_SPARKS = 7; // was 4; denser single trail reads more clearly
 
 // Chorus — when a kick's peak strength exceeds CHORUS_THRESH, every
-// line fires a bigger burst simultaneously. Big kicks light the whole
-// graph; smaller ones get the wandering single-line baseline instead.
-// Chorus also fires through the curve-editor gate (see
-// `curveEditorOpen` arg on draw()) — the curve scheduler dims the
-// baseline so users editing curves aren't distracted, but big musical
-// moments still register.
-const CHORUS_THRESH = 0.6;
-const CHORUS_BURST_BASE = 4;
+// line fires a bigger burst simultaneously. Probabilistic so not
+// every strong kick lights up the whole graph: most do, but enough
+// don't that the chorus moment retains its surprise. A failed chorus
+// roll falls through to a regular baseline fire (subject to its own
+// rate-limit), so the kick still reads — it just gets a wandering
+// single-line trail instead of the full-cluster blast.
+const CHORUS_THRESH = 0.5;
+const CHORUS_FIRE_PROB = 0.55;
+const CHORUS_BURST_BASE = 6;
 const CHORUS_BURST_PEAK = 6; // up to +6 more sparks per line scaled by peakPulse
 
 const MAX_SPARKS = 240;
@@ -228,11 +242,7 @@ export class GraphRenderer {
     }
   }
 
-  draw(
-    pulse = 0,
-    now: number = performance.now(),
-    curveEditorOpen = false,
-  ): void {
+  draw(pulse = 0, now: number = performance.now()): void {
     // ResizeObserver in the constructor already keeps {w, h} in sync,
     // including the display:none → block transition. The legacy
     // getBoundingClientRect() self-heal that used to live here forced a
@@ -343,7 +353,11 @@ export class GraphRenderer {
         if (pulse > this._peakPulse) this._peakPulse = pulse;
       } else if (this._aboveBeat) {
         const peak = this._peakPulse;
-        if (peak >= CHORUS_THRESH) {
+        // Chorus is probabilistic — even on strong kicks it only
+        // fires CHORUS_FIRE_PROB of the time. A denied chorus roll
+        // falls through to baseline so the kick still registers as
+        // a wandering trail rather than disappearing entirely.
+        if (peak >= CHORUS_THRESH && Math.random() < CHORUS_FIRE_PROB) {
           chorusFire = true;
           chorusPeakStrength = peak;
         } else if (
@@ -355,17 +369,14 @@ export class GraphRenderer {
         this._peakPulse = 0;
       }
       // Silence fallback: if no beats have fired baseline for too
-      // long, fire one anyway. Skipped when the curve editor is open.
+      // long, fire one anyway so the graph never goes fully still.
       if (
-        !curveEditorOpen &&
         !chorusFire &&
         !baselineFire &&
         now - this._lastBaselineFireAt >= BASELINE_MAX_INTERVAL_MS
       ) {
         baselineFire = true;
       }
-      // Curve-editor gate: drop baseline entirely; chorus still fires.
-      if (curveEditorOpen) baselineFire = false;
 
       // Pick the baseline line at fire-time so the user sees a fresh
       // random pick on every burst.
@@ -418,8 +429,17 @@ export class GraphRenderer {
         // exclusive — chorus already fires the chosen line, so baseline
         // is suppressed during chorus.
         let burstCount = 0;
+        let burstBirthAt = now;
         if (chorusFire) {
           burstCount = chorusBurstCount;
+          // Hash → [0, CHORUS_STAGGER_MAX_MS) per-line cascade offset.
+          // Reuse the same hash already computed for the y dodge;
+          // different bit window so stagger and dodge aren't correlated
+          // (otherwise the line that dodges most would also fire last,
+          // which reads as a single tilted sweep).
+          const staggerMs =
+            (Math.abs(hash >> 17) % 1000) / 1000 * CHORUS_STAGGER_MAX_MS;
+          burstBirthAt = now + staggerMs;
         } else if (name === this._baselineLine) {
           burstCount = BASELINE_BURST_SPARKS;
           this._baselineLine = null; // consumed
@@ -438,6 +458,7 @@ export class GraphRenderer {
             vy: Math.sin(sa) * sp,
             age: 0,
             life: SPARK_LIFE_MS - 150 + Math.random() * 300,
+            birthAt: burstBirthAt,
             r,
             g,
             b,
@@ -446,9 +467,11 @@ export class GraphRenderer {
       }
 
       // Sparks — physics + render + cull. Walking backwards so splice
-      // doesn't shift indices we still need to visit.
+      // doesn't shift indices we still need to visit. Skip sparks that
+      // haven't reached their birthAt yet (pre-birth chorus stagger).
       for (let i = this._sparks.length - 1; i >= 0; i--) {
         const s = this._sparks[i];
+        if (now < s.birthAt) continue;
         s.age += dt;
         if (s.age >= s.life) {
           this._sparks.splice(i, 1);

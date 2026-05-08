@@ -27,7 +27,6 @@ import {
   tickTurntable,
   type Turntable,
 } from "@/engine/render/turntable";
-import { useCurveStore } from "@/store/useCurveStore";
 import { useLoraStore } from "@/store/useLoraStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
@@ -192,7 +191,7 @@ export function useRenderLoop(refs: Refs) {
       }
 
       hud.draw(frac, { transparentBg: false });
-      graph.draw(kick, now, useCurveStore.getState().overlayOpen);
+      graph.draw(kick, now);
 
       // Drive ribbons. The top-edge bar's --fill is the denoise slider; the
       // L/R bars track the first/second active LoRA. For Phase 8 just feed
