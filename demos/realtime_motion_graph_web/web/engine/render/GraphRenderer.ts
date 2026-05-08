@@ -111,8 +111,9 @@ interface History {
 // trail across the rendered line history in their line's color,
 // reinforcing the "time is flowing past you" cue.
 //
-// Storage: struct-of-arrays in pre-allocated TypedArrays, slot reuse via
-// a ring pointer. Zero per-frame allocation, zero array shift/splice,
+// Storage: struct-of-arrays in pre-allocated TypedArrays. Allocation
+// (_allocSpark) prefers dead slots and protects pre-birth staggered
+// chorus sparks. Zero per-frame allocation, zero array shift/splice,
 // no per-spark fillStyle string. The pre-2026-perf-pass implementation
 // used a Spark[] with shift()/splice()/push() and built an `rgba(...)`
 // string per spark per frame; on chorus kicks (240 sparks alive) that
@@ -160,7 +161,16 @@ const CHORUS_FIRE_PROB = 0.55;
 const CHORUS_BURST_BASE = 6;
 const CHORUS_BURST_PEAK = 6; // up to +6 more sparks per line scaled by peakPulse
 
-const MAX_SPARKS = 240;
+// Pool size. Sized so a full chorus burst (~20 lines × up to 12 sparks
+// = 240) plus baseline trails (~7 / 250 ms = ~36 alive over a 1.3 s
+// lifetime) plus a second chorus event arriving inside the first one's
+// lifetime all fit without forcing eviction of pre-birth sparks. The
+// chorus stagger pushes some sparks' birthAt up to 120 ms into the
+// future; if those slots get overwritten before they're born, the user
+// never sees them — which is exactly the "no big burst on strong kick"
+// regression we hit in perf pass #4. Pool sizing + a smarter allocator
+// (see _allocSpark below) make that case impossible.
+const MAX_SPARKS = 384;
 
 // Per-line vertical "dodge" so signals with similar values at the
 // playhead don't squish into a single visual blob during chorus. Hash
@@ -177,10 +187,11 @@ export class GraphRenderer {
   private readonly histories: Map<string, History> = new Map();
   private readonly _resizeObs: ResizeObserver;
   // Spark pool — SoA TypedArrays. Slot is alive when _spAlive[i] === 1.
-  // Allocation is a ring pointer: _spNextSlot advances on each spawn,
-  // overwriting whatever was there. With MAX_SPARKS sized for the worst
-  // chorus burst, this approximates "evict oldest" (the original Spark[]
-  // shift() semantic) without an O(n) scan.
+  // Allocation goes through _allocSpark(now), which prefers free slots
+  // and never evicts pre-birth (staggered chorus) sparks. See that
+  // method for why this is non-trivial. The pre-2026-perf-pass
+  // implementation used a Spark[] with shift()/splice()/push() — see
+  // PERFORMANCE.md for the full incident write-up.
   private readonly _spX = new Float32Array(MAX_SPARKS);
   private readonly _spY = new Float32Array(MAX_SPARKS);
   private readonly _spVX = new Float32Array(MAX_SPARKS);
@@ -190,7 +201,11 @@ export class GraphRenderer {
   private readonly _spBirth = new Float32Array(MAX_SPARKS);
   private readonly _spColor = new Uint16Array(MAX_SPARKS);
   private readonly _spAlive = new Uint8Array(MAX_SPARKS);
-  private _spNextSlot = 0;
+  // Hint for the allocator's free-slot search. Always start scanning
+  // from here; advance past whatever we hand out. When the pool is
+  // mostly empty, this gives O(1) allocation; when full, the scan
+  // degrades gracefully (see _allocSpark).
+  private _spAllocHint = 0;
   // Per-line color cache: name → index into _colorTable. The table holds
   // pre-built `rgb(r,g,b)` strings so the render loop sets fillStyle to a
   // string we already own, never allocating a new one per spark.
@@ -322,7 +337,7 @@ export class GraphRenderer {
 
     // Per-line dot at the playhead + two-layer leftward confetti
     // trails shed from the dot. Sparks live in the SoA pool above
-    // (_spX/_spY/...), capped at MAX_SPARKS, allocated via ring pointer.
+    // (_spX/_spY/...), capped at MAX_SPARKS, allocated via _allocSpark.
     //
     // Layer 1 (baseline): on the falling edge of small/medium kicks
     // (peakPulse in [BEAT_THRESH, CHORUS_THRESH)), pick ONE random
@@ -462,9 +477,7 @@ export class GraphRenderer {
             const sp =
               SPARK_MIN_SPEED +
               Math.random() * (SPARK_MAX_SPEED - SPARK_MIN_SPEED);
-            const slot = this._spNextSlot;
-            this._spNextSlot =
-              this._spNextSlot + 1 >= MAX_SPARKS ? 0 : this._spNextSlot + 1;
+            const slot = this._allocSpark(now);
             this._spX[slot] = playheadX;
             this._spY[slot] = sparkY;
             this._spVX[slot] = Math.cos(sa) * sp;
@@ -544,6 +557,56 @@ export class GraphRenderer {
     ctx.moveTo(playheadX + 0.5, 0);
     ctx.lineTo(playheadX + 0.5, h);
     ctx.stroke();
+  }
+
+  /**
+   * Allocate a slot for a new spark. Strategy:
+   *   1. Scan forward from `_spAllocHint` for a dead slot — O(1) when
+   *      the pool has any free space, which is the common case.
+   *   2. If the pool is fully alive, evict the slot whose age/life
+   *      ratio is highest (the spark closest to dying naturally).
+   *      Skip pre-birth slots (now < birthAt) — those are staggered
+   *      chorus sparks the user hasn't seen yet; overwriting them is
+   *      the worst outcome.
+   *   3. If even step 2 finds nothing (every slot is pre-birth — only
+   *      possible at saturating spawn rates), fall back to the alloc
+   *      hint and accept the visual loss.
+   *
+   * This replaced a naive ring-pointer allocator from the initial
+   * pool rewrite that overwrote whatever was at the next slot — which
+   * during a chorus burst meant the burst's own staggered late-firing
+   * sparks were getting overwritten by subsequent baseline trails
+   * before they could be born. Symptom: chorus bursts looked sparse
+   * or missing entirely on strong kicks.
+   */
+  private _allocSpark(now: number): number {
+    // Step 1: linear probe for a dead slot starting at the hint.
+    for (let attempt = 0; attempt < MAX_SPARKS; attempt++) {
+      const idx = this._spAllocHint;
+      this._spAllocHint =
+        this._spAllocHint + 1 >= MAX_SPARKS ? 0 : this._spAllocHint + 1;
+      if (!this._spAlive[idx]) return idx;
+    }
+    // Step 2: pool fully alive. Pick the spark closest to natural death,
+    // skipping pre-birth slots (they're "promised" to the user).
+    let bestIdx = -1;
+    let bestF = -1;
+    for (let i = 0; i < MAX_SPARKS; i++) {
+      if (now < this._spBirth[i]) continue;
+      const f = this._spAge[i] / this._spLife[i];
+      if (f > bestF) {
+        bestF = f;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0) return bestIdx;
+    // Step 3: every slot is pre-birth. Vanishingly rare — would require
+    // 384 staggered sparks all in the future, more than a chorus event
+    // ever spawns. Accept the loss and overwrite at the hint.
+    const idx = this._spAllocHint;
+    this._spAllocHint =
+      this._spAllocHint + 1 >= MAX_SPARKS ? 0 : this._spAllocHint + 1;
+    return idx;
   }
 
   destroy(): void {
