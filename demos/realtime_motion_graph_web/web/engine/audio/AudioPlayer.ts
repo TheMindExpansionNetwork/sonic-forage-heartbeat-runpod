@@ -17,6 +17,13 @@ export class AudioPlayer {
   swapCount = 0;
   channels = 2;
   frameCount = 0;
+  // Most recent kick (RMS over a 480-frame window, soft-clipped to [0,1]).
+  // Computed by the AudioWorklet on the audio thread and posted alongside
+  // position; the main render path reads it via getKick(). On the
+  // ScriptProcessor fallback path this stays 0 — kick reactivity degrades
+  // gracefully (no flashes on beats) rather than blocking the main thread
+  // with a per-frame RMS loop. See PERFORMANCE.md.
+  kick = 0;
 
   private _listeners: Set<MirrorListener> = new Set();
   private _mirror: Float32Array | null = null;
@@ -56,10 +63,16 @@ export class AudioPlayer {
       this.node = node;
 
       node.port.onmessage = (e: MessageEvent) => {
-        const msg = e.data as { type: string; positionSec?: number; swapCount?: number };
+        const msg = e.data as {
+          type: string;
+          positionSec?: number;
+          swapCount?: number;
+          kick?: number;
+        };
         if (msg.type === "position") {
           this.positionSec = msg.positionSec ?? 0;
           this.swapCount = msg.swapCount ?? this.swapCount;
+          if (typeof msg.kick === "number") this.kick = msg.kick;
         }
       };
 

@@ -3,6 +3,7 @@
 import { useEffect } from "react";
 
 import { evaluateCurve } from "@/engine/curves/interp";
+import { frameScheduler } from "@/engine/scheduler/FrameScheduler";
 import {
   isManualOverrideActive,
   usePerformanceStore,
@@ -31,33 +32,27 @@ import { LORA_SLIDER_MAX, SLIDER_META } from "@/types/engine";
 // would just churn renders without any visible effect.
 export function useScheduledCurves(): void {
   useEffect(() => {
-    let raf = 0;
-    let cancelled = false;
-
-    const tick = () => {
-      if (cancelled) return;
-      const curveState = useCurveStore.getState();
-      // Master kill-switch: when disabled, no curve drives anything,
-      // regardless of per-curve enabled flags. The user's drawings are
-      // preserved; they just don't apply.
-      if (!curveState.scheduleEnabled) {
-        raf = requestAnimationFrame(tick);
-        return;
-      }
-      const session = useSessionStore.getState();
-      const player = session.player;
-      const remote = session.remote;
-      // Need both: player gives us positionSec, remote gives duration
-      // (audio length the engine is generating against). Skip cleanly
-      // when not playing.
-      if (player && remote && remote.duration > 0) {
+    // Compute-phase tick: writes sliderValues before useRenderLoop's
+    // render phase reads them. Bails cheaply when scheduleEnabled is
+    // false — it stays registered but does ~zero work each frame.
+    // Pre-2026 this was a self-scheduling rAF that woke up every vsync
+    // even when the master kill-switch was off; now it shares a single
+    // rAF with the rest of the render path.
+    const unregister = frameScheduler.register(
+      "scheduled-curves",
+      () => {
+        const curveState = useCurveStore.getState();
+        if (!curveState.scheduleEnabled) return;
+        const session = useSessionStore.getState();
+        const player = session.player;
+        const remote = session.remote;
+        if (!player || !remote || remote.duration <= 0) return;
         const t = Math.min(
           1,
           Math.max(0, player.positionSec / remote.duration),
         );
         const curves = curveState.curves;
-        const setSliderDirect =
-          usePerformanceStore.getState().setSliderDirect;
+        const setSliderDirect = usePerformanceStore.getState().setSliderDirect;
         for (const param of Object.keys(curves)) {
           const c = curves[param];
           if (!c.enabled) continue;
@@ -71,14 +66,9 @@ export function useScheduledCurves(): void {
             : (SLIDER_META[param]?.max ?? 1.0);
           setSliderDirect(param, yNorm * max);
         }
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf);
-    };
+      },
+      { phase: "compute", budgetMs: 1 },
+    );
+    return () => unregister();
   }, []);
 }

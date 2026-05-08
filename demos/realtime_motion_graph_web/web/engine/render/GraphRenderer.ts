@@ -1,12 +1,13 @@
 // Parameter-history graph display. Maintains a rolling buffer per signal
 // and renders glowing polylines + a playhead.
 //
-// Glow uses the GPU-accelerated shadowBlur path (not ctx.filter:blur,
-// which falls back to software in Skia). The glow pass is intentionally
-// dialed back from earlier iterations — at full pulse the bloom should
-// read as a gentle in-color smear, not an additive white flash. Tuning
-// knobs live in the per-line loop below; bump them in lockstep if the
-// pulse needs to read more aggressively again.
+// Beat energy reads through three channels: line width pulses with
+// kick, the playhead does an additive "lighter" glow stroke on strong
+// kicks, and the spark bursts (below) trail behind the playhead. The
+// pre-2026 implementation used per-line ctx.shadowBlur strokes scaled
+// by pulse — that defeats Skia's blur cache and was the dominant
+// per-frame cost during music. Don't add shadowBlur back without
+// reading PERFORMANCE.md first.
 //
 // Independently of pulse, each signal renders a small orbital dot at its
 // playhead intersection (a colored disc + a white satellite on a slow
@@ -109,23 +110,14 @@ interface History {
 // "now"). Reads as a chromatic streak behind the playhead — sparks
 // trail across the rendered line history in their line's color,
 // reinforcing the "time is flowing past you" cue.
-interface Spark {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  age: number;
-  life: number;
-  // Wall-clock millis at which the spark "activates". Sparks with
-  // birthAt > now are skipped entirely — no aging, no rendering — so
-  // chorus bursts can stagger per line and read as a cascade across
-  // the cluster instead of one synchronized cloud. For non-staggered
-  // (baseline) sparks, set birthAt = now at spawn.
-  birthAt: number;
-  r: number;
-  g: number;
-  b: number;
-}
+//
+// Storage: struct-of-arrays in pre-allocated TypedArrays, slot reuse via
+// a ring pointer. Zero per-frame allocation, zero array shift/splice,
+// no per-spark fillStyle string. The pre-2026-perf-pass implementation
+// used a Spark[] with shift()/splice()/push() and built an `rgba(...)`
+// string per spark per frame; on chorus kicks (240 sparks alive) that
+// was the dominant per-frame allocator and cause of beat-correlated
+// jank. See PERFORMANCE.md for the full incident write-up.
 
 // Spark physics. Disc size matches cursor.ts confetti (2px); trails
 // are tuned long + flat so they extend visibly along the rendered
@@ -184,7 +176,26 @@ export class GraphRenderer {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly histories: Map<string, History> = new Map();
   private readonly _resizeObs: ResizeObserver;
-  private readonly _sparks: Spark[] = [];
+  // Spark pool — SoA TypedArrays. Slot is alive when _spAlive[i] === 1.
+  // Allocation is a ring pointer: _spNextSlot advances on each spawn,
+  // overwriting whatever was there. With MAX_SPARKS sized for the worst
+  // chorus burst, this approximates "evict oldest" (the original Spark[]
+  // shift() semantic) without an O(n) scan.
+  private readonly _spX = new Float32Array(MAX_SPARKS);
+  private readonly _spY = new Float32Array(MAX_SPARKS);
+  private readonly _spVX = new Float32Array(MAX_SPARKS);
+  private readonly _spVY = new Float32Array(MAX_SPARKS);
+  private readonly _spAge = new Float32Array(MAX_SPARKS);
+  private readonly _spLife = new Float32Array(MAX_SPARKS);
+  private readonly _spBirth = new Float32Array(MAX_SPARKS);
+  private readonly _spColor = new Uint16Array(MAX_SPARKS);
+  private readonly _spAlive = new Uint8Array(MAX_SPARKS);
+  private _spNextSlot = 0;
+  // Per-line color cache: name → index into _colorTable. The table holds
+  // pre-built `rgb(r,g,b)` strings so the render loop sets fillStyle to a
+  // string we already own, never allocating a new one per spark.
+  private readonly _colorIdxByName: Map<string, number> = new Map();
+  private readonly _colorTable: string[] = [];
   // Wall-clock millis at which the most recent baseline burst fired,
   // and the line picked to fire it. `_baselineLine` is consumed (set
   // to null) inside the per-line loop once that line actually fires,
@@ -276,12 +287,13 @@ export class GraphRenderer {
       ctx.fillRect(0, 0, w, h);
     }
 
-    // Glow + crisp line per signal. Build the path once, stroke twice:
-    // first wide with shadowBlur (GPU-accelerated on Chromium/Safari's
-    // accelerated canvas), then thin and sharp on top. This replaces
-    // `ctx.filter = blur(...)`, which falls back to software in Skia
-    // and was eating 5–15 ms / frame during active music — exactly the
-    // "whole-page lag during beats" shape.
+    // One stroke per signal. The pre-2026-perf-pass implementation did a
+    // second wide stroke with `shadowBlur = 1 + 1.5 * pulse` for a glow
+    // halo whenever pulse > 0.1 — but per-stroke shadowBlur with a
+    // beat-driven radius defeats Skia's compositor cache (every frame is
+    // a fresh blur kernel) and was firing for every line on every frame
+    // of music. Beat energy still reads through the playhead glow below
+    // and the spark bursts; the per-line halo wasn't pulling its weight.
     for (const [name, hist] of this.histories) {
       const n = Math.min(hist.filled, VISIBLE_SAMPLES);
       if (n < 2) continue;
@@ -301,28 +313,16 @@ export class GraphRenderer {
         else ctx.lineTo(x, y);
       }
 
-      if (pulse > 0.1) {
-        ctx.save();
-        ctx.globalCompositeOperation = "lighter";
-        ctx.shadowColor = `rgba(${r},${g},${b},${0.25 + 0.25 * pulse})`;
-        ctx.shadowBlur = 1 + 1.5 * pulse;
-        ctx.shadowOffsetX = 0;
-        ctx.shadowOffsetY = 0;
-        ctx.strokeStyle = `rgba(${r},${g},${b},${0.3 + 0.4 * pulse})`;
-        ctx.lineWidth = 1.5 + 1.5 * pulse;
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      ctx.shadowBlur = 0;
-      ctx.strokeStyle = `rgba(${r},${g},${b},1)`;
-      ctx.lineWidth = 1;
+      // Line widens slightly with pulse so beats still register on the
+      // line itself, but no shadowBlur — pure crisp stroke.
+      ctx.strokeStyle = `rgba(${r},${g},${b},${0.85 + 0.15 * pulse})`;
+      ctx.lineWidth = 1 + 0.5 * pulse;
       ctx.stroke();
     }
 
     // Per-line dot at the playhead + two-layer leftward confetti
-    // trails shed from the dot. Sparks live in `this._sparks`, capped
-    // at MAX_SPARKS.
+    // trails shed from the dot. Sparks live in the SoA pool above
+    // (_spX/_spY/...), capped at MAX_SPARKS, allocated via ring pointer.
     //
     // Layer 1 (baseline): on the falling edge of small/medium kicks
     // (peakPulse in [BEAT_THRESH, CHORUS_THRESH)), pick ONE random
@@ -445,64 +445,91 @@ export class GraphRenderer {
           this._baselineLine = null; // consumed
         }
 
-        for (let i = 0; i < burstCount; i++) {
-          if (this._sparks.length >= MAX_SPARKS) this._sparks.shift();
-          const sa = LEFT_ANGLE + (Math.random() - 0.5) * 2 * SPARK_CONE_RAD;
-          const sp =
-            SPARK_MIN_SPEED +
-            Math.random() * (SPARK_MAX_SPEED - SPARK_MIN_SPEED);
-          this._sparks.push({
-            x: playheadX,
-            y: sparkY,
-            vx: Math.cos(sa) * sp,
-            vy: Math.sin(sa) * sp,
-            age: 0,
-            life: SPARK_LIFE_MS - 150 + Math.random() * 300,
-            birthAt: burstBirthAt,
-            r,
-            g,
-            b,
-          });
+        if (burstCount > 0) {
+          // Resolve / cache this line's color-table index once outside
+          // the inner spawn loop. _colorTable holds pre-built `rgb(...)`
+          // strings; the render pass reuses them as fillStyle without
+          // ever building a per-spark string.
+          let colorIdx = this._colorIdxByName.get(name);
+          if (colorIdx === undefined) {
+            colorIdx = this._colorTable.length;
+            this._colorTable.push(`rgb(${r},${g},${b})`);
+            this._colorIdxByName.set(name, colorIdx);
+          }
+          for (let i = 0; i < burstCount; i++) {
+            const sa =
+              LEFT_ANGLE + (Math.random() - 0.5) * 2 * SPARK_CONE_RAD;
+            const sp =
+              SPARK_MIN_SPEED +
+              Math.random() * (SPARK_MAX_SPEED - SPARK_MIN_SPEED);
+            const slot = this._spNextSlot;
+            this._spNextSlot =
+              this._spNextSlot + 1 >= MAX_SPARKS ? 0 : this._spNextSlot + 1;
+            this._spX[slot] = playheadX;
+            this._spY[slot] = sparkY;
+            this._spVX[slot] = Math.cos(sa) * sp;
+            this._spVY[slot] = Math.sin(sa) * sp;
+            this._spAge[slot] = 0;
+            this._spLife[slot] = SPARK_LIFE_MS - 150 + Math.random() * 300;
+            this._spBirth[slot] = burstBirthAt;
+            this._spColor[slot] = colorIdx;
+            this._spAlive[slot] = 1;
+          }
         }
       }
 
-      // Sparks — physics + render + cull. Walking backwards so splice
-      // doesn't shift indices we still need to visit. Skip sparks that
-      // haven't reached their birthAt yet (pre-birth chorus stagger).
-      for (let i = this._sparks.length - 1; i >= 0; i--) {
-        const s = this._sparks[i];
-        if (now < s.birthAt) continue;
-        s.age += dt;
-        if (s.age >= s.life) {
-          this._sparks.splice(i, 1);
+      // Sparks — physics + render in a single pool walk. Alpha is
+      // applied via globalAlpha (one numeric assignment) instead of a
+      // per-spark `rgba(...)` string allocation; fillStyle changes only
+      // when the next alive spark belongs to a different line. fillRect
+      // skips the path tessellation cost of arc(); at 2.5 px in motion
+      // the visual is indistinguishable from circles.
+      let lastColorIdx = -1;
+      for (let i = 0; i < MAX_SPARKS; i++) {
+        if (!this._spAlive[i]) continue;
+        if (now < this._spBirth[i]) continue;
+        const age = this._spAge[i] + dt;
+        const life = this._spLife[i];
+        if (age >= life) {
+          this._spAlive[i] = 0;
           continue;
         }
-        s.vy += SPARK_GRAVITY * dtScale;
-        s.x += s.vx * dtScale;
-        s.y += s.vy * dtScale;
-        const f = s.age / s.life;
-        const alpha = 1 - f;
+        this._spAge[i] = age;
+        const newVY = this._spVY[i] + SPARK_GRAVITY * dtScale;
+        this._spVY[i] = newVY;
+        const x = this._spX[i] + this._spVX[i] * dtScale;
+        const y = this._spY[i] + newVY * dtScale;
+        this._spX[i] = x;
+        this._spY[i] = y;
+        const f = age / life;
         const radius = SPARK_RADIUS * (1 - f * 0.7);
         if (radius <= 0.1) continue;
-        ctx.fillStyle = `rgba(${s.r},${s.g},${s.b},${alpha.toFixed(3)})`;
-        ctx.beginPath();
-        ctx.arc(s.x, s.y, radius, 0, Math.PI * 2);
-        ctx.fill();
+        const colorIdx = this._spColor[i];
+        if (colorIdx !== lastColorIdx) {
+          ctx.fillStyle = this._colorTable[colorIdx];
+          lastColorIdx = colorIdx;
+        }
+        ctx.globalAlpha = 1 - f;
+        const d = radius + radius;
+        ctx.fillRect(x - radius, y - radius, d, d);
       }
+      ctx.globalAlpha = 1;
 
       ctx.restore();
     }
 
-    // Playhead — same shadowBlur trick. Glow halo + crisp 1px line.
-    if (pulse > 0.05) {
+    // Playhead glow. The pre-2026-perf-pass version used
+    // `shadowBlur = 4 * pulse` and fired whenever pulse > 0.05 —
+    // i.e. essentially every frame of any non-silent music, with a
+    // continuously varying blur radius (worst case for Skia's blur
+    // cache). Replaced with a wider semi-transparent stroke under
+    // "lighter" composite — visually similar at speed, no shadowBlur.
+    // Gated at pulse > 0.2 so it only fires on meaningful kicks.
+    if (pulse > 0.2) {
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
-      ctx.shadowColor = `rgba(150, 180, 220, ${0.9 * pulse})`;
-      ctx.shadowBlur = 4 * pulse;
-      ctx.shadowOffsetX = 0;
-      ctx.shadowOffsetY = 0;
-      ctx.strokeStyle = `rgba(150, 180, 220, ${0.9 * pulse})`;
-      ctx.lineWidth = 2 + 5 * pulse;
+      ctx.strokeStyle = `rgba(150, 180, 220, ${0.45 * pulse})`;
+      ctx.lineWidth = 4 + 8 * pulse;
       ctx.beginPath();
       ctx.moveTo(playheadX + 0.5, 0);
       ctx.lineTo(playheadX + 0.5, h);
@@ -510,7 +537,7 @@ export class GraphRenderer {
       ctx.restore();
     }
 
-    ctx.shadowBlur = 0;
+
     ctx.strokeStyle = `rgba(255, 255, 255, ${0.6 + 0.4 * pulse})`;
     ctx.lineWidth = 1;
     ctx.beginPath();

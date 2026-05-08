@@ -183,6 +183,15 @@ body.cursor-idle .cursor-canvas { opacity: 0; }
 #performance {
   position: fixed;
   inset: 0;
+  /* --bloom-amount is written here (not on :root) so style recalc on
+     every binned-kick change only walks this subtree, not the whole
+     document. `isolation: isolate` promotes the scene to its own
+     stacking context so the compositor can keep the rest of the page
+     (cursor, anything outside #performance) on a separate layer that
+     doesn't repaint when bloom changes. Avoiding `contain: paint`
+     because position:fixed/absolute descendants (modals, tooltips)
+     would get clipped. */
+  isolation: isolate;
 }
 
 #start-overlay {

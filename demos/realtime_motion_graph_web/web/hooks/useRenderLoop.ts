@@ -3,8 +3,8 @@
 import { useEffect, type RefObject } from "react";
 
 import { tickActiveCursor } from "@/engine/cursor";
-import { kickRms } from "@/engine/render/audioFeatures";
 import { EffectsRenderer } from "@/engine/render/EffectsRenderer";
+import { frameScheduler } from "@/engine/scheduler/FrameScheduler";
 import { GraphRenderer } from "@/engine/render/GraphRenderer";
 import { HUD } from "@/engine/render/HUD";
 import { getConfig, subscribeConfig } from "@/lib/config";
@@ -51,7 +51,6 @@ export function useRenderLoop(refs: Refs) {
     if (!hudEl || !graphEl) return;
 
     let cancelled = false;
-    let raf = 0;
 
     const hud = new HUD(hudEl);
     const graph = new GraphRenderer(graphEl);
@@ -139,6 +138,13 @@ export function useRenderLoop(refs: Refs) {
     // that read --bloom-amount) from re-rastering on frames where the
     // binned kick hasn't actually changed.
     let lastBloom = -1;
+    // Bloom host: target the performance scene root so style recalc is
+    // scoped to the subtree that actually consumes --bloom-amount, not
+    // the whole document. Falls back to <html> if the element isn't
+    // mounted yet (e.g. very first frames before the scene exists).
+    // Cached per-frame: re-resolve when null so a delayed mount picks up,
+    // but stop walking the DOM once we have it.
+    let bloomHost: HTMLElement | null = null;
 
     function tick(now: number) {
       if (cancelled) return;
@@ -151,8 +157,23 @@ export function useRenderLoop(refs: Refs) {
         const dur = session.player.duration;
         const pos = session.player.positionSec;
         frac = dur > 0 ? Math.max(0, Math.min(1, pos / dur)) : 0;
-        const mirror = session.player.getMirror();
-        kick = kickRms(mirror, pos, dur, session.player.channels);
+        // Kick is computed in the AudioWorklet on the audio thread and
+        // posted with each position update (~21 ms cadence). Reading
+        // it here is a single field load — no per-frame audio buffer
+        // walk on the main thread. The ScriptProcessor fallback path
+        // leaves player.kick = 0 (graceful degradation; non-secure
+        // contexts only). See PERFORMANCE.md.
+        kick = session.player.kick;
+      }
+      // CI / devtools synthetic-kick override: set window.__PERF_STRESS_KICK__
+      // to a number in [0, 1] to drive the visuals as if a kick of that
+      // strength were happening continuously. Used by tests/perf/smoke.mjs
+      // to measure chorus-frame cost without needing real audio playback.
+      if (
+        typeof window !== "undefined" &&
+        typeof (window as { __PERF_STRESS_KICK__?: number }).__PERF_STRESS_KICK__ === "number"
+      ) {
+        kick = (window as { __PERF_STRESS_KICK__?: number }).__PERF_STRESS_KICK__ ?? kick;
       }
 
       // Bloom CSS var, rounded to 0.1 bins so the document doesn't
@@ -165,10 +186,12 @@ export function useRenderLoop(refs: Refs) {
       const bloom = Math.round(kick * 10) / 10;
       if (typeof document !== "undefined") {
         if (bloom !== lastBloom) {
-          document.documentElement.style.setProperty(
-            "--bloom-amount",
-            bloom.toString(),
-          );
+          if (!bloomHost) {
+            bloomHost =
+              (document.getElementById("performance") as HTMLElement | null) ??
+              document.documentElement;
+          }
+          bloomHost.style.setProperty("--bloom-amount", bloom.toString());
           lastBloom = bloom;
         }
       }
@@ -243,26 +266,26 @@ export function useRenderLoop(refs: Refs) {
       // glow halo pulses in lockstep with the perimeter ribbons without
       // either side needing to read a CSS variable.
       tickActiveCursor(now, bloom);
-
-      raf = requestAnimationFrame(tick);
     }
 
-    function onVisibility() {
-      if (document.hidden) {
-        if (raf) cancelAnimationFrame(raf);
-        raf = 0;
-      } else if (!raf && !cancelled) {
-        raf = requestAnimationFrame(tick);
-      }
-    }
-    document.addEventListener("visibilitychange", onVisibility);
-
-    raf = requestAnimationFrame(tick);
+    // Single-rAF policy: master render loop registers with FrameScheduler.
+    // Compute-phase callbacks (tweens, scheduled curves) run before this
+    // tick on the same frame, so the store state we read is up to date.
+    // When document.hidden, skip the work entirely — Chrome throttles
+    // rAF to 1 Hz on hidden tabs but we want zero work, not slow work.
+    const unregister = frameScheduler.register(
+      "render-loop",
+      (now) => {
+        if (cancelled) return;
+        if (typeof document !== "undefined" && document.hidden) return;
+        tick(now);
+      },
+      { phase: "render", budgetMs: 10 },
+    );
 
     return () => {
       cancelled = true;
-      if (raf) cancelAnimationFrame(raf);
-      document.removeEventListener("visibilitychange", onVisibility);
+      unregister();
       sessionUnsub();
       mirrorUnsub?.();
       unsubEffectsConfig?.();

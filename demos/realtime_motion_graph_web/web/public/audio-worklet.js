@@ -14,6 +14,15 @@
 const CROSSFADE_SECONDS = 0.05;
 const SEAM_FADE_SECONDS = 0.05;  // loop-seam crossfade at end-of-buffer
 const REPORT_EVERY = 1024;  // frames between position reports
+// Kick / RMS window. 480 frames at 48 kHz is ~10 ms — long enough to
+// average a kick transient, short enough to track sub-beat dynamics.
+// Sliding sum-of-squares is maintained incrementally; periodic refresh
+// (every REFRESH frames) re-computes from the buffer to bound floating-
+// point drift. KICK_SOFT_GAIN matches the main-thread kickRms() the
+// worklet replaces (was: `rms * 1.6`, clamped to [0,1]).
+const KICK_WINDOW = 480;
+const KICK_REFRESH = 48000;  // ~1 s — drift is microscopic in float32 anyway
+const KICK_SOFT_GAIN = 1.6;
 
 class RealtimeBufferProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -32,6 +41,14 @@ class RealtimeBufferProcessor extends AudioWorkletProcessor {
     this.seamFadeLen = Math.max(1, Math.floor(sampleRate * SEAM_FADE_SECONDS));
 
     this._framesSinceReport = 0;
+
+    // Kick state: ring of squared frame energies, running sum.
+    this._kickRing = new Float32Array(KICK_WINDOW);
+    this._kickHead = 0;
+    this._kickFilled = 0;
+    this._kickSumSq = 0;
+    this._lastKick = 0;
+    this._kickFramesSinceRefresh = 0;
 
     this.port.onmessage = (e) => this._onmessage(e.data);
   }
@@ -136,9 +153,44 @@ class RealtimeBufferProcessor extends AudioWorkletProcessor {
         }
       }
 
+      // Kick / RMS — sliding sum of squared frame energies. Frame energy
+      // is the mean of the output channels at this frame; squaring gives
+      // us the input to RMS. We update the ring incrementally (subtract
+      // oldest, add newest) so per-frame cost is O(1). Done here on the
+      // audio thread so the main render loop never has to read the audio
+      // buffer to derive a beat signal — a per-frame mirror walk used to
+      // cost a budget slice on every render frame.
+      let frameEnergy = 0;
+      for (let c = 0; c < outChannels; c++) frameEnergy += output[c][i];
+      frameEnergy /= outChannels;
+      const sq = frameEnergy * frameEnergy;
+      const oldSq = this._kickRing[this._kickHead];
+      this._kickSumSq += sq - oldSq;
+      this._kickRing[this._kickHead] = sq;
+      this._kickHead = (this._kickHead + 1) % KICK_WINDOW;
+      if (this._kickFilled < KICK_WINDOW) this._kickFilled++;
+
       this.position++;
       if (this.position >= nCur) this.position = seam;
     }
+
+    // Periodic refresh of _kickSumSq from the ring to bound float drift.
+    // At float32 precision over ~1 s of accumulation drift is well below
+    // perceptual threshold, but the recompute is cheap enough.
+    this._kickFramesSinceRefresh += frames;
+    if (this._kickFramesSinceRefresh >= KICK_REFRESH) {
+      this._kickFramesSinceRefresh = 0;
+      let s = 0;
+      for (let i = 0; i < this._kickFilled; i++) s += this._kickRing[i];
+      this._kickSumSq = s;
+    }
+
+    // Compute the kick value once per process() block, not per frame.
+    // The sliding window already smooths the signal; main-thread visuals
+    // poll this at rAF cadence. RMS, soft-clip, clamp.
+    const denom = this._kickFilled || 1;
+    const rms = Math.sqrt(Math.max(0, this._kickSumSq) / denom);
+    this._lastKick = Math.max(0, Math.min(1, rms * KICK_SOFT_GAIN));
 
     this._framesSinceReport += frames;
     if (this._framesSinceReport >= REPORT_EVERY) {
@@ -147,6 +199,7 @@ class RealtimeBufferProcessor extends AudioWorkletProcessor {
         type: "position",
         positionSec: this.position / sampleRate,
         swapCount: this.swapCount,
+        kick: this._lastKick,
       });
     }
 

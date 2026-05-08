@@ -2,6 +2,8 @@
 
 import { create } from "zustand";
 
+import { frameScheduler } from "@/engine/scheduler/FrameScheduler";
+
 import {
   SLIDER_META,
   type DcwMode,
@@ -74,13 +76,18 @@ interface Tween {
   startTime: number;
 }
 const tweens = new Map<string, Tween>();
-let rafId: number | null = null;
+// Active FrameScheduler registration handle, or null when no tweens are
+// running. We register on first tween, unregister when the map empties —
+// keeps the master rAF callback from doing dead work while idle.
+let tweenUnregister: (() => void) | null = null;
 
-function tickTweens(): void {
-  rafId = null;
+function tickTweens(now: number): void {
+  if (tweens.size === 0) {
+    // Defensive: scheduler keeps calling until we unregister, but we
+    // already unregister at the end of any frame that drains the map.
+    return;
+  }
   const state = usePerformanceStore.getState();
-  if (tweens.size === 0) return;
-  const now = performance.now();
   const durationMs = state.smoothMs;
   const updates: Record<string, number> = {};
   for (const [param, t] of tweens) {
@@ -101,8 +108,9 @@ function tickTweens(): void {
       sliderValues: { ...s.sliderValues, ...updates },
     }));
   }
-  if (tweens.size > 0 && typeof requestAnimationFrame !== "undefined") {
-    rafId = requestAnimationFrame(tickTweens);
+  if (tweens.size === 0 && tweenUnregister) {
+    tweenUnregister();
+    tweenUnregister = null;
   }
 }
 
@@ -116,8 +124,11 @@ function ensureTween(param: string): void {
     start: sliderValues[param] ?? 0,
     startTime: performance.now(),
   });
-  if (rafId === null && typeof requestAnimationFrame !== "undefined") {
-    rafId = requestAnimationFrame(tickTweens);
+  if (!tweenUnregister) {
+    tweenUnregister = frameScheduler.register("tweens", tickTweens, {
+      phase: "compute",
+      budgetMs: 1,
+    });
   }
 }
 
