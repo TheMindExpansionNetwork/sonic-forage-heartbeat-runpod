@@ -18,6 +18,14 @@ export interface DecodedFixture {
   sampleRate: number;
 }
 
+// Server-side latent pool size (1920 * 5 = 9600 samples = 0.2 s at
+// 48 kHz). backend.py and the sidecar precompute both align to this;
+// trimming the decoded fixture to the same boundary keeps the runtime
+// `samples` count matching the sidecar's recorded `samples` field, so
+// `_try_load_sidecar` accepts the cached BPM / key / latents instead
+// of falling back to live CNN detection.
+const SAMPLE_POOL = 9600;
+
 /** Decoder runs on a short-lived real AudioContext at SAMPLE_RATE so the
  *  PCM matches what the pod's pipeline expects. We previously used
  *  OfflineAudioContext here; recent Chromium builds occasionally never
@@ -46,20 +54,24 @@ async function decodeArrayBuffer(bytes: ArrayBuffer): Promise<DecodedFixture> {
   const rawFrames = audioBuffer.length;
   const channels = 2;
 
-  // Length normalize: trim to a whole-second multiple. Browsers'
+  // Length normalize: trim to a multiple of the server's latent pool
+  // (1920 * 5 = 9600 samples = 0.2 s at 48 kHz, mirroring backend.py's
+  // `pool` and scripts/precompute_fixture_sidecars.py's POOL). Browsers'
   // decodeAudioData honours the mp3 encoder-padding header and returns
-  // a non-integer-second sample count for many real-world files (e.g.
-  // a 142.96 s mp3 with 23 ms of priming silence at the head). The
+  // a non-pool-aligned sample count for many real-world files (e.g. a
+  // 142.96 s mp3 with 23 ms of priming silence at the head). The
   // server-side VAE encode then computes a latent count off that ragged
   // tail and can underflow into a negative time dim — we saw
   // `Trying to create tensor with negative dimension -1: [1, 128, -1]`
-  // on a track with exactly that shape. Whole-second alignment also
-  // matches what every TRT engine profile expects (60/120/240 s
-  // boundaries) and is what server-side fixture caches assume.
-  // Trimming the partial tail loses < 1 s of audio; padding with
-  // zeros would risk an audible click.
+  // on a track with exactly that shape. Pool alignment is what every
+  // server step (VAE encode, sidecar samples field, TRT engine
+  // selection) actually requires; aligning to whole seconds (the
+  // previous rule) was strictly coarser and broke fixtures whose
+  // natural pool-aligned length isn't a whole second — e.g. the lo-fi
+  // loop is 57.6 s, so the whole-second trim shaved it to 57.0 s and
+  // missed the sidecar lookup, falling back to CNN key detection.
   const sr = audioBuffer.sampleRate;
-  const frames = Math.floor(rawFrames / sr) * sr;
+  const frames = Math.floor(rawFrames / SAMPLE_POOL) * SAMPLE_POOL;
   if (frames < sr) {
     throw new Error(
       `Audio too short — need ≥ 1 second, got ${(rawFrames / sr).toFixed(2)} s.`,

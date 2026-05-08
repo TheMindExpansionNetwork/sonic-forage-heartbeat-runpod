@@ -74,11 +74,15 @@ export function useFixtureSwap() {
         remote.addEventListener("swap_failed", onFail);
 
         const perf = usePerformanceStore.getState();
+        // Key is intentionally not sent: server resolves via the new
+        // fixture's sidecar (or CNN-detects on a miss) and echoes the
+        // result in `swap_ready.key`, which we then write to the
+        // dropdown via setKey(detail.key) above.
         const sent = remote.sendSwapSource(
           interleaved,
           channels,
           perf.promptA,
-          perf.activeKey,
+          undefined,
           name,
         );
         if (!sent) {

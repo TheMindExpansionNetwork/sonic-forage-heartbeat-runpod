@@ -64,12 +64,14 @@ function buildConfig(fixtureName: string): SessionConfig {
     crop: cfg.crop,
     steps: cfg.steps,
     fast_vae: cfg.fast_vae,
-    key: perf.activeKey,
     enabled_loras: enabledLoras,
     prompt: perf.promptA,
     lora_strengths: loraStrengths,
     // Lets the server look up a precomputed sidecar (BPM, key, source
     // latent, context_latent). Absent / unknown name -> live path.
+    // Key is intentionally not sent: the server picks sidecar.key for
+    // known fixtures and CNN-detects for live uploads, then echoes the
+    // result back in `ready` so the dropdown reflects what was used.
     fixture_name: fixtureName,
   };
 }

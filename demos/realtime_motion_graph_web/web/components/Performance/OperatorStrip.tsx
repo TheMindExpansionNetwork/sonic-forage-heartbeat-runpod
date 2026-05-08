@@ -157,9 +157,17 @@ export function OperatorStrip() {
       <select
         id="key-select"
         className="fixture-select"
-        title="Musical key — auto-detected; override re-sends prompt"
+        title="Musical key — sidecar / auto-detected; changes apply immediately"
         value={activeKey}
-        onChange={(e) => setKey(e.target.value)}
+        onChange={(e) => {
+          const newKey = e.target.value;
+          setKey(newKey);
+          const remote = useSessionStore.getState().remote;
+          if (remote) {
+            const { promptA } = usePerformanceStore.getState();
+            remote.sendPrompt(promptA, newKey);
+          }
+        }}
       >
         {VALID_KEYSCALES.map((k) => (
           <option key={k} value={k}>
