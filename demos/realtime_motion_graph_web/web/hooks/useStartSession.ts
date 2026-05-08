@@ -3,7 +3,7 @@
 import { useCallback } from "react";
 
 import { AudioPlayer } from "@/engine/audio/AudioPlayer";
-import { listFixtures, loadFixtureAudio } from "@/engine/audio/loadFixture";
+import { listFixtures, loadFixtureAudio, pickDefaultFixture } from "@/engine/audio/loadFixture";
 import { defaultWsUrl } from "@/engine/podUrl";
 import { RemoteBackend, SLICE_FLAG_DELTA } from "@/engine/protocol";
 import { getApiKey } from "@/engine/rtmgConfig";
@@ -94,7 +94,7 @@ export function useStartSession() {
     if (!fixtureName) {
       try {
         const list = await listFixtures();
-        fixtureName = list[0] ?? "";
+        fixtureName = pickDefaultFixture(list);
         if (fixtureName) {
           usePerformanceStore.getState().setFixture(fixtureName);
         }

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { decodeAudioFile, listFixtures } from "@/engine/audio/loadFixture";
+import { decodeAudioFile, listFixtures, pickDefaultFixture } from "@/engine/audio/loadFixture";
 import { togglePauseAndAudio } from "@/engine/audio/togglePauseAndAudio";
 import { LOCAL_MODE } from "@/lib/runtime";
 import { useCurveStore } from "@/store/useCurveStore";
@@ -51,8 +51,9 @@ export function OperatorStrip() {
     void listFixtures()
       .then((names) => {
         setFixtures(names);
-        if (!usePerformanceStore.getState().fixture && names[0]) {
-          setFixture(names[0]);
+        const def = pickDefaultFixture(names);
+        if (!usePerformanceStore.getState().fixture && def) {
+          setFixture(def);
         }
       })
       .catch(() => setFixtures([]));
