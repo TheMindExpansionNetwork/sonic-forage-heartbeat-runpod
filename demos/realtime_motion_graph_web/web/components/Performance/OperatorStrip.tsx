@@ -25,7 +25,6 @@ export function OperatorStrip() {
   const [fixtures, setFixtures] = useState<string[]>([]);
   const fixture = usePerformanceStore((s) => s.fixture);
   const activeKey = usePerformanceStore((s) => s.activeKey);
-  const detectedKey = usePerformanceStore((s) => s.detectedKey);
   const kiosk = usePerformanceStore((s) => s.kiosk);
   const paused = usePerformanceStore((s) => s.paused);
   const showKbdHints = usePerformanceStore((s) => s.showKbdHints);
@@ -184,38 +183,44 @@ export function OperatorStrip() {
           if (file) void onFilePicked(file);
         }}
       />
-      <div
-        className="key-control-group"
-        title="Tells the model what key the song is in. Does not transpose audio."
+      <select
+        id="key-select"
+        className="fixture-select"
+        title="Musical key — sidecar / auto-detected; changes apply immediately"
+        value={activeKey}
+        onChange={(e) => {
+          const newKey = e.target.value;
+          if (newKey === activeKey) return;
+          // Surface what this control actually does. Users were reading
+          // it as a song-pitch transposer (which it isn't) — the
+          // confirm is a one-off "are you sure" with the explanation
+          // attached, so the action stays one click away but the
+          // misconception gets corrected before the change applies.
+          const ok =
+            typeof window === "undefined" ||
+            window.confirm(
+              `Change key to "${newKey}"?\n\nThis tells the model what key the song is in. It does NOT change the song's pitch or transpose the audio.`,
+            );
+          if (!ok) {
+            // Bounce the <select> back to the previous value so the UI
+            // reflects the cancelled state.
+            e.currentTarget.value = activeKey;
+            return;
+          }
+          setKey(newKey);
+          const remote = useSessionStore.getState().remote;
+          if (remote) {
+            const { promptA } = usePerformanceStore.getState();
+            remote.sendPrompt(promptA, newKey);
+          }
+        }}
       >
-        <span className="key-detected-readout">
-          Detected: <strong>{detectedKey ?? "—"}</strong>
-        </span>
-        <label className="key-override-label" htmlFor="key-select">
-          Override
-        </label>
-        <select
-          id="key-select"
-          className="fixture-select"
-          title="Override the model's key hint. Does not transpose audio."
-          value={activeKey}
-          onChange={(e) => {
-            const newKey = e.target.value;
-            setKey(newKey);
-            const remote = useSessionStore.getState().remote;
-            if (remote) {
-              const { promptA } = usePerformanceStore.getState();
-              remote.sendPrompt(promptA, newKey);
-            }
-          }}
-        >
-          {VALID_KEYSCALES.map((k) => (
-            <option key={k} value={k}>
-              {k}
-            </option>
-          ))}
-        </select>
-      </div>
+        {VALID_KEYSCALES.map((k) => (
+          <option key={k} value={k}>
+            {k}
+          </option>
+        ))}
+      </select>
       <button
         id="kiosk-toggle"
         className={`pause-btn${kiosk ? " active" : ""}`}
