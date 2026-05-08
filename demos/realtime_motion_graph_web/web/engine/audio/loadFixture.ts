@@ -137,3 +137,13 @@ export async function listFixtures(): Promise<string[]> {
   const json = (await res.json()) as string[];
   return json;
 }
+
+// Preferred default the UI picks when no fixture is yet selected. Falls
+// back to names[0] if the catalog doesn't contain it (e.g. removed from
+// KNOWN_FIXTURES upstream).
+export const PREFERRED_DEFAULT_FIXTURE = "low_fi_Gm_loop_60s_gnm.wav";
+
+export function pickDefaultFixture(names: readonly string[]): string {
+  if (names.includes(PREFERRED_DEFAULT_FIXTURE)) return PREFERRED_DEFAULT_FIXTURE;
+  return names[0] ?? "";
+}

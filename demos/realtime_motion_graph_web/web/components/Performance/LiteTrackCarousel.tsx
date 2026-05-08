@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { decodeAudioFile, listFixtures } from "@/engine/audio/loadFixture";
+import { decodeAudioFile, listFixtures, pickDefaultFixture } from "@/engine/audio/loadFixture";
 import { LOCAL_MODE } from "@/lib/runtime";
 import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
@@ -58,8 +58,9 @@ export function LiteTrackCarousel() {
     void listFixtures()
       .then((names) => {
         setFixtures(names);
-        if (!usePerformanceStore.getState().fixture && names[0]) {
-          setFixture(names[0]);
+        const def = pickDefaultFixture(names);
+        if (!usePerformanceStore.getState().fixture && def) {
+          setFixture(def);
         }
       })
       .catch(() => setFixtures([]));
