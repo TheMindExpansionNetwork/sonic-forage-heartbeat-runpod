@@ -665,28 +665,30 @@ export class GraphRenderer {
               // unit-normalised; normal = (-slope, 1) / sqrt(1 + slope²).
               // Reflected v = v - 2 (v · n) n; energy lost via uniform
               // damping factor on both components.
-              //
-              // Constraint on top of the physics: sparks always trail
-              // leftward (into the past, away from the playhead). A
-              // physically-correct reflection on a steep down-right
-              // slope would kick the spark rightward — true to physics
-              // but visually wrong here, since the right side of the
-              // playhead is "future" the engine hasn't generated yet.
-              // We mirror any rightward reflection back to leftward,
-              // preserving the slope-driven vy magnitude but keeping
-              // the timeline metaphor intact. Same shape of fix as
-              // the playhead clamp below; it's the velocity-side twin.
               const slope = bestSlope;
               const invNormMag = 1 / Math.sqrt(1 + slope * slope);
               const nx = -slope * invNormMag;
               const ny = invNormMag;
               const vDotN = newVX * nx + newVY * ny;
-              let rVX = newVX - 2 * vDotN * nx;
-              const rVY = newVY - 2 * vDotN * ny;
-              if (rVX > 0) rVX = -rVX;
-              newVX = rVX * BOUNCE_DAMPING;
-              newVY = rVY * BOUNCE_DAMPING;
+              newVX = (newVX - 2 * vDotN * nx) * BOUNCE_DAMPING;
+              newVY = (newVY - 2 * vDotN * ny) * BOUNCE_DAMPING;
               y = bestLineY;
+
+              // If the reflection kicked the spark rightward (toward
+              // the playhead), cap its remaining lifetime so it fades
+              // out before it reaches the playhead-as-wall. Avoids the
+              // visual hiccup where a rightward-moving spark hits the
+              // wall and stops dead. Using 85% of the time-to-impact
+              // as the new lifetime gives the alpha decay enough room
+              // to take the spark to ~zero before the wall would.
+              if (newVX > 0 && x < playheadX) {
+                const framesToWall = (playheadX - x) / newVX;
+                const msToWall = framesToWall * 16; // approximate frame ms
+                const cappedRemaining = msToWall * 0.85;
+                if (cappedRemaining < life - age) {
+                  this._spLife[i] = age + cappedRemaining;
+                }
+              }
 
               if (bestColorIdx === ownColor) {
                 this._spOwnBounces[i] = ownBounces + 1;
