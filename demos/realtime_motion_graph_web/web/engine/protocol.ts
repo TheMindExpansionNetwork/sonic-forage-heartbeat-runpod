@@ -527,6 +527,21 @@ export class RemoteBackend extends EventTarget {
   }
 
   /**
+   * Pick a Library fixture as the active timbre reference. The server
+   * resolves the WAV from its local HF cache and runs the same apply
+   * path as a PCM upload, so the browser doesn't have to fetch +
+   * decode + re-upload a file that already lives on the pod's disk.
+   * Replies with timbre_set on success or timbre_failed on error
+   * (e.g. unknown fixture name).
+   */
+  sendSetTimbreFixture(name: string): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ type: "set_timbre_fixture", name }));
+    } catch {}
+  }
+
+  /**
    * Drop the active timbre reference; server falls back to self-timbre
    * (encode against the playback source's own latent). Replies with
    * timbre_cleared on success.
@@ -554,6 +569,19 @@ export class RemoteBackend extends EventTarget {
     return this.sendAudioFrame(
       "set_structure_source", name, interleaved, channels,
     );
+  }
+
+  /**
+   * Pick a Library fixture as the active structure reference. Server-
+   * side counterpart to sendSetTimbreFixture: avoids the wasteful
+   * fetch+decode+upload round trip for fixtures that already live on
+   * the pod's disk. Replies with structure_set / structure_failed.
+   */
+  sendSetStructureFixture(name: string): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ type: "set_structure_fixture", name }));
+    } catch {}
   }
 
   /**

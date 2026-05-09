@@ -32,7 +32,9 @@ from acestep.audio.key_detection import detect_key
 from acestep.constants import TASK_INSTRUCTIONS
 from acestep.engine.session import PreparedSource, Session
 from acestep.engine.trt.profile_manager import TRTProfileManager
-from acestep.fixtures import FixtureSidecar, fixture_sidecar
+from acestep.fixtures import (
+    FixtureSidecar, KNOWN_FIXTURES, audio_fixture, fixture_sidecar,
+)
 from acestep.nodes.types import Audio, Latent
 from acestep.paths import (
     EngineNotBuiltError,
@@ -692,6 +694,112 @@ def handle_client(
         if r is not None:
             r.mark_hint_dirty()
 
+    def _load_fixture_waveform(name: str) -> torch.Tensor:
+        """Read a known fixture WAV from the local HF cache into a
+        ``[≤2, N]`` float32 tensor. Used by the ``set_*_fixture`` fast
+        path so a Library pick doesn't have to round-trip through the
+        browser as decoded PCM (the file already lives on this pod's
+        disk; ``audio_fixture`` resolves to the cache hit). Caller is
+        responsible for any further truncation / pool alignment."""
+        if name not in KNOWN_FIXTURES:
+            raise ValueError(f"unknown fixture: {name}")
+        # Lazy import: the byte-upload path doesn't pull soundfile, and
+        # we don't want a hard import-time dep just for this fast path.
+        import soundfile as sf
+
+        path = audio_fixture(name)
+        audio_data, sr = sf.read(str(path), always_2d=True)
+        if sr != SAMPLE_RATE:
+            raise ValueError(
+                f"fixture {name!r} sample rate {sr}, expected {SAMPLE_RATE}",
+            )
+        return torch.from_numpy(audio_data.T.copy()).float()[:2]
+
+    def _apply_timbre_waveform(t_wf: torch.Tensor, name: str) -> float:
+        """Mutate timbre state for a new ref. Returns post-truncation
+        duration (seconds). Rolls back to prior state and re-raises on
+        any failure. Caller sends the ack.
+
+        Shared by the byte-upload (``set_timbre_source``) and fixture
+        fast (``set_timbre_fixture``) paths so cache lookup, encode
+        fallback, cond-pair refresh, and rollback semantics stay in
+        one place."""
+        prev_timbre_latent = timbre_latent_ref[0]
+        prev_timbre_name = timbre_name_ref[0]
+        prev_cond_pair = cond_pair_ref[0]
+        prev_stream_cond = stream.conditioning
+        try:
+            cap = int(duration_ref[0] * SAMPLE_RATE)
+            t_wf = t_wf[:, :cap]
+            rem = t_wf.shape[-1] % pool
+            if rem:
+                t_wf = t_wf[:, :t_wf.shape[-1] - rem]
+            if t_wf.shape[-1] < pool:
+                raise ValueError("timbre clip too short")
+            clip_s = t_wf.shape[-1] / SAMPLE_RATE
+            sc = _try_load_sidecar(
+                name, checkpoint=checkpoint,
+                samples=int(t_wf.shape[-1]),
+            )
+            if sc is not None:
+                device = session.handler.device
+                dtype = session.handler.dtype
+                timbre_latent = Latent(
+                    tensor=sc.latent.to(device, dtype).contiguous(),
+                )
+                print(f"[Server] timbre: sidecar hit ({name})")
+            else:
+                timbre_audio = Audio(
+                    waveform=t_wf, sample_rate=SAMPLE_RATE,
+                )
+                print(
+                    f"[Server] timbre: VAE encoding {clip_s:.1f}s "
+                    f"({t_wf.shape[0]}ch)..."
+                )
+                timbre_latent = session.encode_audio(timbre_audio)
+                print(
+                    f"[Server] timbre: VAE done "
+                    f"(latent {tuple(timbre_latent.tensor.shape)})"
+                )
+            timbre_latent_ref[0] = timbre_latent
+            timbre_name_ref[0] = name
+            new_pair = _encode_cond_pair(
+                prompt_text[0], timbre_latent,
+                bpm_ref[0], duration_ref[0], key_ref[0],
+            )
+            cond_pair_ref[0] = new_pair
+            stream.conditioning = _blend_for_strength(
+                new_pair[0], new_pair[1], timbre_strength_ref[0],
+            )
+            return clip_s
+        except Exception:
+            timbre_latent_ref[0] = prev_timbre_latent
+            timbre_name_ref[0] = prev_timbre_name
+            cond_pair_ref[0] = prev_cond_pair
+            stream.conditioning = prev_stream_cond
+            raise
+
+    def _apply_structure_waveform(s_wf: torch.Tensor, name: str) -> tuple[float, float]:
+        """Stash a structure-ref waveform and re-derive the override's
+        context_latent against the current playback length. Returns
+        ``(clip_s, target_s)`` for the ack. Fully clears any prior
+        override (matching the existing failure semantics) and re-
+        raises on any mid-flight failure. Caller sends the ack."""
+        s_wf = s_wf[:2]
+        try:
+            struct_audio_ref[0] = s_wf
+            struct_name_ref[0] = name
+            clip_s = s_wf.shape[-1] / SAMPLE_RATE
+            target_s = playback_samples_ref[0] / SAMPLE_RATE
+            _apply_struct_override()
+            return clip_s, target_s
+        except Exception:
+            struct_audio_ref[0] = None
+            struct_context_ref[0] = None
+            struct_name_ref[0] = None
+            stream.source = source_ref[0]
+            raise
+
     # Client mirror: tracks what audio the client currently has. Replaced
     # wholesale on swap so deltas continue to be computed against the
     # buffer the client just crossfaded into.
@@ -876,13 +984,11 @@ def handle_client(
                             stream.conditioning = _blend_for_strength(cs, cf, v)
                         elif mtype == "set_timbre_source":
                             # Followed by a binary audio frame (same wire
-                            # format as init / swap_source). VAE-encode the
-                            # clip on the recv thread, refresh the cond
-                            # pair against the new timbre latent, then blend
-                            # at the current strength. We cap to the
-                            # playback source's duration so the upload
-                            # fits the currently-loaded vae_encode TRT
-                            # profile — no profile switch is needed.
+                            # format as init / swap_source). _apply_timbre_
+                            # waveform handles cap / pool trim / sidecar
+                            # lookup / encode fallback / cond-pair refresh
+                            # / rollback. This block just shuttles bytes
+                            # off the wire and acks.
                             name = data.get("name") or "timbre"
                             print(
                                 f"[Server] set_timbre_source: receiving "
@@ -897,84 +1003,9 @@ def handle_client(
                                 f"[Server] set_timbre_source: got "
                                 f"{len(audio_msg)} bytes"
                             )
-                            # Capture prior override state so a mid-flight
-                            # failure (encode_audio / encode_text raising
-                            # after we've already mutated *_ref slots)
-                            # rolls back to whatever was active before
-                            # this attempt, rather than leaving a half-
-                            # applied latent that future prompt re-encodes
-                            # would silently consume.
-                            prev_timbre_latent = timbre_latent_ref[0]
-                            prev_timbre_name = timbre_name_ref[0]
-                            prev_cond_pair = cond_pair_ref[0]
-                            prev_stream_cond = stream.conditioning
                             try:
                                 t_wf = _decode_audio_msg(audio_msg)
-                                cap = int(duration_ref[0] * SAMPLE_RATE)
-                                t_wf = t_wf[:, :cap]
-                                rem = t_wf.shape[-1] % pool
-                                if rem:
-                                    t_wf = t_wf[:, :t_wf.shape[-1] - rem]
-                                if t_wf.shape[-1] < pool:
-                                    raise ValueError("timbre clip too short")
-                                clip_s = t_wf.shape[-1] / SAMPLE_RATE
-                                # Sidecar fast path: a known fixture at
-                                # its precomputed sample count uses the
-                                # cached `latent` field (which is exactly
-                                # encode_audio's output) instead of
-                                # spending ~100ms on the VAE encode.
-                                sc = _try_load_sidecar(
-                                    name,
-                                    checkpoint=checkpoint,
-                                    samples=int(t_wf.shape[-1]),
-                                )
-                                if sc is not None:
-                                    device = session.handler.device
-                                    dtype = session.handler.dtype
-                                    timbre_latent = Latent(
-                                        tensor=sc.latent.to(
-                                            device, dtype,
-                                        ).contiguous(),
-                                    )
-                                    print(
-                                        f"[Server] set_timbre_source: "
-                                        f"sidecar hit ({name})"
-                                    )
-                                else:
-                                    timbre_audio = Audio(
-                                        waveform=t_wf,
-                                        sample_rate=SAMPLE_RATE,
-                                    )
-                                    print(
-                                        f"[Server] set_timbre_source: VAE "
-                                        f"encoding {clip_s:.1f}s ({t_wf.shape[0]}ch)..."
-                                    )
-                                    timbre_latent = session.encode_audio(
-                                        timbre_audio,
-                                    )
-                                    print(
-                                        f"[Server] set_timbre_source: VAE "
-                                        f"done (latent "
-                                        f"{tuple(timbre_latent.tensor.shape)})"
-                                    )
-                                timbre_latent_ref[0] = timbre_latent
-                                timbre_name_ref[0] = name
-                                print(
-                                    f"[Server] set_timbre_source: re-encoding "
-                                    f"cond pair..."
-                                )
-                                new_pair = _encode_cond_pair(
-                                    prompt_text[0],
-                                    timbre_latent,
-                                    bpm_ref[0],
-                                    duration_ref[0],
-                                    key_ref[0],
-                                )
-                                cond_pair_ref[0] = new_pair
-                                stream.conditioning = _blend_for_strength(
-                                    new_pair[0], new_pair[1],
-                                    timbre_strength_ref[0],
-                                )
+                                clip_s = _apply_timbre_waveform(t_wf, name)
                                 with send_lock:
                                     ws.send(json.dumps({
                                         "type": "timbre_set",
@@ -986,14 +1017,42 @@ def handle_client(
                                     f"({clip_s:.1f}s)"
                                 )
                             except Exception as exc:
-                                # Roll back to prior override state so
-                                # the next prompt re-encode doesn't pick
-                                # up the partially-applied timbre latent.
-                                timbre_latent_ref[0] = prev_timbre_latent
-                                timbre_name_ref[0] = prev_timbre_name
-                                cond_pair_ref[0] = prev_cond_pair
-                                stream.conditioning = prev_stream_cond
                                 print(f"[Server] set_timbre_source failed: {exc}")
+                                import traceback
+                                traceback.print_exc()
+                                try:
+                                    with send_lock:
+                                        ws.send(json.dumps({
+                                            "type": "timbre_failed",
+                                            "error": str(exc),
+                                        }))
+                                except Exception:
+                                    pass
+                        elif mtype == "set_timbre_fixture":
+                            # Wire shortcut for Library picks: client
+                            # sends just {name}; server resolves the WAV
+                            # from the local HF cache via audio_fixture.
+                            # Avoids the browser fetching the WAV, decoding
+                            # it, and re-uploading the result as a ~10×
+                            # larger float32 PCM payload (the fixture is
+                            # already on this pod's disk).
+                            name = data.get("name", "")
+                            print(f"[Server] set_timbre_fixture: {name!r}")
+                            try:
+                                t_wf = _load_fixture_waveform(name)
+                                clip_s = _apply_timbre_waveform(t_wf, name)
+                                with send_lock:
+                                    ws.send(json.dumps({
+                                        "type": "timbre_set",
+                                        "name": name,
+                                        "duration": clip_s,
+                                    }))
+                                print(
+                                    f"[Server] timbre set: {name} "
+                                    f"({clip_s:.1f}s)"
+                                )
+                            except Exception as exc:
+                                print(f"[Server] set_timbre_fixture failed: {exc}")
                                 import traceback
                                 traceback.print_exc()
                                 try:
@@ -1028,12 +1087,9 @@ def handle_client(
                                 pass
                             print("[Server] timbre cleared")
                         elif mtype == "set_structure_source":
-                            # Followed by a binary audio frame. We pad/
-                            # trim to the playback source's exact sample
-                            # count so the resulting context_latent has
-                            # the same frame count as source.context_latent
-                            # (LatentBlend in _update_hint_strength
-                            # requires matching shapes).
+                            # Followed by a binary audio frame. _apply_
+                            # structure_waveform handles pad/trim, sidecar
+                            # lookup or live prepare_source, and rollback.
                             name = data.get("name") or "structure"
                             print(
                                 f"[Server] set_structure_source: receiving "
@@ -1050,19 +1106,9 @@ def handle_client(
                             )
                             try:
                                 s_wf = _decode_audio_msg(audio_msg)
-                                struct_audio_ref[0] = s_wf
-                                struct_name_ref[0] = name
-                                clip_s = s_wf.shape[-1] / SAMPLE_RATE
-                                target_s = (
-                                    playback_samples_ref[0] / SAMPLE_RATE
+                                clip_s, target_s = _apply_structure_waveform(
+                                    s_wf, name,
                                 )
-                                print(
-                                    f"[Server] set_structure_source: "
-                                    f"{clip_s:.1f}s clip, padding/trimming "
-                                    f"to {target_s:.1f}s and extracting "
-                                    f"hints..."
-                                )
-                                _apply_struct_override()
                                 with send_lock:
                                     ws.send(json.dumps({
                                         "type": "structure_set",
@@ -1075,16 +1121,43 @@ def handle_client(
                                     f"{target_s:.1f}s)"
                                 )
                             except Exception as exc:
-                                # Roll back to no-override so the runner
-                                # doesn't read a half-applied state.
-                                struct_audio_ref[0] = None
-                                struct_context_ref[0] = None
-                                struct_name_ref[0] = None
-                                stream.source = source_ref[0]
                                 print(
                                     f"[Server] set_structure_source "
                                     f"failed: {exc}"
                                 )
+                                import traceback
+                                traceback.print_exc()
+                                try:
+                                    with send_lock:
+                                        ws.send(json.dumps({
+                                            "type": "structure_failed",
+                                            "error": str(exc),
+                                        }))
+                                except Exception:
+                                    pass
+                        elif mtype == "set_structure_fixture":
+                            # Wire shortcut for Library picks. Same
+                            # rationale as set_timbre_fixture.
+                            name = data.get("name", "")
+                            print(f"[Server] set_structure_fixture: {name!r}")
+                            try:
+                                s_wf = _load_fixture_waveform(name)
+                                clip_s, target_s = _apply_structure_waveform(
+                                    s_wf, name,
+                                )
+                                with send_lock:
+                                    ws.send(json.dumps({
+                                        "type": "structure_set",
+                                        "name": name,
+                                        "duration": clip_s,
+                                    }))
+                                print(
+                                    f"[Server] structure set: {name} "
+                                    f"({clip_s:.1f}s, fitted to "
+                                    f"{target_s:.1f}s)"
+                                )
+                            except Exception as exc:
+                                print(f"[Server] set_structure_fixture failed: {exc}")
                                 import traceback
                                 traceback.print_exc()
                                 try:

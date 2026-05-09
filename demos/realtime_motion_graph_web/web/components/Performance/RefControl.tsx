@@ -41,12 +41,17 @@ interface KindBinding {
   label: string;
   ariaLabel: string;
   statusPrefix: string;
+  /** PCM upload path — for custom user tracks that only exist in the
+   *  browser. Returns false if the WS isn't open. */
   send: (
     remote: RemoteBackend,
     interleaved: Float32Array,
     channels: number,
     name: string,
   ) => boolean;
+  /** Wire-shortcut path for Library fixtures: server reads the WAV
+   *  from its local HF cache by name, no PCM round trip. */
+  sendFixture: (remote: RemoteBackend, name: string) => void;
   clear: (remote: RemoteBackend) => void;
 }
 
@@ -58,6 +63,7 @@ function bindingFor(kind: RefKind): KindBinding {
       ariaLabel: "Timbre reference",
       statusPrefix: "timbre",
       send: (r, i, c, n) => r.sendSetTimbreSource(i, c, n),
+      sendFixture: (r, n) => r.sendSetTimbreFixture(n),
       clear: (r) => r.sendClearTimbreSource(),
     };
   }
@@ -67,6 +73,7 @@ function bindingFor(kind: RefKind): KindBinding {
     ariaLabel: "Structure reference",
     statusPrefix: "structure",
     send: (r, i, c, n) => r.sendSetStructureSource(i, c, n),
+    sendFixture: (r, n) => r.sendSetStructureFixture(n),
     clear: (r) => r.sendClearStructureSource(),
   };
 }
@@ -105,14 +112,29 @@ export function RefControl({ kind }: { kind: RefKind }) {
   async function pickExisting(name: string) {
     const session = useSessionStore.getState();
     if (session.status !== "ready" || !session.remote) return;
+
+    // Library fixtures live on the server's disk (HF cache). The wire
+    // shortcut sends just the name; server reads the WAV and runs the
+    // same apply path as a PCM upload. Saves a fetch + decode + ~10×-
+    // bigger float32 re-upload that the browser was only doing on the
+    // server's behalf. Custom user tracks fall through to the upload
+    // path because they only exist in the browser.
+    if (fixtures.includes(name)) {
+      bind.sendFixture(session.remote, name);
+      useSessionStore
+        .getState()
+        .setStatus("ready", `Loading ${bind.statusPrefix} ${name}…`);
+      return;
+    }
+
     setBusy(true);
     useSessionStore
       .getState()
       .setStatus("ready", `Loading ${bind.statusPrefix} ${name}…`);
     try {
       // loadFixtureAudio short-circuits to useCustomTracksStore for
-      // user uploads and falls through to fetch+decode for fixture
-      // names — so the same call serves both branches.
+      // user uploads — so this branch only handles the custom-track
+      // case. (Library picks took the wire shortcut above.)
       const decoded = await loadFixtureAudio(name);
       const ok = bind.send(
         session.remote,
