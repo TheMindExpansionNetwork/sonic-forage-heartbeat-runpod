@@ -245,6 +245,16 @@ const DEFAULT_SLIDER_VALUES: Record<string, number> = {
   ch56: 1.0,
   dcw_scaler: 0.05,
   dcw_high_scaler: 0.02,
+  // streamA2A feature-bank defaults. Match the FeatureBank Python ctor
+  // (acestep/engine/feature_bank.py): cache_depth=1, cache_interval=4,
+  // fi_strength=0.8, fi_threshold=0.98. ``bank_strength`` starts at 0
+  // so a cold session sounds the same as the no-bank path until the
+  // operator pushes the knob.
+  bank_strength: 0.0,
+  bank_cache_depth: 1,
+  bank_cache_interval: 4,
+  bank_fi_strength: 0.8,
+  bank_fi_threshold: 0.98,
 };
 
 interface PerformanceState {
@@ -329,6 +339,18 @@ interface PerformanceState {
   dcwEnabled: boolean;
   dcwMode: DcwMode;
   dcwWavelet: DcwWavelet;
+
+  /** streamA2A feature-bank non-numeric state. The five numeric knobs
+   *  (bank_strength, bank_cache_depth, bank_cache_interval,
+   *  bank_fi_strength, bank_fi_threshold) live in sliderValues.
+   *  ``bankClearSeq`` is a monotonically-increasing counter — the
+   *  server compares it against its last-seen value and calls
+   *  ``bank.reset()`` when it advances (pipeline.run line ~318). */
+  bankEnabled: boolean;
+  bankFreeze: boolean;
+  bankFiEnabled: boolean;
+  bankTomeEnabled: boolean;
+  bankClearSeq: number;
   /** Show keyboard-shortcut hints under each slider / next to buttons.
    * Default true. Persisted to localStorage. */
   showKbdHints: boolean;
@@ -400,6 +422,14 @@ interface PerformanceState {
   toggleDcw: () => void;
   setDcwMode: (m: DcwMode) => void;
   setDcwWavelet: (w: DcwWavelet) => void;
+  toggleBank: () => void;
+  toggleBankFreeze: () => void;
+  toggleBankFi: () => void;
+  toggleBankTome: () => void;
+  /** Bump the bank clear ratchet. Server compares against its last-seen
+   *  value each tick and calls ``bank.reset()`` when it advances, so a
+   *  single increment is enough — no need to track an "is clearing" flag. */
+  bumpBankClearSeq: () => void;
   toggleKbdHints: () => void;
   toggleSmooth: () => void;
   setSmoothMs: (ms: number) => void;
@@ -465,6 +495,12 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   dcwEnabled: true,
   dcwMode: "double",
   dcwWavelet: "haar",
+
+  bankEnabled: true,
+  bankFreeze: false,
+  bankFiEnabled: true,
+  bankTomeEnabled: false,
+  bankClearSeq: 0,
 
   // Hydrated from localStorage after mount via hydratePersistedPrefs() —
   // do NOT read localStorage here, that breaks SSR hydration.
@@ -600,6 +636,11 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   toggleDcw: () => set((s) => ({ dcwEnabled: !s.dcwEnabled })),
   setDcwMode: (m) => set({ dcwMode: m }),
   setDcwWavelet: (w) => set({ dcwWavelet: w }),
+  toggleBank: () => set((s) => ({ bankEnabled: !s.bankEnabled })),
+  toggleBankFreeze: () => set((s) => ({ bankFreeze: !s.bankFreeze })),
+  toggleBankFi: () => set((s) => ({ bankFiEnabled: !s.bankFiEnabled })),
+  toggleBankTome: () => set((s) => ({ bankTomeEnabled: !s.bankTomeEnabled })),
+  bumpBankClearSeq: () => set((s) => ({ bankClearSeq: s.bankClearSeq + 1 })),
   toggleKbdHints: () =>
     set((s) => {
       const next = !s.showKbdHints;

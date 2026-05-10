@@ -44,6 +44,18 @@ export const SLIDER_META: Record<string, SliderMeta> = {
   // boolean ON/OFF + mode + wavelet choices live in their own panel state.
   dcw_scaler: { max: 0.2, step: 0.02, pro: true },
   dcw_high_scaler: { max: 0.1, step: 0.01, pro: true },
+
+  // streamA2A feature-bank knobs. ``bank_strength`` rides through the
+  // VirtualMidiKnobs path (registered in knobs.py); the four cache /
+  // FF-fusion knobs are read directly from the WS raw dict server-side
+  // (pipeline.run → ``raw.get("bank_cache_depth", ...)`` etc.). Integer-
+  // step sliders (depth, interval) render their value without decimals
+  // via SliderGroup's step-aware formatting.
+  bank_strength:       { max: 3.0, step: 0.15, pro: true },
+  bank_cache_depth:    { max: 4,   step: 1,    pro: true },
+  bank_cache_interval: { max: 8,   step: 1,    pro: true },
+  bank_fi_strength:    { max: 1.0, step: 0.05, pro: true },
+  bank_fi_threshold:   { max: 1.0, step: 0.02, pro: true },
 };
 
 export const DCW_MODES = ["low", "high", "double", "pix"] as const;

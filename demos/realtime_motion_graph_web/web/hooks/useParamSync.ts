@@ -64,6 +64,16 @@ export function useParamSync() {
       raw.dcw_enabled = perf.dcwEnabled;
       raw.dcw_mode = perf.dcwMode;
       raw.dcw_wavelet = perf.dcwWavelet;
+      // streamA2A feature-bank non-numeric controls. Numeric knobs
+      // (bank_strength + cache/FF knobs) ride along via sliderValues.
+      // ``bank_clear_seq`` is a monotonically-increasing counter; the
+      // server resets the bank when it advances, so plain equality check
+      // server-side is enough — no special wire framing needed.
+      raw.bank_enabled = perf.bankEnabled;
+      raw.bank_freeze = perf.bankFreeze;
+      raw.bank_fi_enabled = perf.bankFiEnabled;
+      raw.bank_tome_enabled = perf.bankTomeEnabled;
+      raw.bank_clear_seq = perf.bankClearSeq;
 
       // Playback position is *seconds* (raw audio.positionSec), not a 0..1
       // ratio. The server uses absolute time for curve sampling.

@@ -33,6 +33,16 @@ const TINT_STOPS: ReadonlyArray<readonly [number, readonly [number, number, numb
   [1.0, [61, 182, 190]],
 ];
 
+// Pick fader-value precision from the slider's ``step``. Integer-step
+// sliders (e.g. bank_cache_depth at step=1) read as "1" / "4" instead
+// of "1.00" / "4.00" — matching what the server casts the value to
+// (``int(raw.get("bank_cache_depth", ...))``). Sub-integer steps keep
+// the legacy 2-decimal format so existing sliders look unchanged.
+function formatSliderValue(step: number, value: number): string {
+  if (step >= 1) return String(Math.round(value));
+  return value.toFixed(2);
+}
+
 function tintAt(t: number): string {
   const clamped = Math.max(0, Math.min(1, t));
   for (let i = 1; i < TINT_STOPS.length; i++) {
@@ -187,7 +197,7 @@ export function SliderGroup({ param, label, max, kbd }: Props) {
         <div className="slider-fill" style={{ height: `${pct}%` }} />
         <div className="slider-thumb" style={{ bottom: `${pct}%` }} />
       </div>
-      <div className="slider-value">{value.toFixed(2)}</div>
+      <div className="slider-value">{formatSliderValue(meta?.step ?? 0.01, value)}</div>
       {kbd && <kbd className="desktop-only">{kbd}</kbd>}
     </div>
   );

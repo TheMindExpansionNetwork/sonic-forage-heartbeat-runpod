@@ -7,6 +7,7 @@ import { useCurveStore } from "@/store/useCurveStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
 
+import { BankTile } from "./BankTile";
 import { ChannelGainsTile } from "./ChannelGainsTile";
 import { ChannelsTile } from "./ChannelsTile";
 import { DcwTile } from "./DcwTile";
@@ -120,6 +121,7 @@ export function AdvancedDrawer() {
                   <ChannelGainsTile />
                   <ChannelsTile />
                   <DcwTile />
+                  <BankTile />
                   <LibraryTile />
                   <SeedTile />
                 </div>
