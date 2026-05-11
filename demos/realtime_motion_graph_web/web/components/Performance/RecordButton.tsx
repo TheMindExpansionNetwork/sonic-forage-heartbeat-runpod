@@ -97,6 +97,10 @@ export function RecordButton() {
         <span className="turntable-label" />
         <span className="turntable-spindle" />
       </span>
+      {/* Small caption beneath the disc — tactful word label so first-time
+          visitors don't have to hover to learn what the turntable does.
+          Same mono+caps+wide-tracking treatment used everywhere else. */}
+      <span className="turntable-caption" aria-hidden="true">REC</span>
 
       {/* Tonearm — sits to the upper-right of the disc. Idle: parked,
           rotated up-right; recording: dropped onto the outer groove. The

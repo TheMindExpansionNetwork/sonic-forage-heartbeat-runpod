@@ -3290,6 +3290,33 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   box-shadow: 0 0 0 2px var(--accent), 0 6px 22px rgba(0, 0, 0, 0.6);
 }
 
+/* Tactful word label beneath the disc — names the object without
+   competing with the skeuomorphic vinyl. Sits in the existing
+   container's free space below the disc (disc ends at y=60 of a 70px
+   container) and centered on the disc's x (left:3, w:54 → center 30).
+   Uses --accent-hover on hover/recording to match the disc's own
+   color shift. */
+.turntable-caption {
+  position: absolute;
+  top: 62px; /* 2px below disc bottom */
+  left: 3px;
+  width: 54px; /* same x-extent as the disc; centered text below it */
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-dim);
+  pointer-events: none;
+  transition: color 160ms;
+}
+.turntable:hover .turntable-caption {
+  color: var(--accent-hover);
+}
+.turntable--recording .turntable-caption {
+  color: var(--accent);
+}
+
 /* Disc — the rotating element. Holds platter, grooves, label, spindle. */
 .turntable-disc {
   position: absolute;
@@ -3868,6 +3895,11 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   background: var(--sheet-bg);
   border: 1px solid var(--frame-line);
   border-radius: var(--radius-lg);
+  /* Clip the ::before gradient strip to the rounded corners — see
+     the design-language Decision Rule on decorative strips. The fan's
+     own scrollable child handles its own overflow, and box-shadow
+     renders outside the clip box, so the outer glow stays intact. */
+  overflow: hidden;
   padding: 6px;
   display: flex;
   flex-direction: column;
