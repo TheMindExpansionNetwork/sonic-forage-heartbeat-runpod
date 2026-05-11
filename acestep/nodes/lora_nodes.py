@@ -39,7 +39,7 @@ def _scan_library_options() -> tuple[str, ...]:
     try:
         files = discover_loras()
     except Exception as e:
-        logger.warning("LoRA library scan failed: %s", e)
+        logger.warning("LoRA library scan failed: {}", e)
         return (_NONE,)
     return (_NONE,) + tuple(p.stem for p in files)
 
@@ -115,7 +115,7 @@ class LoRA(BaseNode):
             if selection != _NONE:
                 logger.warning(
                     "LoRA node: backend has no LoRA manager available; "
-                    "selection %r ignored",
+                    "selection {!r} ignored",
                     selection,
                 )
             return {"model": model_handle}
@@ -128,7 +128,7 @@ class LoRA(BaseNode):
                 engine.disable_lora(self._enabled_id)
             except Exception as e:
                 logger.warning(
-                    "LoRA node: disable_lora(%s) failed: %s",
+                    "LoRA node: disable_lora({}) failed: {}",
                     self._enabled_id, e,
                 )
             self._enabled_id = None
@@ -174,7 +174,7 @@ class LoRA(BaseNode):
                 return engine.register_lora(str(p))
 
         logger.warning(
-            "LoRA node: selection %r not in library and not registered",
+            "LoRA node: selection {!r} not in library and not registered",
             selection,
         )
         return None

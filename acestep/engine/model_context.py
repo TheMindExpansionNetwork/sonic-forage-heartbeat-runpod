@@ -54,6 +54,7 @@ class ModelContext:
         use_flash_attention: bool = False,
         offload_to_cpu: bool = False,
         offload_dit_to_cpu: bool = False,
+        offload_text_encoder: bool = False,
         quantization: Optional[str] = None,
         prefer_source: Optional[str] = None,
         skip_decoder: bool = False,
@@ -86,10 +87,45 @@ class ModelContext:
             compile_decoder=compile_decoder,
             compile_vae=compile_vae,
             use_flash_attention=use_flash_attention,
+            offload_text_encoder=offload_text_encoder,
             prefer_source=prefer_source,
             skip_decoder=skip_decoder,
             skip_vae=skip_vae,
         )
+
+    def close(self) -> None:
+        """Release model weights + diffusion engine.
+
+        Called by :meth:`Session.close`. Drops:
+
+        - the DiffusionEngine (TRT engine, exec context, refit buffers,
+          LoRA manager — see :meth:`DiffusionEngine.close`)
+        - the DiT model (~6 GB bf16 turbo on GPU, ~12 GB XL turbo)
+        - the VAE (~0.5 GB GPU when not skipped)
+        - the text encoder (~0.3 GB GPU)
+        - the silence latent (small, but it pins a slice of an old
+          activation arena under torch's caching allocator)
+
+        The caller is expected to follow with ``gc.collect()`` and
+        ``torch.cuda.empty_cache()`` so PyTorch returns the freed
+        allocations to CUDA. TRT contexts, on the other hand, free
+        directly via their finalizers and don't go through torch.
+
+        Idempotent: subsequent calls are no-ops.
+        """
+        if self._diffusion_engine is not None:
+            try:
+                self._diffusion_engine.close()
+            except Exception as e:
+                logger.warning("DiffusionEngine.close raised: {}", e)
+            self._diffusion_engine = None
+        # Drop tensor-bearing attributes. Setting to None is enough — the
+        # nn.Module / tensor objects have no CUDA-side finalizer that
+        # requires explicit destruction the way TRT contexts do, so the
+        # subsequent gc.collect() + empty_cache() drains them.
+        for attr in ("model", "vae", "text_encoder",
+                     "text_tokenizer", "silence_latent", "config"):
+            setattr(self, attr, None)
 
     # ------------------------------------------------------------------
     # Initialization
@@ -104,6 +140,7 @@ class ModelContext:
         compile_decoder: bool,
         compile_vae: bool,
         use_flash_attention: bool,
+        offload_text_encoder: bool,
         prefer_source: Optional[str],
         skip_decoder: bool,
         skip_vae: bool,
@@ -195,13 +232,13 @@ class ModelContext:
             self.vae = torch.compile(self.vae, dynamic=True)
 
         # --- 3. Load text encoder / tokenizer ------------------------------
-        self._offload_text_encoder = skip_decoder
+        self._offload_text_encoder = offload_text_encoder
         text_enc_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
         if not os.path.exists(text_enc_path):
             raise FileNotFoundError(f"Text encoder not found at {text_enc_path}")
         self.text_tokenizer = AutoTokenizer.from_pretrained(text_enc_path)
         self.text_encoder = AutoModel.from_pretrained(text_enc_path)
-        if not self.offload_to_cpu and not skip_decoder:
+        if not self.offload_to_cpu and not self._offload_text_encoder:
             self.text_encoder = self.text_encoder.to(device).to(self.dtype)
         else:
             self.text_encoder = self.text_encoder.to("cpu").to(self.dtype)

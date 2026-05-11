@@ -1,16 +1,18 @@
-"""Single-port HTTP + WebSocket server for the web-app version of the demo.
+"""HTTP + WebSocket server for the realtime motion-graph demo backend.
 
-Serves the browser client from ``static/`` and runs the
-:func:`.backend.handle_client` pipeline on the **same** TCP port,
-using the websockets library's ``process_request`` hook to
-short-circuit non-upgrade requests into static-file HTTP responses.
+Multiplexes the JSON HTTP API (``/api/server-info``, ``/api/loras``,
+``/api/videos``, ``/api/fixtures``), static fixture/video file serving
+(``/fixtures/<name>``, ``/videos/<name>``), and the
+:func:`.backend.handle_client` WebSocket pipeline onto a single TCP port,
+using the websockets library's ``process_request`` hook to short-circuit
+non-upgrade requests into HTTP responses.
 
-Single-port matters for Vast.ai / Docker deploys where only one port
-is usually mapped into the container.
+The Next.js dev server (``run.py``) proxies these endpoints through to
+this backend; in production the same routes are served directly.
 
 Usage:
     python -u -m demos.realtime_motion_graph_web.server
-    python -u -m demos.realtime_motion_graph_web.server --host 0.0.0.0 --port 8765
+    python -u -m demos.realtime_motion_graph_web.server --host 0.0.0.0 --port 1318
     python -u -m demos.realtime_motion_graph_web.server --no-backend
 """
 
@@ -20,6 +22,7 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 from websockets.http11 import Response
@@ -33,9 +36,9 @@ from acestep.fixtures import KNOWN_FIXTURES, audio_fixture
 # GPU stays free for other work while iterating on the front-end.
 
 
-STATIC_DIR = Path(__file__).parent / "static"
-VIDEOS_DIR = STATIC_DIR / "videos"
+VIDEOS_DIR = Path(__file__).parent / "videos"
 _AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+_VIDEO_EXTS = {".mp4", ".webm", ".mov"}
 
 # Set in main() based on --no-backend; read by _process_request when the
 # client polls /api/server-info on startup.
@@ -49,8 +52,6 @@ _KIOSK = False
 _DEFAULT_MODE = "graph"
 _VALID_MODES = ("graph", "video")
 
-# Keep the wire compact and don't cache anything so the product team
-# always sees the latest JS after a redeploy.
 _NO_CACHE_HEADERS = [
     ("Cache-Control", "no-store, must-revalidate"),
     ("Pragma", "no-cache"),
@@ -60,44 +61,18 @@ _NO_CACHE_HEADERS = [
 ]
 
 
-def _content_type_for(path: Path) -> str:
-    # Extra module types that the stdlib mimetypes table misses.
-    ext = path.suffix.lower()
-    if ext == ".js" or ext == ".mjs":
-        return "application/javascript; charset=utf-8"
-    if ext == ".css":
-        return "text/css; charset=utf-8"
-    if ext == ".html":
-        return "text/html; charset=utf-8"
-    if ext == ".json":
-        return "application/json; charset=utf-8"
-    if ext == ".wasm":
-        return "application/wasm"
-    guessed, _ = mimetypes.guess_type(str(path))
-    return guessed or "application/octet-stream"
+def _resolve_video(name: str) -> Path | None:
+    """Map a ``/videos/<name>`` request to a file inside ``VIDEOS_DIR``.
 
-
-def _resolve_static(url_path: str) -> Path | None:
-    """Map a URL path to a file inside ``STATIC_DIR``, or None if missing.
-
-    Refuses any path that tries to escape ``STATIC_DIR`` via ``..`` or
-    absolute segments.
+    ``name`` is the raw URL segment after ``/videos/``. Refuses anything
+    that contains a path separator so a request can't escape ``VIDEOS_DIR``.
     """
-    # Strip query string and fragment.
-    path = url_path.split("?", 1)[0].split("#", 1)[0]
-    if path in ("", "/"):
-        path = "/index.html"
-    # Leading slash only; reject empty segments from repeated slashes.
-    if not path.startswith("/"):
+    decoded = urllib.parse.unquote(name)
+    if not decoded or "/" in decoded or "\\" in decoded or decoded in (".", ".."):
         return None
-    rel = path.lstrip("/")
-    if not rel:
-        rel = "index.html"
-    candidate = (STATIC_DIR / rel).resolve()
-    try:
-        candidate.relative_to(STATIC_DIR.resolve())
-    except ValueError:
-        return None  # path escape attempt
+    candidate = VIDEOS_DIR / decoded
+    if candidate.suffix.lower() not in _VIDEO_EXTS:
+        return None
     if not candidate.is_file():
         return None
     return candidate
@@ -126,10 +101,10 @@ def _process_request(connection, request):
     except Exception:
         remote = "?"
 
+    path_only = url.split("?", 1)[0].split("#", 1)[0]
+
     # API: server-info — lets the client know whether the backend is up.
-    # In --no-backend mode the client takes the video-only path: it plays
-    # the source audio directly and skips the WebSocket connection entirely.
-    if url.split("?", 1)[0] == "/api/server-info":
+    if path_only == "/api/server-info":
         body = json.dumps({
             "no_backend": _NO_BACKEND,
             "kiosk": _KIOSK,
@@ -151,7 +126,7 @@ def _process_request(connection, request):
     # panel before the user even clicks Play.  Uses the same path
     # resolution the WebSocket pipeline uses, so everyone agrees on
     # what's in the catalog.
-    if url.split("?", 1)[0] == "/api/loras":
+    if path_only == "/api/loras":
         from acestep.paths import discover_loras, loras_dir
         try:
             d = loras_dir()
@@ -179,10 +154,9 @@ def _process_request(connection, request):
             body,
         )
 
-    # API: list video files in static/videos/
-    if url.split("?", 1)[0] == "/api/videos":
-        _VIDEO_EXTS = {".mp4", ".webm", ".mov"}
-        videos = []
+    # API: list video files in VIDEOS_DIR.
+    if path_only == "/api/videos":
+        videos: list[str] = []
         if VIDEOS_DIR.is_dir():
             videos = sorted(
                 f.name for f in VIDEOS_DIR.iterdir()
@@ -204,7 +178,7 @@ def _process_request(connection, request):
     # Files are downloaded on-demand by /fixtures/<name>; this endpoint just
     # returns the canonical manifest from acestep.fixtures so the UI can render
     # the picker before any download happens.
-    if url.split("?", 1)[0] == "/api/fixtures":
+    if path_only == "/api/fixtures":
         body = json.dumps(sorted(KNOWN_FIXTURES)).encode()
         _log_http(remote, 200, "GET", url)
         return Response(
@@ -220,9 +194,8 @@ def _process_request(connection, request):
     # Serve files from the HF fixture dataset under /fixtures/<name>.
     # audio_fixture() validates `name` against KNOWN_FIXTURES (so this is
     # also our path-escape guard) and downloads on first access.
-    fixture_match = url.split("?", 1)[0].split("#", 1)[0]
-    if fixture_match.startswith("/fixtures/"):
-        rel = fixture_match[len("/fixtures/"):]
+    if path_only.startswith("/fixtures/"):
+        rel = path_only[len("/fixtures/"):]
         try:
             candidate = audio_fixture(rel)
         except KeyError:
@@ -254,55 +227,60 @@ def _process_request(connection, request):
                     ]),
                     msg,
                 )
+            ctype, _ = mimetypes.guess_type(candidate.name)
             _log_http(remote, 200, "GET", url)
             return Response(
                 200, "OK",
                 Headers([
-                    ("Content-Type", _content_type_for(candidate)),
+                    ("Content-Type", ctype or "application/octet-stream"),
                     ("Content-Length", str(len(body))),
                     *_NO_CACHE_HEADERS,
                 ]),
                 body,
             )
 
-    target = _resolve_static(url)
-    if target is None:
-        body = b"404 not found\n"
-        _log_http(remote, 404, "GET", url)
-        return Response(
-            404,
-            "Not Found",
-            Headers([
-                ("Content-Type", "text/plain; charset=utf-8"),
-                ("Content-Length", str(len(body))),
-                *_NO_CACHE_HEADERS,
-            ]),
-            body,
-        )
+    # Serve user-supplied videos under /videos/<name> from VIDEOS_DIR.
+    if path_only.startswith("/videos/"):
+        target = _resolve_video(path_only[len("/videos/"):])
+        if target is not None:
+            try:
+                body = target.read_bytes()
+            except OSError as e:
+                msg = f"500 {e}\n".encode()
+                _log_http(remote, 500, "GET", url)
+                return Response(
+                    500, "Internal Server Error",
+                    Headers([
+                        ("Content-Type", "text/plain; charset=utf-8"),
+                        ("Content-Length", str(len(msg))),
+                        *_NO_CACHE_HEADERS,
+                    ]),
+                    msg,
+                )
+            ctype, _ = mimetypes.guess_type(target.name)
+            _log_http(remote, 200, "GET", url)
+            return Response(
+                200, "OK",
+                Headers([
+                    ("Content-Type", ctype or "application/octet-stream"),
+                    ("Content-Length", str(len(body))),
+                    *_NO_CACHE_HEADERS,
+                ]),
+                body,
+            )
 
-    try:
-        body = target.read_bytes()
-    except OSError as e:
-        msg = f"500 {e}\n".encode()
-        _log_http(remote, 500, "GET", url)
-        return Response(
-            500,
-            "Internal Server Error",
-            Headers([
-                ("Content-Type", "text/plain; charset=utf-8"),
-                ("Content-Length", str(len(msg))),
-                *_NO_CACHE_HEADERS,
-            ]),
-            msg,
-        )
-
-    headers = Headers([
-        ("Content-Type", _content_type_for(target)),
-        ("Content-Length", str(len(body))),
-        *_NO_CACHE_HEADERS,
-    ])
-    _log_http(remote, 200, "GET", url)
-    return Response(200, "OK", headers, body)
+    body = b"404 not found\n"
+    _log_http(remote, 404, "GET", url)
+    return Response(
+        404,
+        "Not Found",
+        Headers([
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+            *_NO_CACHE_HEADERS,
+        ]),
+        body,
+    )
 
 
 def _stub_handle_client(ws):
@@ -316,12 +294,13 @@ def _stub_handle_client(ws):
 
 def main():
     host = "0.0.0.0"
-    port = 8765  # single port: serves both HTTP and WebSocket
+    port = 1318  # single port: serves both HTTP and WebSocket
     accel = "tensorrt"  # decoder + vae backend; overridden by --accel
     checkpoint = "acestep-v15-turbo"  # DiT variant; overridden by --checkpoint
 
     args = sys.argv[1:]
     no_backend = "--no-backend" in args or "--ui-only" in args
+    offload_text_encoder = "--offload-text-encoder" in args
     if "--host" in args:
         idx = args.index("--host")
         host = args[idx + 1]
@@ -377,9 +356,6 @@ def main():
             f"[Server] --mode must be one of {_VALID_MODES}, got {default_mode!r}"
         )
 
-    if not STATIC_DIR.exists():
-        raise SystemExit(f"[Server] static dir missing: {STATIC_DIR}")
-
     global _NO_BACKEND, _ACCEL, _KIOSK, _DEFAULT_MODE
     _NO_BACKEND = no_backend
     _ACCEL = accel
@@ -401,14 +377,18 @@ def main():
                 decoder_backend=decoder_accel,
                 vae_backend=vae_accel,
                 checkpoint=checkpoint,
+                offload_text_encoder=offload_text_encoder,
             )
 
-    print(f"[Server] Starting single-port HTTP+WS on :{port}")
+    print(f"[Server] Starting HTTP+WS on :{port}")
     srv = ws_serve(
         ws_handler,
         host,
         port,
-        max_size=50 * 1024 * 1024,
+        # Sized to fit the React UI's MAX_FIXTURE_DURATION_S (240 s)
+        # at 48 kHz stereo Float32 (~88 MiB) with comfortable headroom.
+        # See web/engine/audio/loadFixture.ts.
+        max_size=100 * 1024 * 1024,
         process_request=_process_request,
     )
     ws_thread = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -418,19 +398,21 @@ def main():
     extras = [f"mode={default_mode}"]
     if kiosk:
         extras.append("kiosk")
+    if offload_text_encoder:
+        extras.append("text_encoder=offload")
     extras.append(f"ckpt={checkpoint}")
     extra_str = " " + " ".join(f"[{e}]" for e in extras)
     if decoder_accel == vae_accel:
         accel_str = f"accel={decoder_accel}"
     else:
         accel_str = f"accel=decoder:{decoder_accel}+vae:{vae_accel}"
-    mode = "UI-ONLY (no backend)" if no_backend else f"WEB APP, single port, {accel_str}{extra_str}"
+    mode = "UI-ONLY (no backend)" if no_backend else f"WEB APP, {accel_str}{extra_str}"
     print()
     print("=" * 60)
     print(f"  Real-Time Motion-to-Music  ({mode})")
     print("=" * 60)
-    print(f"  Open:      http://{browsable_host}:{port}/")
     print(f"  WebSocket: ws://{browsable_host}:{port}/")
+    print(f"  HTTP API:  http://{browsable_host}:{port}/api/...")
     print(f"  Fixtures:  daydreamlive/demon-fixtures (HF, {len(KNOWN_FIXTURES)} files, on-demand)")
     print("  Ctrl+C to stop")
     print("=" * 60)

@@ -93,6 +93,13 @@ class DiffusionEngine:
         self._trt_stream = None
         self._trt_buf_cache: dict[tuple, dict] = {}
 
+        # Engine-swap listeners. StreamPipeline (and any other consumer
+        # that snapshots ``self._trt_*`` at construction time) registers
+        # a callback here so it can re-read the live refs and invalidate
+        # any cached I/O bindings after the profile manager swaps the
+        # underlying engine.
+        self._engine_swap_listeners: list = []
+
         # Dynamic LoRA manager. TRT path constructs TRTLoRAManager inside
         # load_trt_engine (after the engine is up and refit support is
         # confirmed). Eager path constructs EagerLoRAManager up-front so
@@ -125,7 +132,7 @@ class DiffusionEngine:
         if not engine_path.exists():
             raise FileNotFoundError(f"TRT engine not found: {engine_path}")
 
-        logger.info("Loading TRT decoder engine from %s ...", engine_path)
+        logger.info("Loading TRT decoder engine from {} ...", engine_path)
         self._trt_engine = engine_from_bytes(bytes_from_path(str(engine_path)))
         self._trt_ctx = self._trt_engine.create_execution_context()
         self._trt_stream = _get_trt_stream()
@@ -188,12 +195,74 @@ class DiffusionEngine:
             try:
                 self._lora_manager.register_library()
             except Exception as e:
-                logger.warning("Failed to scan LoRA library: %s", e)
+                logger.warning("Failed to scan LoRA library: {}", e)
         except RuntimeError as e:
             # Engine not built with REFIT, or TRT version too old
-            logger.info("TRT LoRA refit not available: %s", e)
+            logger.info("TRT LoRA refit not available: {}", e)
         except Exception as e:
-            logger.warning("Failed to init TRT LoRA manager: %s", e)
+            logger.warning("Failed to init TRT LoRA manager: {}", e)
+
+        # Notify subscribers AFTER LoRA wiring is up so a listener that
+        # eagerly probes the new engine sees a fully-initialized state.
+        # First-time loads (from __init__) hit this with an empty list,
+        # which is a cheap no-op.
+        self._fire_engine_swap_listeners()
+
+    def add_engine_swap_listener(self, callback) -> None:
+        """Register a zero-arg callback fired after every successful
+        ``load_trt_engine`` (including the implicit one from __init__).
+
+        Used by ``StreamPipeline`` to re-read the engine's ``_trt_ctx``
+        / ``_trt_engine`` / ``_trt_io_dtype`` and drop its shape-keyed
+        buffer cache so the next forward pass binds against the new
+        engine's profile.
+        """
+        if callback not in self._engine_swap_listeners:
+            self._engine_swap_listeners.append(callback)
+
+    def remove_engine_swap_listener(self, callback) -> None:
+        """Detach a listener previously added via
+        :meth:`add_engine_swap_listener`. Idempotent."""
+        try:
+            self._engine_swap_listeners.remove(callback)
+        except ValueError:
+            pass
+
+    def _fire_engine_swap_listeners(self) -> None:
+        """Invoke every registered listener; isolate exceptions so a
+        broken listener can't prevent others from running or leave the
+        engine in a half-swapped state."""
+        for cb in list(self._engine_swap_listeners):
+            try:
+                cb()
+            except Exception as e:
+                logger.warning("Engine swap listener raised: {}", e)
+
+    def unload_trt_engine(self) -> None:
+        """Drop the active TRT decoder engine and free its GPU workspace.
+
+        Pair with :meth:`load_trt_engine` to swap profiles in-place: the
+        TRT engine + execution context together pin several GB of
+        workspace, so we MUST release them before loading the next
+        engine or VRAM doubles up. The shared polygraphy stream
+        survives — it's process-global and reused by every TRT engine.
+
+        Active LoRAs are NOT preserved here: the new engine gets a fresh
+        ``TRTLoRAManager`` from ``load_trt_engine``. Callers who need
+        continuity should snapshot ENABLED entries before this call and
+        re-enable them after the new engine is up (see
+        ``acestep.engine.trt.profile_manager.TRTProfileManager``).
+        """
+        # Drop refit hooks first so a stray callback can't fire on the
+        # disposed engine.
+        self._lora_manager = None
+        # Per-shape buffers reference TRT-owned addresses; clear before
+        # the context goes.
+        self._trt_buf_cache = {}
+        self._trt_ctx = None
+        self._trt_engine = None
+        torch.cuda.empty_cache()
+        logger.info("Unloaded TRT decoder engine")
 
     # ------------------------------------------------------------------
     # LoRA management (backend-agnostic)
@@ -216,14 +285,14 @@ class DiffusionEngine:
         try:
             self._lora_manager = EagerLoRAManager(decoder=self.decoder)
         except (RuntimeError, ValueError) as e:
-            logger.info("Eager LoRA manager not available: %s", e)
+            logger.info("Eager LoRA manager not available: {}", e)
             self._lora_manager = None
             return
 
         try:
             self._lora_manager.register_library()
         except Exception as e:
-            logger.warning("Failed to scan LoRA library: %s", e)
+            logger.warning("Failed to scan LoRA library: {}", e)
 
     def apply_lora(self, lora_path: str, strength: float = 1.0) -> str:
         """Register + enable a LoRA in one call. Returns the LoRA id.
@@ -303,6 +372,58 @@ class DiffusionEngine:
                 "path, the decoder must have parameters loaded."
             )
 
+    def close(self) -> None:
+        """Release per-engine TRT + LoRA state.
+
+        Called by :meth:`acestep.engine.model_context.ModelContext.close`
+        as part of the :meth:`acestep.engine.session.Session.close` chain.
+        Drops:
+
+        - the TRT execution context (the dominant non-PyTorch GPU buffer:
+          activation/workspace memory, ~1–2 GB for a turbo decoder profile)
+        - the deserialized engine itself (~1.5–3 GB GPU)
+        - the per-shape input/output buffer cache (``_trt_buf_cache``)
+        - the LoRA manager (CPU base/refit buffers + GPU mirror on the
+          eager backend)
+
+        These are *not* freed by Python GC reliably — the polygraphy /
+        pycuda objects keep CUDA references alive until their finalizers
+        run, which can be arbitrarily delayed under reference cycles.
+        Explicit ``del`` here forces the destructor chain immediately.
+
+        Idempotent: subsequent calls are no-ops.
+        """
+        # Drop the buffer cache first (each entry holds a torch.Tensor on
+        # CUDA); it indirectly references the engine via the context.
+        self._trt_buf_cache.clear()
+        # LoRA manager next. It holds a Refitter, which holds an engine
+        # reference. Closing it before the engine clears that ref.
+        if self._lora_manager is not None:
+            try:
+                self._lora_manager.close()
+            except Exception as e:
+                logger.warning("LoRAManagerBase.close raised: {}", e)
+            self._lora_manager = None
+        # Now the TRT context + engine. ``del`` on the instance attribute
+        # is what triggers the polygraphy/pycuda finalizer that frees the
+        # CUDA workspace. Rebinding to None works only when no other
+        # name holds the previous value; ``del`` removes the binding
+        # unconditionally.
+        for attr in ("_trt_ctx", "_trt_engine"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        # Re-establish the attributes as None so the rest of the API
+        # (load_trt_engine, etc.) keeps working if the engine is reused.
+        self._trt_ctx = None
+        self._trt_engine = None
+        # The CUDA stream is process-shared (see vae_nodes._get_trt_stream)
+        # so we just drop our reference, not destroy the stream.
+        self._trt_stream = None
+        # Drop the decoder reference too — it pins the DiT graph that
+        # ModelContext is about to release.
+        self.decoder = None
+        self.model = None
+
     def _trt_decoder_step(
         self,
         hidden_states: torch.Tensor,
@@ -355,7 +476,7 @@ class DiffusionEngine:
 
             self._trt_buf_cache[key] = {"bufs": bufs, "output": out_buf}
             logger.info(
-                "Allocated TRT buffers for shapes: hs=%s enc=%s",
+                "Allocated TRT buffers for shapes: hs={} enc={}",
                 list(hs_shape), list(enc_shape),
             )
 

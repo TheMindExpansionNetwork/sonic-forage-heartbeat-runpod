@@ -1,0 +1,84 @@
+{
+  "_comment": "Initial settings for the DEMON installation. Edit and refresh — no rebuild needed. Slider max/step lives in types/engine.ts (SLIDER_META); only the per-control starting value is set here. Schema and defaults: web/lib/config.ts.",
+
+  "engine": {
+    "sde": false,
+    "lora": true,
+    "depth": 4,
+    "vae_window": 3,
+    "crop": 0,
+    "steps": 8,
+    "fast_vae": true,
+    "_walk_window_help": "When true, route long sources through the walk_window_s (60s) DiT engine by cutting longer songs into 60 second latents and swapping at boundaries — keeps the 60s engine's faster parameter-update latency on multi-minute sources. No effect when source ≤ window_s.",
+    "walk_window": false,
+    "walk_window_s": 60,
+    "key": "G# minor",
+    "_time_signature_help": "Default meter numerator for the operator dropdown. One of 2, 3, 4, 6 (string) for 2/4, 3/4, 4/4, 6/8 respectively. Sidecar values still win on fixture hits; this is the seed for live uploads and the AlmostReadyDialog manual override.",
+    "time_signature": "4",
+    "_enabled_loras_help": "Filename stems (no .safetensors) to auto-enable on first catalog load. Empty = count-rule (first two from the sorted catalog, with name-fallback per slot — see useLoraStore.ts).",
+    "enabled_loras": []
+  },
+
+  "prompts": {
+    "a": "heavy dubstep, deathstep, afxdump, growl heavy bass distortion",
+    "b": "daft punk style, beautiful, four to the floor, angelic",
+    "blend": 0.4
+  },
+
+  "controls": {
+    "denoise": 0,
+    "_lora_default_strength_help": "Initial value applied to any LoRA strength slider whose server-reported strength is 0 (current Python backend behavior). Auto-enabled LoRAs land here on first paint.",
+    "lora_default_strength": 0.7,
+    "hint_strength": 1.4,
+
+    "feedback": 0.0,
+    "shift": 0.5,
+    "noise_share": 0.0,
+    "ode_noise": 0.0,
+
+    "ch_g0": 1.0,
+    "ch_g1": 1.0,
+    "ch_g2": 1.0,
+    "ch_g3": 1.0,
+    "ch_g4": 1.0,
+    "ch_g5": 1.0,
+    "ch_g6": 1.0,
+    "ch_g7": 1.0,
+
+    "ch13": 1.0,
+    "ch14": 1.0,
+    "ch19": 1.0,
+    "ch23": 1.0,
+    "ch29": 1.0,
+    "ch56": 1.0,
+
+    "dcw_enabled": true,
+    "dcw_mode": "double",
+    "dcw_scaler": 0.05,
+    "dcw_high_scaler": 0.02,
+    "dcw_wavelet": "haar"
+  },
+
+  "seed": 0,
+
+  "_audio_help": "Output audio chain. lufs_enabled toggles the loudness matcher on at boot (operator can still flip it via the LUFS button in-session). lufs_window_sec controls the meter's sliding window. 3s is the standard. Lower = faster response but noisier and prone to high-water spikes on transients. Practical floor ~1.5s. lufs_metric picks the metric: 'lufs' (BS.1770 K-weighted, broadcast standard) or 'dba' (IEC 61672 A-weighted, closer to perceived loudness on bright/distorted content). lufs_silence_floor_db disengages the matcher when the chunk at the playhead reads more than this far below target (gain ramps to 1.0 instead of computing a boost), so silent regions of the model output don't get amplified into audible noise; 30 is well outside real musical content, lower to 20 to disengage on quiet passages too. lufs_silence_floor_hysteresis_db is the Schmitt-trigger band: once disengaged, the matcher re-engages only when the chunk reads within (floor - hysteresis) dB of target, preventing flapping at the threshold. Widen if you still hear volume swells at silence boundaries. The matcher always seeds the high-water mark with the source's loudest short-term window at session start, so the louder of {source, denoised} defines the target from t=0 -- no need to wait for the meter to discover it.",
+  "audio": {
+    "lufs_enabled": true,
+    "lufs_window_sec": 1.5,
+    "lufs_metric": "lufs",
+    "lufs_peak_headroom": 4.0,
+    "lufs_silence_floor_db": 30.0,
+    "lufs_silence_floor_hysteresis_db": 6.0
+  },
+
+  "_effects_help": "Audio-reactive video shader pipeline (parallax + bloom-on-kick). Both effects pulse with the kick envelope; the perimeter ribbons + DEMON wordmark also pulse with kick via a CSS variable.",
+  "effects": {
+    "parallax_strength": 0.4,
+    "bloom_on_kick": 0.3,
+    "bloom_threshold": 0.15,
+    "warp_strength": 0.4
+  },
+
+  "_reset_seconds_help": "Idle timeout. After this many seconds of no interaction (pointer, key, or MIDI), every control reverts to the defaults above. Set to 0 to disable.",
+  "reset_seconds": 0
+}

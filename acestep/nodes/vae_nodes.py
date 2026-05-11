@@ -69,7 +69,7 @@ def _get_trt_vae(engine_path: str, device: torch.device):
 
     engine = engine_from_bytes(bytes_from_path(engine_path))
     ctx = engine.create_execution_context()
-    logger.info("Loaded TRT VAE engine: %s", engine_path)
+    logger.info("Loaded TRT VAE engine: {}", engine_path)
 
     tensor_dtypes = {
         engine.get_tensor_name(i): _trt_tensor_dtype(engine, engine.get_tensor_name(i))
@@ -78,6 +78,33 @@ def _get_trt_vae(engine_path: str, device: torch.device):
     entry = {"engine": engine, "context": ctx, "tensor_dtypes": tensor_dtypes}
     _trt_vae_cache[engine_path] = entry
     return entry
+
+
+def _evict_trt_vae(engine_path: str) -> bool:
+    """Drop a cached TRT VAE engine and free its GPU buffers.
+
+    Used by the profile manager when swapping to a different-duration
+    engine: the old context, its workspace, and the cached output buffer
+    must be released before the new engine is loaded so VRAM doesn't
+    spike past the budget.
+
+    Returns True if an entry was evicted, False if the path wasn't cached.
+    """
+    engine_path = os.path.abspath(engine_path)
+    entry = _trt_vae_cache.pop(engine_path, None)
+    if entry is None:
+        return False
+    # Clear refs in deterministic order: cached I/O buffers first (so
+    # nothing still holds the device pointer), then the execution
+    # context, then the engine. Polygraphy releases workspace when the
+    # context's refcount hits zero.
+    entry.pop("_decode_buf", None)
+    entry.pop("_encode_buf", None)
+    entry["context"] = None
+    entry["engine"] = None
+    torch.cuda.empty_cache()
+    logger.info("Evicted TRT VAE engine: {}", engine_path)
+    return True
 
 
 def _trt_vae_decode(
@@ -396,7 +423,7 @@ class StreamVAEDecode(BaseNode):
                     name="vae_window", type="number", default=5.0,
                     description=(
                         "Decode window (s); <=0 decodes full latent. "
-                        "Positive values are clamped to [5, 30] to fit "
+                        "Positive values are clamped to [3, 30] to fit "
                         "the windowed VAE engine profile."
                     ),
                     min=0.0, max=30.0, step=0.1,

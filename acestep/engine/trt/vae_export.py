@@ -90,7 +90,7 @@ def export_vae_encoder_onnx(
         device=device, dtype=torch.float32,
     )
 
-    logger.info("Tracing VAE encoder for ONNX export (samples=%d)...", config.trace_audio_samples)
+    logger.info("Tracing VAE encoder for ONNX export (samples={})...", config.trace_audio_samples)
 
     with torch.no_grad():
         torch.onnx.export(
@@ -108,7 +108,7 @@ def export_vae_encoder_onnx(
             dynamo=False,
         )
 
-    logger.info("VAE encoder ONNX saved to %s", onnx_path)
+    logger.info("VAE encoder ONNX saved to {}", onnx_path)
     return onnx_path
 
 
@@ -136,7 +136,7 @@ def export_vae_decoder_onnx(
         device=device, dtype=torch.float32,
     )
 
-    logger.info("Tracing VAE decoder for ONNX export (T=%d)...", config.trace_latent_frames)
+    logger.info("Tracing VAE decoder for ONNX export (T={})...", config.trace_latent_frames)
 
     with torch.no_grad():
         torch.onnx.export(
@@ -154,7 +154,7 @@ def export_vae_decoder_onnx(
             dynamo=False,
         )
 
-    logger.info("VAE decoder ONNX saved to %s", onnx_path)
+    logger.info("VAE decoder ONNX saved to {}", onnx_path)
     return onnx_path
 
 
@@ -238,7 +238,7 @@ def build_vae_trt_engine(
     onnx_abs = str(onnx_path.resolve())
     if not parser.parse_from_file(onnx_abs):
         for i in range(parser.num_errors):
-            logger.error("ONNX parse error: %s", parser.get_error(i))
+            logger.error("ONNX parse error: {}", parser.get_error(i))
         raise RuntimeError("ONNX parsing failed")
 
     build_config = builder.create_builder_config()
@@ -261,7 +261,7 @@ def build_vae_trt_engine(
         raise RuntimeError("Failed to add TensorRT optimization profile")
 
     logger.info(
-        "Building TRT engine: %s [%d, %d, %d]",
+        "Building TRT engine: {} [{}, {}, {}]",
         input_name, min_dynamic, opt_dynamic, max_dynamic,
     )
 
@@ -273,7 +273,7 @@ def build_vae_trt_engine(
         f.write(serialized)
 
     size_mb = engine_path.stat().st_size / (1 << 20)
-    logger.info("Engine saved to %s (%.1f MB)", engine_path, size_mb)
+    logger.info("Engine saved to {} ({:.1f} MB)", engine_path, size_mb)
     return engine_path
 
 

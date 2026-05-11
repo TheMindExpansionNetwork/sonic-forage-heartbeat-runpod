@@ -164,7 +164,7 @@ def fetch_onnx(
     target_main = target_dir / main_filename
 
     if target_main.exists() and not force_download:
-        logger.info("Reusing local ONNX at %s", target_main)
+        logger.info("Reusing local ONNX at {}", target_main)
         return target_main
 
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +177,7 @@ def fetch_onnx(
     from huggingface_hub import hf_hub_download, snapshot_download
 
     logger.info(
-        "Fetching ONNX %r from HF: %s/%s",
+        "Fetching ONNX {!r} from HF: {}/{}",
         component, source.repo, source.hf_main_file.format(**ctx),
     )
     if is_single_file:
@@ -203,5 +203,5 @@ def fetch_onnx(
                 shutil.copy2(f, target_dir / f.name)
 
     size_mb = target_main.stat().st_size / (1 << 20)
-    logger.info("ONNX %r ready at %s (%.1f MB)", component, target_main, size_mb)
+    logger.info("ONNX {!r} ready at {} ({:.1f} MB)", component, target_main, size_mb)
     return target_main

@@ -1901,8 +1901,8 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
     ):
         if diffusion_guidance_scale != 1.0 or use_adg or cfg_interval_start != 0.0 or cfg_interval_end != 1.0:
             logger.info(
-                "Turbo DiT ignores CFG params (guidance_scale=%.2f, use_adg=%s, "
-                "cfg_interval=[%.2f, %.2f]); turbo is CFG-distilled.",
+                "Turbo DiT ignores CFG params (guidance_scale={:.2f}, use_adg={}, "
+                "cfg_interval=[{:.2f}, {:.2f}]); turbo is CFG-distilled.",
                 diffusion_guidance_scale, use_adg, cfg_interval_start, cfg_interval_end,
             )
 
@@ -1966,7 +1966,7 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
             n = min(int(infer_steps), 20)
             if n != int(infer_steps):
                 logger.warning(
-                    "infer_steps=%d exceeds maximum 20, clamping to 20.", infer_steps
+                    "infer_steps={} exceeds maximum 20, clamping to 20.", infer_steps
                 )
             raw = [1.0 - i / n for i in range(n)]
             if shift != 1.0:

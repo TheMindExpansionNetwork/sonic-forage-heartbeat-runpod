@@ -465,7 +465,7 @@ def main():
     Handler.state = state
 
     server = HTTPServer((args.host, args.port), Handler)
-    logger.info("Listening on http://%s:%d", args.host, args.port)
+    logger.info("Listening on http://{}:{}", args.host, args.port)
     logger.info("Endpoints: /health, /prepare_source, /audio_info, /encode_text, /apply_lora, /remove_loras, /generate, /warmup")
 
     try:

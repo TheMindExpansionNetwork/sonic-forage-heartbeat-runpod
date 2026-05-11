@@ -354,7 +354,7 @@ class DecoderForExport(nn.Module):
             layer.self_attn = _AttnFp32Wrapper(layer.self_attn)
 
         logger.info(
-            "fp16_attn_safe: wrapped all %d self_attn modules in fp32 "
+            "fp16_attn_safe: wrapped all {} self_attn modules in fp32 "
             "(cross_attn stays in fp16)",
             len(decoder.layers),
         )
@@ -457,7 +457,7 @@ class DecoderForExport(nn.Module):
                 layer.mlp = _MlpFp16Wrapper(layer.mlp)
                 wrapped += 1
         logger.info(
-            "bf16_mlp_fp16: wrapped %d/%d layer MLPs in fp16",
+            "bf16_mlp_fp16: wrapped {}/{} layer MLPs in fp16",
             wrapped, len(decoder.layers),
         )
 
@@ -499,7 +499,7 @@ class DecoderForExport(nn.Module):
                 setattr(parent, lin_attr, _LinearFp16Wrapper(lin))
                 wrapped += 1
         logger.info(
-            "bf16_matmul_fp16: wrapped %d Linears across %d layers",
+            "bf16_matmul_fp16: wrapped {} Linears across {} layers",
             wrapped, len(decoder.layers),
         )
 
@@ -529,8 +529,8 @@ class DecoderForExport(nn.Module):
             decoder.layers[i] = _LayerFp16Wrapper(decoder.layers[i])
 
         logger.info(
-            "bf16_layer_fp16: wrapped %d/%d layers in fp16 (indices %s); "
-            "remaining %d layers stay bf16",
+            "bf16_layer_fp16: wrapped {}/{} layers in fp16 (indices {}); "
+            "remaining {} layers stay bf16",
             len(safe), n_layers, safe, n_layers - len(safe),
         )
 
@@ -846,7 +846,7 @@ def export_decoder_onnx(
     )
 
     logger.info(
-        "Tracing decoder for ONNX export (T=%d, L=%d, exporter=%s) ...",
+        "Tracing decoder for ONNX export (T={}, L={}, exporter={}) ...",
         T, L, "dynamo" if use_dynamo else "torchscript",
     )
 
@@ -904,7 +904,7 @@ def export_decoder_onnx(
     # We skip it and rely on the native parsers.
 
     size_mb = onnx_path.stat().st_size / (1 << 20)
-    logger.info("ONNX saved to %s (%.1f MB)", onnx_path, size_mb)
+    logger.info("ONNX saved to {} ({:.1f} MB)", onnx_path, size_mb)
     return onnx_path
 
 
@@ -1021,16 +1021,16 @@ def build_trt_engine(
     network = builder.create_network(net_flags)
     parser = trt.OnnxParser(network, trt_logger)
 
-    logger.info("Parsing ONNX from %s ...", onnx_path)
+    logger.info("Parsing ONNX from {} ...", onnx_path)
     # Use parse_from_file so TRT resolves external data relative to the ONNX path
     onnx_abs = str(onnx_path.resolve())
     if not parser.parse_from_file(onnx_abs):
         for i in range(parser.num_errors):
-            logger.error("ONNX parse error: %s", parser.get_error(i))
+            logger.error("ONNX parse error: {}", parser.get_error(i))
         raise RuntimeError("ONNX parsing failed")
 
     logger.info(
-        "Network: %d inputs, %d outputs, %d layers",
+        "Network: {} inputs, {} outputs, {} layers",
         network.num_inputs, network.num_outputs, network.num_layers,
     )
 
@@ -1090,11 +1090,11 @@ def build_trt_engine(
         raise RuntimeError("Failed to add TensorRT optimization profile")
 
     logger.info(
-        "Building TRT engine (fp16=%s, bf16=%s, opt_level=%d) ...",
+        "Building TRT engine (fp16={}, bf16={}, opt_level={}) ...",
         config.fp16, config.bf16, config.builder_optimization_level,
     )
     logger.info(
-        "  Profiles: B=[%d,%d,%d]  T=[%d,%d,%d]  L_enc=[%d,%d,%d]",
+        "  Profiles: B=[{},{},{}]  T=[{},{},{}]  L_enc=[{},{},{}]",
         Bmin, Bopt, Bmax, Smin, Sopt, Smax, Emin, Eopt, Emax,
     )
 
@@ -1106,7 +1106,7 @@ def build_trt_engine(
         f.write(serialized)
 
     size_mb = engine_path.stat().st_size / (1 << 20)
-    logger.info("Engine saved to %s (%.1f MB)", engine_path, size_mb)
+    logger.info("Engine saved to {} ({:.1f} MB)", engine_path, size_mb)
     return engine_path
 
 
@@ -1182,6 +1182,6 @@ def validate_trt_vs_pytorch(
 
     logger.info("Validation results:")
     for k, v in results.items():
-        logger.info("  %-20s: %.6f", k, v)
+        logger.info("  {:<20}: {:.6f}", k, v)
 
     return results

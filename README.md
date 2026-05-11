@@ -41,7 +41,7 @@ Pipeline depth trades latency-to-first-effect for throughput:
 
 ## Live demo: realtime_motion_graph_web
 
-Browser front-end + GPU server in a single package. Feed it source audio and a text prompt; twist on-screen knobs (or a connected MIDI controller via Web MIDI) to control denoise strength, SDE curve shape, latent feedback, and diffusion shift while the engine generates and plays back audio continuously. Optional audio-reactive video: drop any `.mp4` into `demos/realtime_motion_graph_web/static/videos/`.
+Browser front-end + GPU server in a single package. Feed it source audio and a text prompt; twist on-screen knobs (or a connected MIDI controller via Web MIDI) to control denoise strength, SDE curve shape, latent feedback, and diffusion shift while the engine generates and plays back audio continuously. Optional audio-reactive video: drop any `.mp4` into `demos/realtime_motion_graph_web/videos/`.
 
 ```bash
 uv run python -u -m demos.realtime_motion_graph_web --port 8765

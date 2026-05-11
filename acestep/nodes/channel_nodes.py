@@ -158,7 +158,7 @@ class ChannelGuidance(BaseNode):
         handler._channel_guidance.append(entry)
 
         logger.info(
-            "Channel guidance: ch %d-%d scale=%.3f (%d total configs)",
+            "Channel guidance: ch {}-{} scale={:.3f} ({} total configs)",
             ch_start, ch_end, scale, len(handler._channel_guidance),
         )
 
@@ -192,7 +192,7 @@ class RemoveChannelGuidance(BaseNode):
         count = len(getattr(handler, '_channel_guidance', []))
         handler._channel_guidance = []
         if count:
-            logger.info("Removed %d channel guidance configs", count)
+            logger.info("Removed {} channel guidance configs", count)
         return {"model": model_handle}
 
 
@@ -201,18 +201,34 @@ def build_channel_gain(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor | None:
-    """Build a [1, 1, 64] gain tensor from channel guidance configs.
+    """Build a channel gain tensor from channel guidance configs.
 
-    Returns None if no configs or all gains are 1.0 (no-op).
+    Every entry's ``scale`` (scalar or per-frame curve) is canonicalized
+    through :func:`ode_steps.normalize_curve` to a ``[1, T_i, 1]`` form;
+    scalars become ``[1, 1, 1]``.  The output gain has shape
+    ``[1, T, 64]`` where ``T`` is the maximum T across entries (so
+    ``[1, 1, 64]`` for all-scalar configs, matching the pre-curve
+    allocation footprint).  Each entry's normalized scale is broadcast
+    across its channel range via ``expand``; no per-shape branching is
+    needed because every entry uses the same canonical shape.
+
+    Returns None when there are no configs or every gain is 1.0 (no-op).
     """
     if not configs:
         return None
 
-    gain = torch.ones(1, 1, 64, device=device, dtype=dtype)
+    from acestep.engine import ode_steps
+
+    norm_scales = [ode_steps.normalize_curve(cfg.scale) for cfg in configs]
+    T = max(int(s.shape[1]) for s in norm_scales)
+
+    gain = torch.ones(1, T, 64, device=device, dtype=dtype)
     any_non_unity = False
-    for cfg in configs:
-        if cfg.scale != 1.0:
-            gain[0, 0, cfg.channel_start:cfg.channel_end + 1] = cfg.scale
+    for cfg, sc in zip(configs, norm_scales):
+        c0, c1 = cfg.channel_start, cfg.channel_end + 1
+        sc_d = sc.to(device=device, dtype=dtype)
+        gain[0, :, c0:c1] = sc_d.expand(1, T, c1 - c0).squeeze(0)
+        if not torch.equal(sc_d, torch.ones_like(sc_d)):
             any_non_unity = True
 
     return gain if any_non_unity else None

@@ -679,7 +679,7 @@ def _build_windowed_vae_decode_engine(
 
     if not force_rebuild and os.path.exists(engine_path):
         size_mb = os.path.getsize(engine_path) / 1e6
-        logger.info("SKIP %s (%.0f MB)", name, size_mb)
+        logger.info("SKIP {} ({:.0f} MB)", name, size_mb)
         return (label, engine_path, 0.0, "SKIPPED")
 
     min_f, opt_f, max_f = WINDOWED_VAE_PROFILE_FRAMES
@@ -691,14 +691,14 @@ def _build_windowed_vae_decode_engine(
     )
 
     logger.info("=" * 60)
-    logger.info("VAE TRT BUILD (windowed): %s (min=%d opt=%d max=%d)",
+    logger.info("VAE TRT BUILD (windowed): {} (min={} opt={} max={})",
                 name, min_f, opt_f, max_f)
     logger.info("=" * 60)
 
     t0 = time.time()
     build_vae_decode_engine(onnx_paths["vae_decode"], engine_path, config=config)
     elapsed = time.time() - t0
-    logger.info("Built in %.0fs", elapsed)
+    logger.info("Built in {:.0f}s", elapsed)
     return (label, engine_path, elapsed, "OK")
 
 

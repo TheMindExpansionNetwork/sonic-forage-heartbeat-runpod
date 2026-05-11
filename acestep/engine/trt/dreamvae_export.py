@@ -94,7 +94,7 @@ def export_dreamvae_onnx(
     onnx_path = Path(onnx_path)
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Loading DreamVAE weights from %s ...", repo_id)
+    logger.info("Loading DreamVAE weights from {} ...", repo_id)
     model = load_dreamvae_from_hf(repo_id=repo_id, device=device, dtype=torch.float32)
 
     example = torch.randn(
@@ -102,7 +102,7 @@ def export_dreamvae_onnx(
         device=device, dtype=torch.float32,
     )
 
-    logger.info("Exporting DreamVAE to ONNX (opset %d, trace_T=%d) -> %s",
+    logger.info("Exporting DreamVAE to ONNX (opset {}, trace_T={}) -> {}",
                 _DREAMVAE_ONNX_OPSET, _DREAMVAE_TRACE_LATENT_FRAMES, onnx_path)
     with torch.no_grad():
         torch.onnx.export(
@@ -120,7 +120,7 @@ def export_dreamvae_onnx(
             dynamo=False,
         )
     size_mb = onnx_path.stat().st_size / (1 << 20)
-    logger.info("DreamVAE ONNX written: %s (%.1f MB)", onnx_path, size_mb)
+    logger.info("DreamVAE ONNX written: {} ({:.1f} MB)", onnx_path, size_mb)
     return onnx_path
 
 
@@ -145,8 +145,8 @@ def verify_dreamvae_onnx_matches_hf(local_onnx: Union[str, Path]) -> bool:
     remote = Path(hf_hub_download("daydreamlive/DreamVAE", "onnx/model.onnx"))
     a = sha256(local_onnx)
     b = sha256(remote)
-    logger.info("Local  : %s  %s", local_onnx, a)
-    logger.info("HF     : %s  %s", remote, b)
+    logger.info("Local  : {}  {}", local_onnx, a)
+    logger.info("HF     : {}  {}", remote, b)
     return a == b
 
 
@@ -173,7 +173,7 @@ def build_dreamvae_engine(
 
     if engine_path.exists() and not force_rebuild:
         size_mb = engine_path.stat().st_size / (1 << 20)
-        logger.info("SKIP %s (%.0f MB)", name, size_mb)
+        logger.info("SKIP {} ({:.0f} MB)", name, size_mb)
         return engine_path, "SKIPPED"
 
     if onnx_path is None:
@@ -186,7 +186,7 @@ def build_dreamvae_engine(
     )
 
     logger.info("=" * 60)
-    logger.info("DREAMVAE TRT BUILD: %s (max_duration=%ds)", name, duration_s)
+    logger.info("DREAMVAE TRT BUILD: {} (max_duration={}s)", name, duration_s)
     logger.info("=" * 60)
 
     engine_path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +226,7 @@ def build_windowed_dreamvae_engine(
 
     if engine_path.exists() and not force_rebuild:
         size_mb = engine_path.stat().st_size / (1 << 20)
-        logger.info("SKIP %s (%.0f MB)", name, size_mb)
+        logger.info("SKIP {} ({:.0f} MB)", name, size_mb)
         return (label, str(engine_path), 0.0, "SKIPPED")
 
     if onnx_path is None:
@@ -242,7 +242,7 @@ def build_windowed_dreamvae_engine(
     )
 
     logger.info("=" * 60)
-    logger.info("DREAMVAE TRT BUILD (windowed): %s (min=%d opt=%d max=%d)",
+    logger.info("DREAMVAE TRT BUILD (windowed): {} (min={} opt={} max={})",
                 name, min_f, opt_f, max_f)
     logger.info("=" * 60)
 
@@ -251,10 +251,10 @@ def build_windowed_dreamvae_engine(
     try:
         build_vae_decode_engine(onnx_path, engine_path, config=config)
         elapsed = _time.time() - t0
-        logger.info("Built in %.0fs", elapsed)
+        logger.info("Built in {:.0f}s", elapsed)
         return (label, str(engine_path), elapsed, "OK")
     except Exception as e:
-        logger.error("DreamVAE windowed build failed: %s", e)
+        logger.error("DreamVAE windowed build failed: {}", e)
         return (label, "", _time.time() - t0, "FAILED")
 
 
@@ -293,9 +293,9 @@ def build_dreamvae_engines(
             )
             elapsed = time.time() - t0
             if status == "OK":
-                logger.info("Built in %.0fs", elapsed)
+                logger.info("Built in {:.0f}s", elapsed)
             results.append((label, str(engine_path), elapsed, status))
         except Exception as e:  # build failures shouldn't kill the matrix
-            logger.error("DreamVAE %ds build failed: %s", dur, e)
+            logger.error("DreamVAE {}s build failed: {}", dur, e)
             results.append((label, "", time.time() - t0, "FAILED"))
     return results

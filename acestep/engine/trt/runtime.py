@@ -70,7 +70,7 @@ class TRTDecoder:
 
         self.device = torch.device(device)
 
-        logger.info("Loading TRT engine from %s ...", engine_path)
+        logger.info("Loading TRT engine from {} ...", engine_path)
         self.engine = engine_from_bytes(bytes_from_path(str(engine_path)))
 
         self.context = self.engine.create_execution_context()
@@ -96,7 +96,7 @@ class TRTDecoder:
         # Per-shape buffer cache: shape_key -> {bufs, output}
         self._buf_cache: dict[tuple, dict] = {}
 
-        logger.info("TRT decoder ready (output_dtype=%s)", self._output_dtype)
+        logger.info("TRT decoder ready (output_dtype={})", self._output_dtype)
 
     def _get_bufs(self, hs_shape, ts_shape, enc_shape, cl_shape):
         """Get or allocate buffers for these shapes, using each tensor's
@@ -139,7 +139,7 @@ class TRTDecoder:
 
         entry = {"bufs": bufs, "output": out_buf}
         self._buf_cache[key] = entry
-        logger.info("Allocated TRT buffers for shapes: hs=%s enc=%s", list(hs_shape), list(enc_shape))
+        logger.info("Allocated TRT buffers for shapes: hs={} enc={}", list(hs_shape), list(enc_shape))
         return entry
 
     def __call__(
@@ -229,9 +229,9 @@ class TRTDecoder:
             "steps_per_sec": 1000.0 / (sum(times) / len(times)),
             "seq_len": T, "enc_len": L, "batch_size": B,
         }
-        logger.info("TRT benchmark (T=%d, L=%d, B=%d):", T, L, B)
+        logger.info("TRT benchmark (T={}, L={}, B={}):", T, L, B)
         logger.info(
-            "  mean=%.1fms  min=%.1fms  max=%.1fms  (%.1f steps/sec)",
+            "  mean={:.1f}ms  min={:.1f}ms  max={:.1f}ms  ({:.1f} steps/sec)",
             results["mean_ms"], results["min_ms"], results["max_ms"],
             results["steps_per_sec"],
         )

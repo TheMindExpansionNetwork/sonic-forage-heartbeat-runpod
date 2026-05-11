@@ -17,8 +17,13 @@ import numpy as np
 import soundfile as sf
 from websockets.sync.client import connect
 
+from acestep.fixtures import audio_fixture
+
 WS_URL = "ws://localhost:8765/"
-AUDIO_PATH = Path(__file__).resolve().parents[2] / "demos" / "realtime_motion_graph_web" / "static" / "default_audio" / "confusion.wav"
+# Same fixture the live demo opens by default; pulled (and cached) from
+# the daydreamlive/demon-fixtures HF dataset inside main() so importing
+# this module doesn't hit the network.
+DEFAULT_FIXTURE = "inside_confusion_loop_60s_gsm.wav"
 
 CFG = {
     "sde": False,
@@ -57,10 +62,9 @@ def load_wav_48k_stereo(p: Path):
 
 
 def main():
-    if not AUDIO_PATH.exists():
-        raise SystemExit(f"audio missing: {AUDIO_PATH}")
-    audio, n_samples, n_channels = load_wav_48k_stereo(AUDIO_PATH)
-    print(f"[smoke] loaded {AUDIO_PATH.name}: {n_samples / 48000:.1f}s x {n_channels}ch")
+    audio_path = audio_fixture(DEFAULT_FIXTURE)
+    audio, n_samples, n_channels = load_wav_48k_stereo(audio_path)
+    print(f"[smoke] loaded {audio_path.name}: {n_samples / 48000:.1f}s x {n_channels}ch")
 
     print(f"[smoke] connect {WS_URL}")
     t0 = time.time()

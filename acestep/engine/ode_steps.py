@@ -33,17 +33,35 @@ import torch
 # ---------------------------------------------------------------------------
 
 
-def normalize_curve(curve: torch.Tensor) -> torch.Tensor:
-    """Broadcast a per-frame curve to ``[B, T, 1]`` for element-wise ops.
+def normalize_curve(value: "float | int | bool | torch.Tensor") -> torch.Tensor:
+    """Canonicalize a scalar-or-curve value to ``[B, T, 1]``.
 
-    Accepts shape ``[T]``, ``[B, T]``, or ``[B, T, 1]`` and returns
-    ``[1, T, 1]``, ``[B, T, 1]``, or the input unchanged respectively.
+    This is the single boundary that turns scalar-or-curve API inputs
+    into a uniform tensor shape.  Downstream code multiplies the result
+    against ``[B, T, *]`` operands and lets broadcasting handle both
+    "scalar" (``[1, 1, 1]``) and per-frame (``[1, T, 1]``) cases — there
+    is no need for ``isinstance`` checks anywhere else.
+
+    Accepts:
+        - Python ``int`` / ``float`` / ``bool`` -> ``[1, 1, 1]``
+        - 0-d tensor -> ``[1, 1, 1]``
+        - 1-d ``[T]`` -> ``[1, T, 1]``
+        - 2-d ``[B, T]`` -> ``[B, T, 1]``
+        - 3-d ``[B, T, 1]`` -> unchanged
     """
-    if curve.ndim == 1:       # [T]
-        return curve.unsqueeze(0).unsqueeze(-1)
-    elif curve.ndim == 2:     # [B, T]
-        return curve.unsqueeze(-1)
-    return curve              # already [B, T, 1]
+    if isinstance(value, (int, float, bool)):
+        return torch.tensor([[[float(value)]]], dtype=torch.float32)
+    if value.ndim == 0:
+        return value.reshape(1, 1, 1).to(dtype=torch.float32)
+    if value.ndim == 1:
+        return value.unsqueeze(0).unsqueeze(-1)
+    if value.ndim == 2:
+        return value.unsqueeze(-1)
+    if value.ndim == 3:
+        return value
+    raise ValueError(
+        f"normalize_curve: expected scalar / 0-d / 1-d / 2-d / 3-d, got {value.ndim}-d",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -258,19 +276,37 @@ def step_sde_renoise(
 class MomentumBuffer:
     """Running-average accumulator over velocity deltas for APG.
 
-    One buffer per in-flight generation: callers construct it when a slot
-    is created with CFG enabled and pass the same instance to
-    :func:`apg_forward` every step so the accumulator persists across the
-    slot's schedule.
+    The momentum coefficient can be supplied either at construction
+    (``MomentumBuffer(momentum=-0.75)``, the legacy form) or per
+    :meth:`update` call (the hot-mutable form used by streaming, where
+    :func:`apg_forward` looks up the effective momentum from the
+    shared-curve registry every step).  The per-call value wins when
+    both are supplied; the constructor default makes the legacy
+    no-argument ``buffer.update(diff)`` form keep working.
+
+    One buffer per in-flight generation: callers construct it when a
+    slot is created with CFG enabled and pass the same instance to
+    :func:`apg_forward` every step so the accumulator persists across
+    the slot's schedule.
     """
 
-    def __init__(self, momentum: float = -0.75):
+    def __init__(self, momentum: "float | torch.Tensor" = -0.75) -> None:
         self.momentum = momentum
         self.running_average: "torch.Tensor | float" = 0
 
-    def update(self, update_value: torch.Tensor) -> None:
-        new_average = self.momentum * self.running_average
-        self.running_average = update_value + new_average
+    def update(
+        self,
+        update_value: torch.Tensor,
+        momentum: "float | torch.Tensor | None" = None,
+    ) -> None:
+        """Advance the running average by ``update_value``.
+
+        ``momentum`` overrides the constructor default for this call.
+        Either form (scalar or per-frame curve) broadcasts against
+        ``update_value`` since the multiplication is the only operation.
+        """
+        m = momentum if momentum is not None else self.momentum
+        self.running_average = update_value + m * self.running_average
 
 
 def apg_project(
@@ -294,19 +330,25 @@ def apg_forward(
     pred_uncond: torch.Tensor,
     guidance_scale,
     momentum_buffer: MomentumBuffer,
+    momentum: "float | int | torch.Tensor" = -0.75,
     eta: float = 0.0,
     norm_threshold: float = 2.5,
     dims: Tuple[int, ...] = (1,),
 ) -> torch.Tensor:
     """Apply APG classifier-free guidance to a velocity prediction.
 
-    ``guidance_scale`` may be a Python float or a broadcastable tensor
-    (e.g. ``[1, T, 1]``) for per-frame guidance. The ``momentum_buffer``
-    accumulates the cond/uncond delta across steps and must belong to the
-    generation the call is part of.
+    Both ``guidance_scale`` and ``momentum`` accept the scalar-or-curve
+    form: scalars and per-frame ``[T]`` / ``[1, T]`` / ``[1, T, 1]``
+    curves are normalized internally and broadcast against
+    ``[B, T, D]`` velocities.  The ``momentum_buffer`` accumulates the
+    cond/uncond delta across steps and must belong to the generation
+    the call is part of.
     """
+    momentum_t = normalize_curve(momentum).to(
+        device=pred_cond.device, dtype=pred_cond.dtype,
+    )
     diff = pred_cond - pred_uncond
-    momentum_buffer.update(diff)
+    momentum_buffer.update(diff, momentum_t)
     diff = momentum_buffer.running_average
 
     if norm_threshold > 0:

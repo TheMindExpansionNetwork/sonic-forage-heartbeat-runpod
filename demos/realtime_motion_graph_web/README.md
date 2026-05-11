@@ -1,7 +1,8 @@
 # Realtime Motion-to-Music (Web)
 
-Browser-based real-time motion-to-music demo. Single-port HTTP +
-WebSocket server runs the GPU pipeline alongside the browser client:
+Browser-based real-time motion-to-music demo. A Python backend runs the
+GPU pipeline behind an HTTP + WebSocket server; a Next.js front-end
+renders the live UI:
 
 - Upload a source audio file, get a live ACE-Step stream back
 - Live-editable prompt
@@ -21,23 +22,31 @@ WebSocket server runs the GPU pipeline alongside the browser client:
 - **Server**: the full ACE-Step install (CUDA GPU, `uv sync`, prebuilt
   TensorRT engines). No extra dependencies beyond the main project.
 - **Client**: any modern Chromium or Firefox. Web MIDI and webcam
-  support are optional. HTTPS is *not* required because the server
-  binds on the same origin as the WebSocket endpoint.
+  support are optional.
 
 ## Run
 
-From the remote 5090 box (the machine with the GPU):
+A single launcher starts the Python backend on `:1318` and a Next.js
+dev server on `:6660` with combined output:
 
 ```bash
-uv run python -u -m demos.realtime_motion_graph_web
-# or with explicit binds:
-uv run python -u -m demos.realtime_motion_graph_web \
-    --host 0.0.0.0 --port 8765
-# pick the acceleration mode explicitly (default is tensorrt):
-uv run python -u -m demos.realtime_motion_graph_web --accel tensorrt
-uv run python -u -m demos.realtime_motion_graph_web --accel compile
-uv run python -u -m demos.realtime_motion_graph_web --accel eager
+uv run python -u -m demos.realtime_motion_graph_web.run
+# forward backend args after `--`:
+uv run python -u -m demos.realtime_motion_graph_web.run -- --accel eager
 ```
+
+First run installs `web/node_modules` automatically (Node.js 20+ required).
+Open `http://localhost:6660`. Next.js rewrites `/api/*`, `/fixtures/*`,
+`/loras/*`, and `/videos/*` to the backend at `:1318`; the WebSocket
+URL comes from `NEXT_PUBLIC_POD_BASE_URL` (set by the launcher).
+
+The full UI lives under `web/` (React + zustand, mirrored from the
+internal `daydreamlive/demon-react` package). See `web/components/`,
+`web/engine/`, `web/hooks/`, and `web/store/` for the source.
+
+### Backend args
+
+Anything after `--` on the launcher is forwarded to the backend.
 
 `--accel {tensorrt,compile,eager}` sets BOTH `decoder_backend` and
 `vae_backend` on the underlying `Session`. Default is `tensorrt`.
@@ -49,9 +58,13 @@ one component in eager while the other stays on TRT:
 
 ```bash
 # Mix-and-match: TRT decoder, eager VAE.
-uv run python -u -m demos.realtime_motion_graph_web \
+uv run python -u -m demos.realtime_motion_graph_web.run -- \
     --accel tensorrt --vae-accel eager
 ```
+
+The text encoder stays resident in VRAM by default so live prompt edits do not
+pay CPU/GPU transfer cost. Add `--offload-text-encoder` on lower-VRAM GPUs to
+restore the previous lower-memory behavior.
 
 `--checkpoint <name>` selects which DiT checkpoint to load. The name
 must match a directory under `<checkpoints_dir>/`. Full TensorRT mode is
@@ -106,9 +119,9 @@ By default, `--skip-threshold -1` disables decode skipping so VAE decode
 latency is measured on every completed generation. Set `--no-decode` for
 decoder-only throughput.
 
-Then from any laptop on the same network:
+Once it's running:
 
-1. Open `http://<server-host>:8765/`
+1. Open `http://localhost:6660/`
 2. Click **Play** — the demo loads the default fixture
    (`inside_confusion_loop_60s_gsm.wav`). Fixtures stream from the
    `daydreamlive/demon-fixtures` Hugging Face dataset on first request
@@ -124,12 +137,12 @@ Then from any laptop on the same network:
 
 Audio is the **primary** source: the demo always loads from the
 canonical fixture set (`daydreamlive/demon-fixtures` on Hugging Face,
-listed in `acestep.fixtures.KNOWN_FIXTURES`), served by the web server
+listed in `acestep.fixtures.KNOWN_FIXTURES`), served by the backend
 at `/fixtures/<name>` via lazy HF download.
 Video is **optional and secondary** — drop any `.mp4`/`.webm`/`.mov`
-into `static/videos/` to attach the audio-reactive shader pipeline.
-With no videos present the demo runs audio-only (graph mode is the
-default and looks the same).
+into `videos/` (sibling of `web/`) to attach the audio-reactive shader
+pipeline. With no videos present the demo runs audio-only (graph mode
+is the default and looks the same).
 
 ## Layout
 
@@ -138,30 +151,21 @@ demos/realtime_motion_graph_web/
 ├── README.md
 ├── __init__.py
 ├── __main__.py               # `python -m demos.realtime_motion_graph_web`
-├── server.py                 # HTTP (static) + WebSocket multiplex on one port
+├── run.py                    # launcher: backend + Next.js dev server
+├── server.py                 # HTTP API + WebSocket multiplex on one port
 ├── backend.py                # GPU handle_client coroutine
 ├── pipeline.py               # PipelineRunner (graph-driven streaming loop)
 ├── audio_engine.py           # server-side audio buffer
 ├── knobs.py                  # MIDI knob bank definitions
-├── protocol.py               # wire format (Python source of truth for protocol.js)
-└── static/
-    ├── index.html            # launcher + live HUD DOM
-    ├── style.css
-    ├── main.js               # orchestration, UI, session loops
-    ├── protocol.js           # wire format (float16, zstd delta, slice hdr)
-    ├── audio.js              # main-thread wrapper around the worklet
-    ├── audio-worklet.js      # realtime buffer / swap / patch / delta-add
-    ├── knobs.js              # bank definitions + flat value store
-    ├── motion.js             # webcam motion tracker (canvas frame diff)
-    ├── hud.js                # canvas HUD (waveform, trails, stats)
-    └── lib/
-        └── fzstd.min.js      # bundled pure-JS zstd decoder
+├── protocol.py               # wire format (Python source of truth)
+├── videos/                   # user-supplied .mp4/.webm/.mov drop-in (optional)
+└── web/                      # Next.js front-end (React + zustand)
 ```
 
 ## Protocol
 
 The WebSocket protocol is defined in `protocol.py` (the Python source
-of truth that `static/protocol.js` mirrors):
+of truth that `web/engine/protocol.ts` mirrors):
 
 - **Init**: JSON config -> binary audio upload
   (`<uint32 channels><uint32 samples>` + float32 PCM)
@@ -170,41 +174,69 @@ of truth that `static/protocol.js` mirrors):
   zstd-compressed float16 delta) + `params_update` / `prompt_applied`
   JSON messages in
 
-`server.py` multiplexes HTTP static-file serving and the WebSocket
-upgrade onto one TCP port; the WS handshake hands off to
-`backend.handle_client`.
+`server.py` multiplexes the JSON HTTP API, fixture/video file serving,
+and the WebSocket upgrade onto one TCP port; the WS handshake hands
+off to `backend.handle_client`.
 
 ## Audio-reactive video
 
-The video is rendered through a small WebGL2 shader pipeline
-(`static/effects.js`) so it visually responds to the music in real
-time. Two effects:
+The video is rendered through a small WebGL2 shader pipeline so it
+visually responds to the music in real time. Two effects:
 
 - **Color parallax** — saturated regions drift horizontally with a
   slow sway plus a punch on every kick.
 - **Bloom on kick** — luminance-thresholded bloom that brightens with
   the bass envelope.
 
-Defaults live in `static/config.json` under `effects`:
-
-```json
-"effects": {
-  "parallax_strength": 0.4,
-  "bloom_on_kick": 0.3,
-  "bloom_threshold": 0.15
-}
-```
-
 The same kick amplitude is exposed to CSS as `--bloom-amount`, so the
 perimeter HUD bars and the cursor halo glow in lockstep with the
-shader bloom on the video. No knobs in the public UI — edit
-`config.json` and refresh to retune.
+shader bloom on the video.
 
 **Curator setup: nothing.** Color parallax is saturation-driven, not
 depth-driven, so there is no preprocessing step and no depth map
-sidecars to generate. Drop the source video into `static/videos/`
-and run the server as usual. If WebGL2 is unavailable the canvas is
-hidden and the plain video plays as fallback.
+sidecars to generate. Drop the source video into `videos/` and run
+the launcher as usual. If WebGL2 is unavailable the canvas is hidden
+and the plain video plays as fallback.
+
+## Test fixtures
+
+The eight files in `acestep.fixtures.KNOWN_FIXTURES` ship with sidecar
+files in the `daydreamlive/demon-fixtures` HF dataset:
+
+```
+<name>.sidecar.json         # bpm, key, duration metadata
+<name>.sidecar.safetensors  # source latent + context_latent
+```
+
+When the client sends `fixture_name` for a known fixture, the server
+loads the cached source latent + context latent and reads BPM / key
+from the JSON, skipping librosa beat tracking, the CNN key
+classifier, and `Session.prepare_source`. `Session.encode_text` still
+runs live every connect (it depends on the prompt and the demo's
+blended-prompt UI typically diverges from any baked tags within
+seconds of connecting; the ~60ms warm cost isn't worth the cache
+complication). For ad-hoc uploads (no `fixture_name`), the full live
+path runs as before.
+
+The runtime checks `out/fixture_sidecars/` first (so local edits are
+tested without an upload round-trip) and falls through to the
+dataset.
+
+If you want to override the BPM or key for a fixture, edit the
+`<name>.sidecar.json` and re-run the precompute script. Editing the
+JSON's `bpm` / `key` fields and re-running preserves them (the
+script only re-derives values that aren't already pinned). To
+forcibly re-derive everything from scratch, pass `--force`:
+
+```bash
+uv run python -m scripts.precompute_fixture_sidecars
+uv run python -m scripts.precompute_fixture_sidecars --force
+uv run python -m scripts.precompute_fixture_sidecars --only \
+    inside_confusion_loop_60s_gsm.wav
+```
+
+After editing, upload the regenerated `<name>.sidecar.json` and
+`<name>.sidecar.safetensors` pair back to the HF dataset.
 
 ## Browser notes
 
@@ -217,24 +249,17 @@ hidden and the plain video plays as fallback.
   so existing controllers just work.
 - **Webcam**: `getUserMedia` with a low-res capture canvas and a simple
   abs-diff detector, smoothed like the OpenCV version.
-- **Zstd**: bundled `fzstd` UMD build under `static/lib/`. Falls back to
-  jsdelivr CDN if the bundled copy is missing (e.g. while hot-iterating
-  without a build step).
 
 ## Troubleshooting
 
-- **"fzstd library not loaded"**: `static/lib/fzstd.min.js` did not
-  download or load. Re-fetch from
-  `https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.min.js` and place
-  it under `static/lib/`.
-- **"WebSocket connection failed"**: verify `--ws-port` is reachable
-  from the browser (firewall, reverse proxy). The page and the
-  WebSocket are on different ports.
+- **"WebSocket connection failed"**: verify the backend is reachable on
+  `:1318` (firewall, reverse proxy). The launcher logs `[backend]`
+  output if the Python side crashed.
 - **Audio plays silent on first connect**: browsers gate audio on a
   user gesture; `Connect & start` counts as one, so this should "just
   work" but if it doesn't, click anywhere in the HUD view.
 - **No MIDI devices listed**: Web MIDI requires `localhost` or HTTPS in
-  Chromium. Use `http://localhost:8080` locally, or run behind a
+  Chromium. Use the local `http://localhost:6660` URL, or run behind a
   reverse proxy with TLS for remote access.
 - **Webcam permission denied**: same-origin constraint as MIDI. Switch
   to on-screen knobs mode if the browser blocks the camera.

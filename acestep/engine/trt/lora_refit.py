@@ -75,7 +75,7 @@ class TRTLoRAManager(LoRAManagerBase):
         checkpoint_file = None
         if not decoder_params and checkpoint_path:
             from safetensors import safe_open
-            logger.info("Loading base weights from checkpoint: %s", checkpoint_path)
+            logger.info("Loading base weights from checkpoint: {}", checkpoint_path)
             checkpoint_file = safe_open(checkpoint_path, framework="pt")
 
         has_prototype = hasattr(refitter, "get_weights_prototype")
@@ -124,12 +124,12 @@ class TRTLoRAManager(LoRAManagerBase):
             matched += 1
 
         logger.info(
-            "TRT LoRA manager ready: %d/%d engine weights mapped (prefix='%s')",
+            "TRT LoRA manager ready: {}/{} engine weights mapped (prefix='{}')",
             matched, len(all_trt_names), trt_weight_prefix,
         )
         if matched == 0:
             logger.warning(
-                "No engine weights matched! TRT names sample: %s",
+                "No engine weights matched! TRT names sample: {}",
                 all_trt_names[:5],
             )
 

@@ -314,8 +314,12 @@ class ChannelGuidanceEntry:
     Fields:
         channel_start: First channel index (0-63 inclusive).
         channel_end: Last channel index (0-63 inclusive).
-        scale: Multiplicative gain for these channels.
+        scale: Multiplicative gain for these channels.  May be a scalar
+            (uniform across the timeline) or a per-frame curve as a
+            ``[T]`` / ``[1, T]`` / ``[1, T, 1]`` tensor.  Mixing scalar
+            and curve entries in one config list is fine; entries live
+            in disjoint channel ranges and the builder handles each.
     """
     channel_start: int
     channel_end: int
-    scale: float
+    scale: "float | torch.Tensor"

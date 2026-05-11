@@ -153,7 +153,7 @@ def run_test(mode: str):
 
     # Phase 2: Switch to CURVE_B
     if mode == 'shared':
-        pipe.set_shared_sde_curve(CURVE_B.to(device=device, dtype=dtype))
+        pipe.set_shared_curve("sde_denoise_curve", CURVE_B.to(device=device, dtype=dtype))
         print("  >>> Set shared CURVE_B (all in-flight slots affected)")
 
     # Phase 3: Continue ticking with new submissions.
