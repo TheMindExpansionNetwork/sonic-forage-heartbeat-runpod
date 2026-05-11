@@ -63,7 +63,7 @@
 
   "_audio_help": "Output audio chain. lufs_enabled toggles the loudness matcher on at boot (operator can still flip it via the LUFS button in-session). lufs_window_sec controls the meter's sliding window. 3s is the standard. Lower = faster response but noisier and prone to high-water spikes on transients. Practical floor ~1.5s. lufs_metric picks the metric: 'lufs' (BS.1770 K-weighted, broadcast standard) or 'dba' (IEC 61672 A-weighted, closer to perceived loudness on bright/distorted content). The matcher always seeds the high-water mark with the source's loudest short-term window at session start, so the louder of {source, denoised} defines the target from t=0 -- no need to wait for the meter to discover it.",
   "audio": {
-    "lufs_enabled": false,
+    "lufs_enabled": true,
     "lufs_window_sec": 1.5,
     "lufs_metric": "lufs",
     "lufs_peak_headroom": 4.0
