@@ -7,6 +7,8 @@ import { useTactileSlider } from "@/hooks/useTactileSlider";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { SLIDER_META } from "@/types/engine";
 
+import { tooltipFor } from "./SliderTile";
+
 // Vertical slider matching DEMON's CSS layout (.slider-track + .slider-fill
 // + .slider-thumb). Click + drag on the track to set; the value reads from
 // usePerformanceStore. LoRA sliders (param starting with `lora_str_`)
@@ -180,9 +182,23 @@ export function SliderGroup({ param, label, max, kbd }: Props) {
 
   const tintStyle = { "--slider-tint": tintAt(fraction) } as CSSProperties;
 
+  // Descriptive tooltip on the LABEL only — hovering the track during
+  // drag would otherwise trigger the tooltip mid-interaction. Label is
+  // the natural "what is this?" hover target. data-dd-tooltip-wide
+  // wraps the longer copy across multiple lines (vs the default nowrap
+  // chrome tooltips).
+  const tooltip = tooltipFor(param);
+
   return (
     <div className="slider-group" data-param={param} style={tintStyle}>
-      <div className="slider-label">{label}</div>
+      <div
+        className="slider-label"
+        {...(tooltip
+          ? { "data-dd-tooltip": tooltip, "data-dd-tooltip-wide": "" }
+          : {})}
+      >
+        {label}
+      </div>
       <div className="slider-track" ref={trackRef}>
         <div className="slider-fill" style={{ height: `${pct}%` }} />
         <div className="slider-thumb" style={{ bottom: `${pct}%` }} />

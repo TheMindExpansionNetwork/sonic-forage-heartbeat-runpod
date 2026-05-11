@@ -32,6 +32,22 @@ const INWARD_DISTANCE = 8;
 // max --bloom-amount, so 16 px leaves clear headroom on both ends.
 const ALONG_END_INSET_PX = 16;
 
+// Half-revolution curl at each ribbon's leading edge — same geometry
+// as the pre-2026-05 version, restored after the per-ribbon coil and
+// halo-wrap variants were tried and rejected.
+const HEAD_CURL_STEPS = 8;
+const HEAD_CURL_BASE_R = 7;
+const HEAD_CURL_KICK_R = 3;
+
+// Gray "track" ribbons drawn drawLen..ALONG behind the colored fill so
+// the slider reads as a traditional fill-up-to-value control — but the
+// track is itself moving ribbons, cohesive with the fill rather than a
+// different visual language.
+const TRACK_COLOR = "#5a5a60";
+// Multiplier on the canvas-wide alpha for the track pass — keeps the
+// track subordinate while still letting it breathe with --bloom-amount.
+const TRACK_ALPHA_MUL = 0.42;
+
 // Floors for ribbon length, defined in types/engine. The side floor
 // is also consumed by DesktopEdgeDrag for the hint head position so
 // the hint stays attached to the ribbon's visible end. The top floor
@@ -174,7 +190,48 @@ export function destroyRibbons(bars: RibbonBar[]): void {
   }
 }
 
-function drawRibbon(
+/** Canvas-pixel transform for a bar's viewBox. Shared by drawFillRibbon
+ *  and drawTrackRibbon so both ribbons land in identical canvas space. */
+function barTransform(bar: RibbonBar, bleedPx: number) {
+  const alongSize = bar.horizontal ? bar.w : bar.h;
+  const acrossSize = bar.horizontal ? bar.h : bar.w;
+  const hostAcross = Math.max(1, acrossSize - bleedPx);
+  const acrossPerUnit = hostAcross / ACROSS;
+  const alongPerUnit = Math.max(1, alongSize - 2 * ALONG_END_INSET_PX) / ALONG;
+  // The canvas is bleedPx larger than the host on its bleedSide; only
+  // the "left" bleed (right-edge bar) needs an offset on the across
+  // axis. See drawFillRibbon's preserved comment in earlier revisions
+  // for the long version of why.
+  const acrossOffset = bar.bleedSide === "left" ? bleedPx : 0;
+  const alongOffset = ALONG_END_INSET_PX;
+  return {
+    sx: bar.horizontal ? alongPerUnit : acrossPerUnit,
+    sy: bar.horizontal ? acrossPerUnit : alongPerUnit,
+    acrossOffset,
+    alongOffset,
+  };
+}
+
+/** Map a (along, across) viewBox point to canvas-CSS-pixel coords. */
+function viewBoxToCanvas(
+  bar: RibbonBar,
+  t: ReturnType<typeof barTransform>,
+  along: number,
+  across: number,
+): { x: number; y: number } {
+  if (bar.horizontal) {
+    return { x: t.alongOffset + along * t.sx, y: across * t.sy };
+  }
+  const y = bar.flipAlong ? ALONG - along : along;
+  return { x: t.acrossOffset + across * t.sx, y: t.alongOffset + y * t.sy };
+}
+
+/** Colored "fill" ribbon — 0..drawLen along the bar, terminating in
+ *  the original half-revolution curl. Uses the strokeStyle set by the
+ *  caller (one of the PALETTE colors). The leading edge is SOLID; the
+ *  far end of the bar fades via the .install-ribbons CSS mask in
+ *  globals.css. Single beginPath / stroke per ribbon. */
+function drawFillRibbon(
   ctx: CanvasRenderingContext2D,
   progress: number,
   ribbonIdx: number,
@@ -196,49 +253,14 @@ function drawRibbon(
   const writheAmp = NOISE_AMP_BASE + kick * NOISE_AMP_KICK;
   const center =
     bar.innerSign > 0 ? ACROSS - INWARD_DISTANCE : INWARD_DISTANCE;
+  const tform = barTransform(bar, bleedPx);
 
-  // The canvas is bleedPx larger than the host on its bleedSide. Map the
-  // viewBox so the ACROSS axis fills only the host content area; values
-  // past 0..ACROSS land in the bleed pixels (which is exactly where the
-  // writhing curls want to go).
-  const alongSize = bar.horizontal ? bar.w : bar.h;
-  const acrossSize = bar.horizontal ? bar.h : bar.w;
-  const hostAcross = Math.max(1, acrossSize - bleedPx);
-  const acrossPerUnit = hostAcross / ACROSS;
-  // Where viewBox across=0 maps to in canvas pixels. For "top" / "left" /
-  // "right", bleed lives on the inward side of the host, so across=0
-  // (the outer side) is at the canvas edge — except the right bar has
-  // its bleed on the left, so across=0 (bar's left = host's left edge,
-  // which is in the central gutter, beyond the inner side's bleed) needs
-  // to start at canvas_x = bleedPx, then increase toward the screen edge
-  // (across=100 = bar's right edge).
-  // ── wait: the right bar has innerSign=-1 (inner side at across=8), and
-  //    we want across=0 at the host's left edge (which IS the inner side
-  //    visually, in the central gutter). The CSS for .install-edge-right
-  //    pins the host with right:0, so the bar's right edge in CSS is the
-  //    screen's right edge (across=100 in viewBox), and the bar's left
-  //    edge (across=0 in viewBox) is hud-thickness inward. The canvas
-  //    extends LEFT of the bar by bleedPx — so canvas_x=0 is bleedPx
-  //    leftward of the bar's left edge (deeper into the central gutter).
-  //    Therefore across=0 → canvas_x = bleedPx. across=100 → canvas_x =
-  //    bleedPx + hostAcross = bar.w. across=-something (writhe curling
-  //    further inward) → canvas_x < bleedPx (into the bleed zone). ✓
-  const acrossOffset = bar.bleedSide === "left" ? bleedPx : 0;
-  // Same idea as acrossOffset but on the along axis: the writhe path's
-  // first and last points (along=0 and along=ALONG) would sit flush with
-  // the canvas bitmap edge, so the stroke half-width + drop-shadow halo
-  // get sliced. Inset both ends by ALONG_END_INSET_PX to give them room.
-  const hostAlong = Math.max(1, alongSize - 2 * ALONG_END_INSET_PX);
-  const alongPerUnit = hostAlong / ALONG;
-  const alongOffset = ALONG_END_INSET_PX;
-  const sx = bar.horizontal ? alongPerUnit : acrossPerUnit;
-  const sy = bar.horizontal ? acrossPerUnit : alongPerUnit;
-
+  // ── Writhe (full lateral spread, no convergence — pre-2026-05 look) ──
   ctx.beginPath();
-  let prevX = 0,
-    prevY = 0,
-    lastX = 0,
-    lastY = 0;
+  let prevVbX = 0,
+    prevVbY = 0,
+    lastVbX = 0,
+    lastVbY = 0;
   for (let i = 0; i <= SEGMENTS; i++) {
     const t = i / SEGMENTS;
     const along = t * drawLen;
@@ -247,65 +269,111 @@ function drawRibbon(
       Math.sin(along * 0.025 - time * 0.9 + phase * 1.4) * 0.3;
     const across = center + lateral + noise * writheAmp;
 
-    let x: number, y: number;
+    let vbX: number, vbY: number;
     if (bar.horizontal) {
-      x = along;
-      y = across;
+      vbX = along;
+      vbY = across;
     } else {
-      x = across;
-      y = bar.flipAlong ? ALONG - along : along;
+      vbX = across;
+      vbY = bar.flipAlong ? ALONG - along : along;
     }
-    // For horizontal bars, the across axis is y; for vertical bars, it's
-    // x. Apply the bleed offset to whichever one is the across axis (only
-    // matters when bleedSide === "left" → right-edge bar). The along
-    // offset packs the writhe inside ALONG_END_INSET_PX of margin on
-    // both ends so strokes don't get clipped at the canvas bitmap edge.
-    const px = bar.horizontal ? alongOffset + x * sx : acrossOffset + x * sx;
-    const py = bar.horizontal ? y * sy : alongOffset + y * sy;
+    const px = bar.horizontal
+      ? tform.alongOffset + vbX * tform.sx
+      : tform.acrossOffset + vbX * tform.sx;
+    const py = bar.horizontal
+      ? vbY * tform.sy
+      : tform.alongOffset + vbY * tform.sy;
     if (i > 0) {
-      prevX = lastX;
-      prevY = lastY;
+      prevVbX = lastVbX;
+      prevVbY = lastVbY;
     }
     if (i === 0) ctx.moveTo(px, py);
     else ctx.lineTo(px, py);
-    lastX = x;
-    lastY = y;
+    lastVbX = vbX;
+    lastVbY = vbY;
   }
 
-  // Curling arrowhead at the leading edge (in viewBox space, then scaled).
+  // ── Half-revolution curl at the leading edge (original) ──
+  // Tangent from the writhe's last segment defines the curl plane;
+  // altSign / innerSign alternation gives adjacent ribbons opposite
+  // curl handedness. The gradient strokeStyle fades the curl out as
+  // it extends past drawLen, since the canvas position falls past
+  // the gradient's last stop.
   if (drawLen > 8) {
-    const dx = lastX - prevX;
-    const dy = lastY - prevY;
+    const dx = lastVbX - prevVbX;
+    const dy = lastVbY - prevVbY;
     const segLen = Math.hypot(dx, dy) || 1;
     const ux = dx / segLen;
     const uy = dy / segLen;
     const altSign = ribbonIdx % 2 === 0 ? 1 : -1;
     const sign = altSign * (bar.innerSign > 0 ? 1 : -1);
-    const px = -uy * sign;
-    const py = ux * sign;
-    const r = 7 + kick * 3;
-    const cx = lastX + px * r;
-    const cy = lastY + py * r;
-    const curlSteps = 8;
-    for (let j = 1; j <= curlSteps; j++) {
-      const a = (j / curlSteps) * Math.PI;
+    const pvx = -uy * sign;
+    const pvy = ux * sign;
+    const rCurl = HEAD_CURL_BASE_R + kick * HEAD_CURL_KICK_R;
+    const cx = lastVbX + pvx * rCurl;
+    const cy = lastVbY + pvy * rCurl;
+    for (let j = 1; j <= HEAD_CURL_STEPS; j++) {
+      const a = (j / HEAD_CURL_STEPS) * Math.PI;
       const sa = Math.sin(a);
       const ca = Math.cos(a);
-      const rx = -px * ca + ux * sa;
-      const ry = -py * ca + uy * sa;
-      // The arrowhead tip lives in viewBox space as (cx + rx*r, cy + ry*r).
-      // For a horizontal bar this is (along, across); for vertical bars it's
-      // (across, along). Match the same axis-aware offset as above.
-      const tipAlong = bar.horizontal ? cx + rx * r : cy + ry * r;
-      const tipAcross = bar.horizontal ? cy + ry * r : cx + rx * r;
+      const rx = -pvx * ca + ux * sa;
+      const ry = -pvy * ca + uy * sa;
+      const tipAlong = bar.horizontal ? cx + rx * rCurl : cy + ry * rCurl;
+      const tipAcross = bar.horizontal ? cy + ry * rCurl : cx + rx * rCurl;
       const tipX = bar.horizontal
-        ? alongOffset + tipAlong * sx
-        : acrossOffset + tipAcross * sx;
+        ? tform.alongOffset + tipAlong * tform.sx
+        : tform.acrossOffset + tipAcross * tform.sx;
       const tipY = bar.horizontal
-        ? tipAcross * sy
-        : alongOffset + tipAlong * sy;
+        ? tipAcross * tform.sy
+        : tform.alongOffset + tipAlong * tform.sy;
       ctx.lineTo(tipX, tipY);
     }
+  }
+  ctx.stroke();
+}
+
+/** Gray "track" ribbon — drawLen..ALONG along the bar. Uses the
+ *  identical writhe math (same noise function, same lateral spread,
+ *  same phase) as drawFillRibbon, so where fill ends and track begins
+ *  the two share the SAME point — no visual seam at the value
+ *  boundary, no special fan-in/fan-out treatment needed. */
+function drawTrackRibbon(
+  ctx: CanvasRenderingContext2D,
+  progress: number,
+  ribbonIdx: number,
+  time: number,
+  kick: number,
+  bar: RibbonBar,
+  bleedPx: number,
+): void {
+  const drawProgress = bar.horizontal
+    ? Math.max(progress, REMIX_VISIBLE_FLOOR)
+    : Math.max(progress, LORA_SIDE_VISIBLE_FLOOR);
+  const drawLen = drawProgress * ALONG;
+  const trackLen = ALONG - drawLen;
+  if (trackLen <= 1) return; // slider essentially maxed — no track to draw
+  const lateral = (ribbonIdx - (PALETTE.length - 1) / 2) * RIBBON_SPACING;
+  const phase = ribbonIdx * 0.8;
+  const writheAmp = NOISE_AMP_BASE + kick * NOISE_AMP_KICK;
+  const center =
+    bar.innerSign > 0 ? ACROSS - INWARD_DISTANCE : INWARD_DISTANCE;
+  const tform = barTransform(bar, bleedPx);
+  // Density: roughly proportional to track length, floored at 8 so
+  // a near-maxed slider still has enough segments for the writhe to
+  // read smoothly past the curl region.
+  const segs = Math.max(8, Math.round(SEGMENTS * (trackLen / ALONG)));
+
+  ctx.beginPath();
+  for (let i = 0; i <= segs; i++) {
+    const trackT = i / segs;
+    const along = drawLen + trackT * trackLen;
+    const noise =
+      Math.sin(along * 0.012 + time * 1.3 + phase) * 0.7 +
+      Math.sin(along * 0.025 - time * 0.9 + phase * 1.4) * 0.3;
+    const across = center + lateral + noise * writheAmp;
+    const { x, y } = viewBoxToCanvas(bar, tform, along, across);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   }
   ctx.stroke();
 }
@@ -332,10 +400,26 @@ export function tickRibbons(
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.lineWidth = lineWidthPx;
+
+    // PASS 1 — Gray track ribbons (unfilled portion of the slider).
+    // Painted FIRST so the colored fill + halo wrap render on top.
+    // Same four-ribbon writhe language as the fill, just dim; reads
+    // as "this is the rail of the slider," cohesive with the active
+    // portion.
+    ctx.globalAlpha = alpha * TRACK_ALPHA_MUL;
+    ctx.strokeStyle = TRACK_COLOR;
+    for (let i = 0; i < PALETTE.length; i++) {
+      drawTrackRibbon(ctx, fill, i, time, kick, bar, bar.bleedPx);
+    }
+
+    // PASS 2 — Colored fill ribbons (0..value), each terminating in
+    // the original half-revolution curl at the head. Solid stroke;
+    // the .install-ribbons CSS mask handles the far-end fade where
+    // the gray track terminates at the bar's outer edge.
     ctx.globalAlpha = alpha;
     for (let i = 0; i < PALETTE.length; i++) {
       ctx.strokeStyle = PALETTE[i];
-      drawRibbon(ctx, fill, i, time, kick, bar, bar.bleedPx);
+      drawFillRibbon(ctx, fill, i, time, kick, bar, bar.bleedPx);
     }
     ctx.restore();
   }

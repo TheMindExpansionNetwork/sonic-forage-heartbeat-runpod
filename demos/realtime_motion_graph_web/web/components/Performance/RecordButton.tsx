@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { useOneShotTooltip } from "@/hooks/useOneShotTooltip";
 import { isRecordingSupported } from "@/hooks/useRecording";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import {
@@ -40,13 +41,31 @@ export function RecordButton() {
     prevKind.current = state.kind;
   }, [state.kind]);
 
-  const supported = isRecordingSupported();
-  if (!supported) return null;
-  if (status === "idle" || kiosk) return null;
-
+  // Derive everything we need from state UP FRONT so the one-shot
+  // tooltip hook below stays above the early returns (Rules of Hooks
+  // — hooks must run in the same order on every render).
   const active = isActive(state);
   const busy = state.kind === "arming" || state.kind === "finalizing";
   const elapsed = state.kind === "recording" ? elapsedMs(state, now) : 0;
+  const label =
+    state.kind === "recording"
+      ? `Stop recording (${fmtTime(elapsed)})`
+      : state.kind === "paused"
+        ? "Resume recording"
+        : state.kind === "arming"
+          ? "Starting…"
+          : state.kind === "finalizing"
+            ? "Saving…"
+            : "Record (R)";
+  // One-shot tooltip — shows the first time, never again. The
+  // permanent "REC" caption beneath the disc carries the affordance
+  // once the user has seen the tooltip; repeated tooltips become
+  // noise during active performance.
+  const tipProps = useOneShotTooltip("record", label);
+
+  const supported = isRecordingSupported();
+  if (!supported) return null;
+  if (status === "idle" || kiosk) return null;
 
   const onClick = () => {
     if (busy) return;
@@ -63,17 +82,6 @@ export function RecordButton() {
     .filter(Boolean)
     .join(" ");
 
-  const label =
-    state.kind === "recording"
-      ? `Stop recording (${fmtTime(elapsed)})`
-      : state.kind === "paused"
-        ? "Resume recording"
-        : state.kind === "arming"
-          ? "Starting…"
-          : state.kind === "finalizing"
-            ? "Saving…"
-            : "Record (R)";
-
   return (
     <div className="turntable-wrap">
       {warning && (
@@ -87,7 +95,10 @@ export function RecordButton() {
       onClick={onClick}
       disabled={busy}
       aria-label={label}
-      title={label}
+      // Custom tooltip pattern — see [data-dd-tooltip] in globals.css.
+      // One-shot via useOneShotTooltip: tipProps supplies the tooltip
+      // attr only the first time.
+      {...tipProps}
     >
       {/* Disc — platter, audio-reactive grooves, label, spindle. The whole
           disc rotates while recording (CSS animation on .turntable-disc). */}
@@ -97,6 +108,10 @@ export function RecordButton() {
         <span className="turntable-label" />
         <span className="turntable-spindle" />
       </span>
+      {/* Small caption beneath the disc — tactful word label so first-time
+          visitors don't have to hover to learn what the turntable does.
+          Same mono+caps+wide-tracking treatment used everywhere else. */}
+      <span className="turntable-caption" aria-hidden="true">REC</span>
 
       {/* Tonearm — sits to the upper-right of the disc. Idle: parked,
           rotated up-right; recording: dropped onto the outer groove. The

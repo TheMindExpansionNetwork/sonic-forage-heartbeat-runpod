@@ -979,16 +979,25 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   left: 0;
   width: 100%;
   height: calc(100% + var(--ribbon-bleed));
-  -webkit-mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black 100%);
-          mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black 100%);
+  /* Symmetric fade at BOTH ends — the trailing edge (left) where the
+     ribbon writhe begins AND the far edge (right) where the gray
+     "track" ribbons terminate at the bar's outer end. Same
+     ribbon-tail-fade width on each side so the bar reads as
+     symmetric. */
+  -webkit-mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+          mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
 }
 .install-edge-left .install-ribbons {
   top: 0;
   left: 0;
   width: calc(100% + var(--ribbon-bleed));
   height: 100%;
-  -webkit-mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
-          mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+  /* Fade BOTH ends: the trailing edge (bottom, where the writhe
+     begins) and the far edge (top, where the gray "track" ribbons
+     terminate at the bar's outer end). flipAlong=true means
+     "along=ALONG" maps to canvas top. */
+  -webkit-mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+          mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
 }
 .install-edge-right .install-ribbons {
   top: 0;
@@ -998,8 +1007,10 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   left: calc(-1 * var(--ribbon-bleed));
   width: calc(100% + var(--ribbon-bleed));
   height: 100%;
-  -webkit-mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
-          mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+  /* Fade BOTH ends — same as left bar (mirrored layout, same mask
+     applies). */
+  -webkit-mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+          mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
 }
 .install-edge.install-edge-pulse .install-edge-bar { opacity: 1; }
 .install-edge.install-edge-pulse .install-edge-label {
@@ -1532,6 +1543,71 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
 }
 .install-drawer-handle--disabled .install-drawer-handle-grip {
   background: var(--frame-line);
+}
+
+/* First-run coachmark — floats above the drawer handle to teach new
+   users that more controls live behind it. pointer-events: none so a
+   click on the coachmark falls through to the handle underneath (the
+   document-level pointerdown handler in <AdvancedCoachmark> dismisses
+   the callout while the same click opens the drawer). Single keyframe
+   chain (fade-in forwards → bob loop) — no filter, no backdrop-filter,
+   per PERFORMANCE.md "no unnecessary effects on idle UI". */
+.advanced-coachmark {
+  position: fixed;
+  left: 50%;
+  /* Sit just above the closed-drawer handle peek. When the drawer opens,
+     the parent dismisses the coachmark — no need to track --drawer-h. */
+  bottom: calc(var(--drawer-handle-h, 28px) + 14px);
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 12;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 0.72em;
+  letter-spacing: var(--tracking-wide, 0.18em);
+  text-transform: uppercase;
+  color: var(--text-strong);
+  text-shadow:
+    0 0 6px rgba(0, 0, 0, 0.55),
+    0 0 14px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  animation:
+    advanced-coachmark-fade-in 320ms cubic-bezier(.2, .8, .2, 1) forwards,
+    advanced-coachmark-bob 2.4s ease-in-out infinite 320ms;
+}
+.advanced-coachmark-text { display: inline-block; }
+.advanced-coachmark kbd {
+  display: inline-block;
+  padding: 0 5px;
+  margin: 0 2px;
+  border: 1px solid var(--accent-line, rgba(255, 255, 255, 0.35));
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 0.95em;
+  color: var(--accent, currentColor);
+  background: rgba(255, 255, 255, 0.06);
+}
+.advanced-coachmark-arrow {
+  color: var(--accent, currentColor);
+  font-size: 14px;
+  line-height: 1;
+}
+@keyframes advanced-coachmark-fade-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to   { opacity: 1; transform: translate(-50%, 0);   }
+}
+@keyframes advanced-coachmark-bob {
+  0%, 100% { transform: translate(-50%, 0); }
+  50%      { transform: translate(-50%, -4px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .advanced-coachmark {
+    animation: advanced-coachmark-fade-in 320ms cubic-bezier(.2, .8, .2, 1) forwards;
+  }
 }
 
 /* Drawer body — vertical stack: operator strip across the top, then a
@@ -3214,6 +3290,37 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   box-shadow: 0 0 0 2px var(--accent), 0 6px 22px rgba(0, 0, 0, 0.6);
 }
 
+/* Tactful word label beneath the disc — names the object without
+   competing with the skeuomorphic vinyl. Sits in the existing
+   container's free space below the disc (disc ends at y=60 of a 70px
+   container) and centered on the disc's x (left:3, w:54 → center 30).
+   Uses --accent-hover on hover/recording to match the disc's own
+   color shift. */
+.turntable-caption {
+  position: absolute;
+  top: 66px; /* 6px below disc bottom — gives the label visual breathing room */
+  left: 3px;
+  width: 54px; /* same x-extent as the disc; centered text below it */
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-dim);
+  pointer-events: none;
+  transition: color 160ms;
+}
+.turntable:hover .turntable-caption {
+  color: var(--accent-hover);
+}
+/* Hide the REC label while recording — the .turntable-time elapsed
+   counter renders in the same vertical slot and the two would stack.
+   Fade for continuity with the surrounding state changes. */
+.turntable--recording .turntable-caption,
+.turntable--paused .turntable-caption {
+  opacity: 0;
+}
+
 /* Disc — the rotating element. Holds platter, grooves, label, spindle. */
 .turntable-disc {
   position: absolute;
@@ -3359,11 +3466,13 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   transform: rotate(5deg);
 }
 
-/* Live timer — coral monospace text below the disc. Doesn't rotate. */
+/* Live timer — coral monospace text below the disc. Doesn't rotate.
+   Matches the .turntable-caption "REC" position so the two occupy the
+   same visual slot with the same breathing-room from the disc. */
 .turntable-time {
   position: absolute;
   left: 0;
-  bottom: -2px;
+  bottom: -6px;
   width: 60px;
   text-align: center;
   font-family: var(--font-mono);
@@ -3594,13 +3703,46 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
    dropdown + upload icon for power users who prefer the dropdown.
    ============================================================================ */
 
-.audio-source-crate {
+/* Bottom-left dock holding the now-playing placard + always-visible
+   upload icon button. The dock owns the fixed position AND the
+   collective hover-lift; the placard and upload button merge into a
+   single visual frame (no gap, no border between them, only the
+   placard carries the brand gradient strip + radii). */
+.audio-source-dock {
   position: fixed;
   /* Float above the bottom HUD bar, mirroring the turntable's right-side
      anchor on the left. 24px gap above the bar matches the turntable. */
   bottom: max(calc(var(--hud-thickness) + 24px), env(safe-area-inset-bottom, 0px));
   left: max(calc(var(--hud-thickness) + 24px), env(safe-area-inset-left, 0px));
   z-index: 8;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 0;
+  transition: transform 140ms cubic-bezier(.2, .8, .2, 1);
+  /* Brand gradient strip + bloom drop-shadow live on the dock so they
+     span placard + upload as one continuous element — no per-child
+     gradient seam, no separate shadow halos. */
+  filter: drop-shadow(0 0 calc(1px + var(--bloom-amount, 0) * 6px) var(--accent-glow));
+}
+/* Brand gradient strip — split into two pseudo-elements (one per
+   child) so each piece pins to its own child's positioning context.
+   Since --dd-gradient is a 180deg gradient compressed into 1px, both
+   strips show the same top-stop color and visually meet seamlessly at
+   the placard/upload seam. */
+/* Hover anywhere on the pair lifts the whole widget together so the
+   placard + upload read as one unit, not two. :has() supported in
+   all modern evergreen browsers we target. */
+.audio-source-dock:has(.audio-source-crate:hover),
+.audio-source-dock:has(.audio-source-upload-btn:hover) {
+  transform: translateY(-1px);
+}
+.audio-source-dock:has(.audio-source-crate:active),
+.audio-source-dock:has(.audio-source-upload-btn:active) {
+  transform: translateY(0);
+}
+.audio-source-crate {
+  position: relative; /* positioning context for the brand gradient ::before */
   min-width: 140px;
   max-width: 260px;
   padding: 7px 12px 7px 14px;
@@ -3608,7 +3750,18 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   -webkit-backdrop-filter: blur(6px);
           backdrop-filter: blur(6px);
   border: 1px solid var(--frame-line);
-  border-radius: var(--radius-md);
+  /* The brand gradient ::before IS the top edge — no separate top
+     border, otherwise hover (which repaints border to --accent-line)
+     would stack a colored 1px line beneath the gradient strip. */
+  border-top: none;
+  /* Right edge is the shared seam with the upload button — flatten that
+     corner so the two pieces sit flush, and keep the right border so
+     the seam reads as one 1px frame-line (the upload button drops its
+     left border to avoid doubling). */
+  border-radius: var(--radius-md) 0 0 var(--radius-md);
+  /* Clip the gradient ::before strip to the rounded corners. Without
+     this the 1px-tall strip overshoots the top-left curve. */
+  overflow: hidden;
   font-family: var(--font-mono);
   display: flex;
   flex-direction: row;
@@ -3616,14 +3769,75 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   gap: 10px;
   cursor: pointer;
   text-align: left;
-  /* Bloom drop-shadow ties the placard to the perimeter ribbons so it
-     pulses subtly with the audio kick — no canvas needed. */
-  filter: drop-shadow(0 0 calc(1px + var(--bloom-amount, 0) * 6px) var(--accent-glow));
+  /* Drop-shadow lives on the .audio-source-dock parent so it traces
+     the merged outline; gradient strip lives on this ::before. */
   transition:
-    transform 140ms cubic-bezier(.2, .8, .2, 1),
+    background 160ms,
+    border-color 160ms;
+}
+.audio-source-crate::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--dd-gradient);
+  pointer-events: none;
+  /* Top-left radius only — the right edge meets the upload's strip,
+     which owns the top-right radius. */
+  border-radius: var(--radius-md) 0 0 0;
+}
+/* Always-visible upload icon button. Sits flush against the placard's
+   right edge — same height, same blur background, same bloom-coupled
+   drop-shadow, no separate gradient strip — so the pair reads as one
+   frame with an internal seam. The placard owns the brand gradient and
+   the left radii; the upload owns the right radii. */
+.audio-source-upload-btn {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  background: rgba(6, 6, 12, 0.72);
+  -webkit-backdrop-filter: blur(6px);
+          backdrop-filter: blur(6px);
+  border: 1px solid var(--frame-line);
+  border-left: none; /* the placard's right border is the seam */
+  border-top: none;  /* gradient strip ::before owns the top edge */
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  /* Clip the gradient ::before strip to the rounded top-right corner. */
+  overflow: hidden;
+  color: var(--text-dim);
+  cursor: pointer;
+  /* Drop-shadow lives on the .audio-source-dock parent so it traces
+     the merged outline; gradient strip lives on this ::before. */
+  transition:
     background 160ms,
     border-color 160ms,
-    filter 200ms;
+    color 160ms;
+}
+.audio-source-upload-btn::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--dd-gradient);
+  pointer-events: none;
+  /* Top-right radius only — the left edge meets the placard's strip. */
+  border-radius: 0 var(--radius-md) 0 0;
+}
+.audio-source-upload-btn:hover {
+  background: rgba(6, 6, 12, 0.85);
+  border-color: var(--accent-line);
+  color: var(--accent-hover);
+}
+.audio-source-upload-btn:disabled {
+  opacity: 0.5;
+  cursor: progress;
 }
 .audio-source-marquee-rows {
   display: flex;
@@ -3647,23 +3861,10 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   color: var(--accent);
   transform: rotate(180deg);
 }
-.audio-source-crate::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: var(--dd-gradient);
-  pointer-events: none;
-  border-radius: var(--radius-md) var(--radius-md) 0 0;
-}
 .audio-source-crate:hover {
-  transform: translateY(-1px);
   background: rgba(6, 6, 12, 0.85);
   border-color: var(--accent-line);
 }
-.audio-source-crate:active { transform: translateY(0); }
 .audio-source-crate--open {
   border-color: var(--accent-line);
   background: rgba(6, 6, 12, 0.88);
@@ -3700,6 +3901,11 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   background: var(--sheet-bg);
   border: 1px solid var(--frame-line);
   border-radius: var(--radius-lg);
+  /* Clip the ::before gradient strip to the rounded corners — see
+     the design-language Decision Rule on decorative strips. The fan's
+     own scrollable child handles its own overflow, and box-shadow
+     renders outside the clip box, so the outer glow stays intact. */
+  overflow: hidden;
   padding: 6px;
   display: flex;
   flex-direction: column;
@@ -3872,7 +4078,11 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
     max-width: none;
   }
   .audio-source-crate {
-    max-width: calc(100vw - 32px);
+    /* Leave room for the upload button + gap (38 + 6 + dock's own left
+       inset). The dock's inset is the same `var(--hud-thickness) + 24px`
+       used for the right margin, so cap at viewport width minus that
+       plus the button. */
+    max-width: calc(100vw - 32px - 44px);
   }
 }
 
@@ -4048,7 +4258,7 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
 
 /* ── Hide AudioSourceCrate when the mobile Lite drawer is open ──────── */
 @media (max-width: 768px) {
-  body.drawer-open .audio-source-crate,
+  body.drawer-open .audio-source-dock,
   body.drawer-open .audio-source-fan {
     display: none !important;
   }
@@ -4120,6 +4330,19 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   animation:
     network-indicator-fade-in 200ms cubic-bezier(.2, .8, .2, 1) forwards,
     start-whisper-breathe 2.6s ease-in-out infinite 200ms;
+  transition: bottom 240ms cubic-bezier(.2, .8, .2, 1);
+}
+/* Curve scheduler overlay docks its tab strip + close button against
+   the bottom of the viewport (≈48–56px tall). When that overlay is
+   open, hoist the pill above the tabs so it doesn't sit on top of the
+   curve tabs or the preset menus that grow upward from them. */
+.network-indicator[data-curves-open="true"] {
+  bottom: calc(
+    var(--drawer-handle-h, 28px) +
+    env(safe-area-inset-bottom, 0px) +
+    var(--curves-tab-strip-h, 64px) +
+    12px
+  );
 }
 .network-indicator__bars rect {
   fill: currentColor;
@@ -4133,6 +4356,93 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
     animation:
       network-indicator-fade-in 200ms cubic-bezier(.2, .8, .2, 1) forwards;
   }
+}
+
+/* ── Custom tooltip (replaces native `title=` for hover-visible UI) ──
+   Opt-in via `data-dd-tooltip="..."`. The element must have
+   `position: relative` (most of our chrome already does because of
+   per-element ::before strips) for the pseudo to anchor correctly.
+
+   Default placement: ABOVE the element. Override per-element with
+   `data-dd-tooltip-pos="below"` when the element lives at the top
+   of the viewport (LibraryButton, HaloBadge, etc.) where a tooltip
+   above would clip off-screen.
+
+   Accessibility: keep `aria-label` on the element alongside
+   `data-dd-tooltip` — screen readers read the aria-label; this
+   pseudo is decorative (aria-hidden by virtue of being a pseudo).
+
+   Design: same vocabulary as .halo-menu / .audio-source-fan —
+   sheet bg, frame-line border, top brand-gradient hairline, mono
+   caps with --tracking-wide. Single project easing. 200ms hover
+   delay so the tooltip doesn't flicker on accidental cursor passes. */
+[data-dd-tooltip]::after {
+  content: attr(data-dd-tooltip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  padding: 5px 10px 4px;
+  background: var(--sheet-bg);
+  border: 1px solid var(--frame-line);
+  border-top: 2px solid transparent;
+  background-image:
+    linear-gradient(var(--sheet-bg), var(--sheet-bg)),
+    var(--dd-gradient);
+  background-origin: padding-box, border-box;
+  background-clip: padding-box, border-box;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-strong);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 100;
+  opacity: 0;
+  visibility: hidden;
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.45),
+    0 0 14px rgba(240, 138, 72, 0.15);
+  transition:
+    opacity 140ms cubic-bezier(.2, .8, .2, 1),
+    visibility 0s linear 140ms,
+    transform 140ms cubic-bezier(.2, .8, .2, 1);
+}
+[data-dd-tooltip][data-dd-tooltip-pos="below"]::after {
+  bottom: auto;
+  top: calc(100% + 8px);
+  transform: translateX(-50%) translateY(-4px);
+}
+/* Wide variant for descriptive tooltips (param explanations etc.).
+   Allows wrapping and caps the width so long sentences don't bleed
+   across the viewport like the default nowrap labels would. */
+[data-dd-tooltip][data-dd-tooltip-wide]::after {
+  white-space: normal;
+  max-width: 280px;
+  line-height: 1.45;
+  padding: 7px 11px 6px;
+  text-transform: none;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+}
+[data-dd-tooltip]:hover::after,
+[data-dd-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+  /* 200ms delay so accidental passes don't flicker the tooltip. */
+  transition:
+    opacity 140ms cubic-bezier(.2, .8, .2, 1) 200ms,
+    visibility 0s linear 200ms,
+    transform 140ms cubic-bezier(.2, .8, .2, 1) 200ms;
+}
+/* Disable on touch — no real hover, and the active state ::after
+   would briefly flash on tap. Accessibility-equivalent info is in
+   the element's aria-label. */
+@media (pointer: coarse) {
+  [data-dd-tooltip]::after { display: none !important; }
 }
 
 /* ── Universal press state on coarse pointers ───────────────────────── */
