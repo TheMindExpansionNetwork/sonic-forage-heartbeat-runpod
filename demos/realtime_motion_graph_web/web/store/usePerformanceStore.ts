@@ -581,7 +581,12 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   setPendingTimeSignatureOverride: (s) =>
     set({ pendingTimeSignatureOverride: s }),
   setMode: (m) => set({ mode: m }),
-  toggleMode: () => set((s) => ({ mode: s.mode === "graph" ? "video" : "graph" })),
+  toggleMode: () =>
+    set((s) => {
+      const next: DisplayMode =
+        s.mode === "graph" ? "video" : s.mode === "video" ? "neon" : "graph";
+      return { mode: next };
+    }),
   setKiosk: (k) => set({ kiosk: k }),
   toggleKiosk: () => set((s) => ({ kiosk: !s.kiosk })),
   setPaused: (p) => set({ paused: p }),

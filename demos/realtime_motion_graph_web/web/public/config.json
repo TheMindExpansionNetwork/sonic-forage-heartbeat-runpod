@@ -10,7 +10,7 @@
     "steps": 8,
     "fast_vae": true,
     "_walk_window_help": "When true, route long sources through the walk_window_s (60s) DiT engine by cutting longer songs into 60 second latents and swapping at boundaries — keeps the 60s engine's faster parameter-update latency on multi-minute sources. No effect when source ≤ window_s.",
-    "walk_window": false,
+    "walk_window": true,
     "walk_window_s": 60,
     "key": "G# minor",
     "_time_signature_help": "Default meter numerator for the operator dropdown. One of 2, 3, 4, 6 (string) for 2/4, 3/4, 4/4, 6/8 respectively. Sidecar values still win on fixture hits; this is the seed for live uploads and the AlmostReadyDialog manual override.",

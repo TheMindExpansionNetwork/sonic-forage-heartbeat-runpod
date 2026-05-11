@@ -32,6 +32,7 @@ import { DesktopEdgeDrag } from "./DesktopEdgeDrag";
 import { HUDFrame } from "./HUDFrame";
 import { InstallStage } from "./InstallStage";
 import { LiveIndicator } from "./LiveIndicator";
+import { ModeToggleButton } from "./ModeToggleButton";
 import {
   MobileLoraBlendStepper,
   MobileRemixStepper,
@@ -83,11 +84,13 @@ export function PerformanceShell() {
   const effectsCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hudCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const graphCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const neonCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useRenderLoop({
     hudCanvas: hudCanvasRef,
     graphCanvas: graphCanvasRef,
     effectsCanvas: effectsCanvasRef,
+    neonCanvas: neonCanvasRef,
     videoA: videoARef,
     videoB: videoBRef,
   });
@@ -116,6 +119,7 @@ export function PerformanceShell() {
           effectsCanvas: effectsCanvasRef,
           hudCanvas: hudCanvasRef,
           graphCanvas: graphCanvasRef,
+          neonCanvas: neonCanvasRef,
         }}
       />
       <HUDFrame />
@@ -140,6 +144,7 @@ export function PerformanceShell() {
       <StatusBar />
 
       <LiveIndicator />
+      <ModeToggleButton />
 
       <NetworkIndicator />
 

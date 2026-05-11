@@ -7,6 +7,7 @@ import { EffectsRenderer } from "@/engine/render/EffectsRenderer";
 import { frameScheduler } from "@/engine/scheduler/FrameScheduler";
 import { GraphRenderer } from "@/engine/render/GraphRenderer";
 import { HUD } from "@/engine/render/HUD";
+import { NeonRenderer } from "@/engine/render/NeonRenderer";
 import { getConfig, subscribeConfig } from "@/lib/config";
 import {
   destroyHaloRibbon,
@@ -39,6 +40,7 @@ interface Refs {
   hudCanvas: RefObject<HTMLCanvasElement | null>;
   graphCanvas: RefObject<HTMLCanvasElement | null>;
   effectsCanvas: RefObject<HTMLCanvasElement | null>;
+  neonCanvas: RefObject<HTMLCanvasElement | null>;
   videoA: RefObject<HTMLVideoElement | null>;
   videoB: RefObject<HTMLVideoElement | null>;
 }
@@ -81,6 +83,12 @@ export function useRenderLoop(refs: Refs) {
     const startMark: StartMarkRibbon | null = startMarkHost
       ? initStartMarkRibbon(startMarkHost)
       : null;
+
+    // Neon visualizer: lazily constructed the first time mode flips to
+    // "neon" so it doesn't allocate a WebGL2 context (FBOs, shader
+    // programs, geometry) for users who never visit the mode.
+    let neon: NeonRenderer | null = null;
+    let neonInitFailed = false;
 
     let effects: EffectsRenderer | null = null;
     let unsubEffectsConfig: (() => void) | null = null;
@@ -260,6 +268,35 @@ export function useRenderLoop(refs: Refs) {
         effects.tick(videoEl, elapsed, kick);
       }
 
+      // Neon visualizer (mode === "neon"). Lazily instantiated. The
+      // shader interprets u_AudioFreqAvg as a [0,1] noise-amplitude drive
+      // and amplifies it aggressively (ease_in_quadratic + impulse + ×20
+      // displacement), which on raw `kick` reads as a chaotic blob.
+      //
+      // We want the title-screen-logo aesthetic: rings always writhing
+      // gently (even with no audio) and music adds a *modest* boost on
+      // top. So we floor at 0.18 and cap the kick contribution to 0.22.
+      // That yields ~0.18 displacement at silence and ~0.40 on a peak
+      // kick — sin-like writhe, not chaos.
+      if (perf.mode === "neon" && !neonInitFailed) {
+        const neonEl = refs.neonCanvas.current;
+        if (neonEl) {
+          if (!neon) {
+            try {
+              neon = new NeonRenderer(neonEl);
+            } catch (e) {
+              console.warn("[NeonRenderer] init failed:", e);
+              neonInitFailed = true;
+              neon = null;
+            }
+          }
+          if (neon) {
+            const freq = 0.18 + Math.min(1, Math.max(0, kick)) * 0.22;
+            neon.tick(now, freq, 0);
+          }
+        }
+      }
+
       // Cursor — driven from this loop instead of its own RAF (saves a
       // vsync wakeup and keeps draws in one batch per frame). Bloom is
       // the same binned kick value the ribbons receive, so the cursor's
@@ -292,11 +329,19 @@ export function useRenderLoop(refs: Refs) {
       hud.destroy();
       graph.destroy();
       effects?.destroy();
+      neon?.destroy();
       if (turntable) destroyTurntable(turntable);
       destroyRibbons(ribbons);
       if (halo) destroyHaloRibbon(halo);
     };
-  }, [refs.hudCanvas, refs.graphCanvas, refs.effectsCanvas, refs.videoA, refs.videoB]);
+  }, [
+    refs.hudCanvas,
+    refs.graphCanvas,
+    refs.effectsCanvas,
+    refs.neonCanvas,
+    refs.videoA,
+    refs.videoB,
+  ]);
 }
 
 function pickActiveVideo(

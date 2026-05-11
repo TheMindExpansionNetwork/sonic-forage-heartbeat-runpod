@@ -19,6 +19,7 @@ export interface InstallStageRefs {
   effectsCanvas: HTMLCanvasElement | null;
   hudCanvas: HTMLCanvasElement | null;
   graphCanvas: HTMLCanvasElement | null;
+  neonCanvas: HTMLCanvasElement | null;
 }
 
 interface Props {
@@ -29,6 +30,7 @@ interface Props {
     effectsCanvas: React.RefObject<HTMLCanvasElement | null>;
     hudCanvas: React.RefObject<HTMLCanvasElement | null>;
     graphCanvas: React.RefObject<HTMLCanvasElement | null>;
+    neonCanvas: React.RefObject<HTMLCanvasElement | null>;
   };
 }
 
@@ -60,6 +62,9 @@ export const InstallStage = forwardRef<HTMLDivElement, Props>(
             <canvas ref={refs.graphCanvas} id="graph" />
             <GraphPauseOverlay />
             <ScheduleCurvesOverlay />
+          </div>
+          <div id="neon-wrap">
+            <canvas ref={refs.neonCanvas} id="neon" />
           </div>
         </div>
       </div>

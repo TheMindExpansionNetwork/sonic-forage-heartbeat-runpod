@@ -611,6 +611,29 @@ body[data-mode="graph"] #install-video-area #video-wrap,
 body[data-mode="graph"] #install-video-area #effects-canvas,
 body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
 
+/* ── Neon visualizer (mode === "neon") ───────────────────────────────────
+   Vendored from wayne-wu/webgl-music-visualizer (see NeonRenderer). The
+   wrap fills the same area as #graph-wrap but is shown only when
+   data-mode === "neon"; the icosphere canvas paints into the full area.
+   In neon mode we hide the graph + video subtrees (mirroring the graph-
+   mode rules above so the three modes are mutually exclusive). */
+#install-video-area #neon-wrap {
+  position: absolute;
+  inset: calc(var(--hud-thickness) * 2 + var(--ribbon-bleed));
+  z-index: 2;
+  display: none;
+}
+#install-video-area #neon { width: 100%; height: 100%; display: block; }
+body[data-mode="neon"] #install-video-area #neon-wrap { display: block; }
+body[data-mode="neon"] #install-video-area #graph-wrap,
+body[data-mode="neon"] #install-video-area #video-wrap,
+body[data-mode="neon"] #install-video-area #effects-canvas,
+body[data-mode="neon"] #install-video-area .focal-side-blur { display: none; }
+/* Neon mode follows the same drawer-resize behavior as graph mode (the
+   stage shrinks when the drawer is open so the visualizer doesn't get
+   cropped behind it). */
+body[data-mode="neon"].drawer-open #install-stage { bottom: var(--drawer-h); }
+
 /* ── Graph click-to-pause overlay ────────────────────────────────────────
    Full-bleed transparent button on top of the graph canvas; makes the
    whole graph area a click target. The centered glyph fades in/out as a
@@ -4055,6 +4078,45 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
 }
 
 /* ── Persistent "live" dot ──────────────────────────────────────────── */
+/* ── Mode toggle button (graph → video → neon → graph) ─────────────────
+   Top-left HUD chip, mirrors .live-indicator typography. The label is
+   short (≤5 chars) so a fixed width keeps the click target stable as
+   the mode cycles. */
+.mode-toggle-btn {
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top, 0px));
+  left: max(14px, env(safe-area-inset-left, 0px));
+  z-index: 7;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 64px;
+  height: 28px;
+  padding: 0 10px;
+  margin: 0;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 60%, transparent);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.62em;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+}
+.mode-toggle-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.mode-toggle-btn:active {
+  background: rgba(0, 0, 0, 0.55);
+}
+.mode-toggle-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .live-indicator {
   position: fixed;
   top: max(12px, env(safe-area-inset-top, 0px));

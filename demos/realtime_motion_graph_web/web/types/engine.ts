@@ -86,7 +86,7 @@ export const LORA_SIDE_VISIBLE_FLOOR = 0.25;
  * of the viewport: 4% is still ~50-80px of grabbable ribbon. */
 export const REMIX_VISIBLE_FLOOR = 0.04;
 
-export type DisplayMode = "graph" | "video";
+export type DisplayMode = "graph" | "video" | "neon";
 
 /** Full keyscale set the model accepts (mirrors VALID_KEYSCALES in app.js). */
 const NOTES = ["A", "B", "C", "D", "E", "F", "G"] as const;
