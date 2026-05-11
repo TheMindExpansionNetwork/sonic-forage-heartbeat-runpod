@@ -32,6 +32,19 @@ const INWARD_DISTANCE = 8;
 // max --bloom-amount, so 16 px leaves clear headroom on both ends.
 const ALONG_END_INSET_PX = 16;
 
+// Fraction of the writhe along-axis over which the four ribbons collapse
+// onto a shared meeting point. At the meeting point a single multi-color
+// halo (drawConvergenceHalo) plays the role each ribbon's individual
+// "curl" used to — visually unifying the four into one terminator that
+// echoes the HaloBadge.
+const HEAD_CONVERGE_START = 0.85;
+const HEAD_HALO_BASE_R_PX = 9;
+const HEAD_HALO_KICK_R_PX = 4;
+const HEAD_HALO_RADIAL_SPREAD_PX = 1.1;
+const HEAD_HALO_NOISE_AMP_BASE_PX = 0.9;
+const HEAD_HALO_NOISE_AMP_KICK_PX = 1.6;
+const HEAD_HALO_SEGMENTS = 36;
+
 // Floors for ribbon length, defined in types/engine. The side floor
 // is also consumed by DesktopEdgeDrag for the hint head position so
 // the hint stays attached to the ribbon's visible end. The top floor
@@ -235,17 +248,24 @@ function drawRibbon(
   const sy = bar.horizontal ? acrossPerUnit : alongPerUnit;
 
   ctx.beginPath();
-  let prevX = 0,
-    prevY = 0,
-    lastX = 0,
-    lastY = 0;
   for (let i = 0; i <= SEGMENTS; i++) {
     const t = i / SEGMENTS;
     const along = t * drawLen;
     const noise =
       Math.sin(along * 0.012 + time * 1.3 + phase) * 0.7 +
       Math.sin(along * 0.025 - time * 0.9 + phase * 1.4) * 0.3;
-    const across = center + lateral + noise * writheAmp;
+    // Converge the four ribbons toward a shared meeting point over the
+    // last ~15% of the bar so the per-ribbon `lateral` spread closes to
+    // zero at the head. Writhe amplitude also tapers so the meeting
+    // point reads as a clean focal point (the halo, drawn separately
+    // by drawConvergenceHalo, lives there).
+    const convergeT = t < HEAD_CONVERGE_START
+      ? 0
+      : (t - HEAD_CONVERGE_START) / (1 - HEAD_CONVERGE_START);
+    const lateralFactor = 1 - convergeT;
+    const writheFactor = 1 - convergeT * 0.85;
+    const across =
+      center + lateral * lateralFactor + noise * writheAmp * writheFactor;
 
     let x: number, y: number;
     if (bar.horizontal) {
@@ -262,88 +282,91 @@ function drawRibbon(
     // both ends so strokes don't get clipped at the canvas bitmap edge.
     const px = bar.horizontal ? alongOffset + x * sx : acrossOffset + x * sx;
     const py = bar.horizontal ? y * sy : alongOffset + y * sy;
-    if (i > 0) {
-      prevX = lastX;
-      prevY = lastY;
-    }
     if (i === 0) ctx.moveTo(px, py);
     else ctx.lineTo(px, py);
-    lastX = x;
-    lastY = y;
   }
 
-  // Coiled tail at the leading edge — replaces the old half-revolution
-  // "arrowhead curl" with a near-full logarithmic spiral. Stays purely
-  // stroke-based (no filled disk) so it reads as ribbon-material that
-  // happens to be wrapping itself, not a separate UI part stuck on the
-  // end. A 315° sweep stops short of closing back on itself, and a mild
-  // inward radius taper makes the loop look like it's actually coiling
-  // around something graspable. Same audio-reactive r so the coil still
-  // breathes with the kick. altSign / innerSign alternation kept so
-  // adjacent ribbons coil opposite ways (each color gets its own thumb).
-  if (drawLen > 8) {
-    const dx = lastX - prevX;
-    const dy = lastY - prevY;
-    const segLen = Math.hypot(dx, dy) || 1;
-    const ux = dx / segLen;
-    const uy = dy / segLen;
-    const altSign = ribbonIdx % 2 === 0 ? 1 : -1;
-    const sign = altSign * (bar.innerSign > 0 ? 1 : -1);
-    const px = -uy * sign;
-    const py = ux * sign;
-    const r = 7 + kick * 3;
-    const cx = lastX + px * r;
-    const cy = lastY + py * r;
-    const curlSteps = 24;
-    const curlSweep = Math.PI * 1.75; // 315° — close-but-not-closed loop
-    for (let j = 1; j <= curlSteps; j++) {
-      const t = j / curlSteps;
-      const a = t * curlSweep;
-      const sa = Math.sin(a);
-      const ca = Math.cos(a);
-      // Logarithmic inward taper: tip orbits cx,cy at a shrinking
-      // radius so the coil tightens as it wraps. 0.18 keeps the taper
-      // gentle enough that the loop's "almost-a-ring" silhouette
-      // survives at the smallest kick values.
-      const rEff = r * (1 - 0.18 * t);
-      const rx = -px * ca + ux * sa;
-      const ry = -py * ca + uy * sa;
-      // The coil tip lives in viewBox space as (cx + rx*rEff, cy + ry*rEff).
-      // For a horizontal bar this is (along, across); for vertical bars it's
-      // (across, along). Match the same axis-aware offset as above.
-      const tipAlong = bar.horizontal ? cx + rx * rEff : cy + ry * rEff;
-      const tipAcross = bar.horizontal ? cy + ry * rEff : cx + rx * rEff;
-      const tipX = bar.horizontal
-        ? alongOffset + tipAlong * sx
-        : acrossOffset + tipAcross * sx;
-      const tipY = bar.horizontal
-        ? tipAcross * sy
-        : alongOffset + tipAlong * sy;
-      ctx.lineTo(tipX, tipY);
-    }
-    ctx.stroke();
+  // No per-ribbon terminator here anymore — the four ribbons collapse
+  // toward a shared meeting point via the HEAD_CONVERGE_START taper in
+  // the loop above, and drawConvergenceHalo (called once per bar after
+  // all four palette passes) paints a single multi-color halo at that
+  // meeting point — same visual language as the HaloBadge, scaled down.
+  ctx.stroke();
+}
 
-    // Kick-gated shimmer dot at the coil's geometric center. Implies
-    // mass / something graspable inside the loop, but only on strong
-    // hits so the resting state stays pure-ribbon. Cheap: one extra
-    // fill() per ribbon per high-kick frame; uses the same palette
-    // color the stroke already used.
-    if (kick > 0.55) {
-      const dotAlong = bar.horizontal ? cx : cy;
-      const dotAcross = bar.horizontal ? cy : cx;
-      const dotPxX = bar.horizontal
-        ? alongOffset + dotAlong * sx
-        : acrossOffset + dotAcross * sx;
-      const dotPxY = bar.horizontal
-        ? dotAcross * sy
-        : alongOffset + dotAlong * sy;
-      const dotR = r * 0.28 * Math.min(sx, sy);
-      ctx.beginPath();
-      ctx.arc(dotPxX, dotPxY, dotR, 0, Math.PI * 2);
-      ctx.fillStyle = ctx.strokeStyle as string;
-      ctx.fill();
+/** Where the four ribbons converge, in viewBox (ALONG/ACROSS) units. */
+function convergencePoint(bar: RibbonBar, progress: number): { along: number; across: number } {
+  const drawProgress = bar.horizontal
+    ? Math.max(progress, REMIX_VISIBLE_FLOOR)
+    : Math.max(progress, LORA_SIDE_VISIBLE_FLOOR);
+  const drawLen = drawProgress * ALONG;
+  const center =
+    bar.innerSign > 0 ? ACROSS - INWARD_DISTANCE : INWARD_DISTANCE;
+  return { along: drawLen, across: center };
+}
+
+/** Single shared halo at the bar's leading edge — polar writhe in the
+ *  same trig-noise language as HaloBadge, scaled to a small terminator
+ *  ring that visually swallows the four ribbon ends. Drawn ONCE per
+ *  bar after all four ribbons have been stroked. Radius/spread are in
+ *  canvas CSS pixels (not viewBox units) so the ring stays circular
+ *  regardless of the host's aspect ratio. */
+function drawConvergenceHalo(
+  ctx: CanvasRenderingContext2D,
+  progress: number,
+  time: number,
+  kick: number,
+  bar: RibbonBar,
+  bleedPx: number,
+): void {
+  const drawProgress = bar.horizontal
+    ? Math.max(progress, REMIX_VISIBLE_FLOOR)
+    : Math.max(progress, LORA_SIDE_VISIBLE_FLOOR);
+  if (drawProgress < 0.01) return;
+
+  const { along, across } = convergencePoint(bar, progress);
+
+  const alongSize = bar.horizontal ? bar.w : bar.h;
+  const acrossSize = bar.horizontal ? bar.h : bar.w;
+  const hostAcross = Math.max(1, acrossSize - bleedPx);
+  const acrossPerUnit = hostAcross / ACROSS;
+  const alongPerUnit = Math.max(1, alongSize - 2 * ALONG_END_INSET_PX) / ALONG;
+  const acrossOffset = bar.bleedSide === "left" ? bleedPx : 0;
+  const alongOffset = ALONG_END_INSET_PX;
+  const sx = bar.horizontal ? alongPerUnit : acrossPerUnit;
+  const sy = bar.horizontal ? acrossPerUnit : alongPerUnit;
+
+  // Map the convergence point from viewBox space to canvas CSS pixels
+  // using the same transform the writhe loop uses, so the halo lands
+  // exactly where the four ribbon ends do.
+  const cxPx = bar.horizontal
+    ? alongOffset + along * sx
+    : acrossOffset + across * sx;
+  const cyPx = bar.horizontal
+    ? across * sy
+    : alongOffset + along * sy;
+
+  const baseR = HEAD_HALO_BASE_R_PX + kick * HEAD_HALO_KICK_R_PX;
+  const writheAmp = HEAD_HALO_NOISE_AMP_BASE_PX + kick * HEAD_HALO_NOISE_AMP_KICK_PX;
+  const segs = HEAD_HALO_SEGMENTS;
+  for (let i = 0; i < PALETTE.length; i++) {
+    ctx.strokeStyle = PALETTE[i];
+    const phase = i * 0.7;
+    const radialOffset = (i - (PALETTE.length - 1) / 2) * HEAD_HALO_RADIAL_SPREAD_PX;
+    const t = time * 1.3;
+    ctx.beginPath();
+    for (let j = 0; j <= segs; j++) {
+      const theta = (j / segs) * Math.PI * 2;
+      const noise =
+        Math.sin(theta * 3 + t + phase) * 0.7 +
+        Math.sin(theta * 7 - t * 0.7 + phase * 1.4) * 0.3;
+      const r = baseR + radialOffset + noise * writheAmp;
+      const x = cxPx + r * Math.cos(theta);
+      const y = cyPx + r * Math.sin(theta);
+      if (j === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
-  } else {
+    ctx.closePath();
     ctx.stroke();
   }
 }
@@ -375,6 +398,10 @@ export function tickRibbons(
       ctx.strokeStyle = PALETTE[i];
       drawRibbon(ctx, fill, i, time, kick, bar, bar.bleedPx);
     }
+    // After all four palette passes: one shared multi-color halo at
+    // the convergence point, painted in the same pass so it inherits
+    // the same lineWidth / lineCap / globalAlpha context.
+    drawConvergenceHalo(ctx, fill, time, kick, bar, bar.bleedPx);
     ctx.restore();
   }
 }
