@@ -214,20 +214,22 @@ export function useStartSession() {
       useLoraStore.getState().setCatalog(remote.loraCatalog);
     }
 
-    // "Hear the source first" gate: every fresh session starts with the
-    // engine value at 0 so the user hears the unmodified track from
-    // frame 1. The top-edge ribbon then plays a *visual-only* glide
-    // from its prior position down to 0 — purely a hint that the
-    // ribbon is a slider; the engine value never moves with it. The
-    // "drag to start" affordance prompts them to dial it back up; the
-    // first value-changing drag flips remixStarted true. controls.denoise
-    // in config.json seeds the initial fresh-load value, but only
-    // applyConfig() at module load sees it; later sessions in the same
-    // page load need this explicit reset to restore the gate.
+    // "Hear the source first" gate: when enabled in config.json, every
+    // session start snaps engine denoise to 0 and plays a visual-only
+    // glide from the slider's prior value down to 0 over glide_ms. The
+    // engine value never moves with the glide; it's a hint that the top
+    // ribbon is a slider, and the "drag to start" affordance prompts the
+    // user to dial it back up. controls.denoise in config.json seeds the
+    // initial fresh-load value (only applyConfig() at module load sees
+    // it); later sessions need this explicit reset to restore the gate.
+    // remixStarted always resets so the affordance shows again.
     const perfState = usePerformanceStore.getState();
-    const prevDenoise = perfState.sliderTargets["denoise"] ?? 0;
-    perfState.setSliderDirect("denoise", 0);
-    perfState.animateSliderDisplayFrom("denoise", prevDenoise, 700);
+    const gate = getConfig().denoise_session_gate;
+    if (gate.enabled) {
+      const prevDenoise = perfState.sliderTargets["denoise"] ?? 0;
+      perfState.setSliderDirect("denoise", 0);
+      perfState.animateSliderDisplayFrom("denoise", prevDenoise, gate.glide_ms);
+    }
     perfState.setRemixStarted(false);
 
     setSession(remote, player);

@@ -130,6 +130,19 @@ export interface RtmgChannelRange {
 }
 export type RtmgConfigChannelRanges = Record<string, RtmgChannelRange>;
 
+/** On session start, snap engine denoise to 0 and play a visual-only
+ * display glide from the slider's prior value down to 0 over `glide_ms`.
+ * The engine value never moves with the glide; purely a "hear the source
+ * first" onboarding cue. Set `enabled: false` to skip the snap entirely;
+ * seed `controls.denoise` to whatever starting value you want in that
+ * case. The glide is only visible when the slider's value at session-start
+ * is non-zero (first session uses controls.denoise; later sessions use
+ * wherever the user left it). */
+export interface RtmgConfigDenoiseSessionGate {
+  enabled: boolean;
+  glide_ms: number;
+}
+
 export interface RtmgConfig {
   engine: RtmgConfigEngine;
   prompts: RtmgConfigPrompts;
@@ -139,6 +152,7 @@ export interface RtmgConfig {
   effects: RtmgConfigEffects;
   audio: RtmgConfigAudio;
   reset_seconds: number;
+  denoise_session_gate: RtmgConfigDenoiseSessionGate;
 }
 
 export const DEFAULT_CONFIG: RtmgConfig = {
@@ -221,6 +235,10 @@ export const DEFAULT_CONFIG: RtmgConfig = {
     lufs_silence_floor_hysteresis_db: 6.0,
   },
   reset_seconds: 0,
+  denoise_session_gate: {
+    enabled: true,
+    glide_ms: 700,
+  },
 };
 
 let _activeConfig: RtmgConfig = DEFAULT_CONFIG;
@@ -275,6 +293,10 @@ function mergeConfig(
       typeof override.reset_seconds === "number"
         ? override.reset_seconds
         : base.reset_seconds,
+    denoise_session_gate: {
+      ...base.denoise_session_gate,
+      ...(override.denoise_session_gate ?? {}),
+    },
   };
 }
 

@@ -26,7 +26,7 @@
   },
 
   "controls": {
-    "denoise": 0,
+    "denoise": 0.7,
     "_lora_default_strength_help": "Initial value applied to any LoRA strength slider whose server-reported strength is 0 (current Python backend behavior). Auto-enabled LoRAs land here on first paint.",
     "lora_default_strength": 0.7,
     "hint_strength": 1.4,
@@ -98,5 +98,11 @@
   },
 
   "_reset_seconds_help": "Idle timeout. After this many seconds of no interaction (pointer, key, or MIDI), every control reverts to the defaults above. Set to 0 to disable.",
-  "reset_seconds": 0
+  "reset_seconds": 0,
+
+  "_denoise_session_gate_help": "On every session start (clicking Play), snap the engine's denoise value to 0 and play a visual-only display glide from the slider's prior value down to 0 over glide_ms. The engine value never moves with the glide; it's a 'hear the source first' onboarding cue, and the slide doubles as a hint that the top ribbon is a slider. The slide is only visible when denoise is non-zero at session start (first session uses controls.denoise above; later sessions use wherever the operator left it). Set enabled to false to skip the snap and glide entirely. With the gate off, controls.denoise seeds first paint and the slider keeps the operator's last value across sessions.",
+  "denoise_session_gate": {
+    "enabled": true,
+    "glide_ms": 700
+  }
 }
