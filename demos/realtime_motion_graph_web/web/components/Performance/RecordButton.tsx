@@ -87,7 +87,10 @@ export function RecordButton() {
       onClick={onClick}
       disabled={busy}
       aria-label={label}
-      title={label}
+      // Custom tooltip pattern — see [data-dd-tooltip] in globals.css.
+      // Default position is ABOVE, which is what the turntable wants
+      // (bottom-right of viewport).
+      data-dd-tooltip={label}
     >
       {/* Disc — platter, audio-reactive grooves, label, spindle. The whole
           disc rotates while recording (CSS animation on .turntable-disc). */}

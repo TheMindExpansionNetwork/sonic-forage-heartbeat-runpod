@@ -4358,6 +4358,81 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   }
 }
 
+/* ── Custom tooltip (replaces native `title=` for hover-visible UI) ──
+   Opt-in via `data-dd-tooltip="..."`. The element must have
+   `position: relative` (most of our chrome already does because of
+   per-element ::before strips) for the pseudo to anchor correctly.
+
+   Default placement: ABOVE the element. Override per-element with
+   `data-dd-tooltip-pos="below"` when the element lives at the top
+   of the viewport (LibraryButton, HaloBadge, etc.) where a tooltip
+   above would clip off-screen.
+
+   Accessibility: keep `aria-label` on the element alongside
+   `data-dd-tooltip` — screen readers read the aria-label; this
+   pseudo is decorative (aria-hidden by virtue of being a pseudo).
+
+   Design: same vocabulary as .halo-menu / .audio-source-fan —
+   sheet bg, frame-line border, top brand-gradient hairline, mono
+   caps with --tracking-wide. Single project easing. 200ms hover
+   delay so the tooltip doesn't flicker on accidental cursor passes. */
+[data-dd-tooltip]::after {
+  content: attr(data-dd-tooltip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  padding: 5px 10px 4px;
+  background: var(--sheet-bg);
+  border: 1px solid var(--frame-line);
+  border-top: 2px solid transparent;
+  background-image:
+    linear-gradient(var(--sheet-bg), var(--sheet-bg)),
+    var(--dd-gradient);
+  background-origin: padding-box, border-box;
+  background-clip: padding-box, border-box;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-strong);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 100;
+  opacity: 0;
+  visibility: hidden;
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.45),
+    0 0 14px rgba(240, 138, 72, 0.15);
+  transition:
+    opacity 140ms cubic-bezier(.2, .8, .2, 1),
+    visibility 0s linear 140ms,
+    transform 140ms cubic-bezier(.2, .8, .2, 1);
+}
+[data-dd-tooltip][data-dd-tooltip-pos="below"]::after {
+  bottom: auto;
+  top: calc(100% + 8px);
+  transform: translateX(-50%) translateY(-4px);
+}
+[data-dd-tooltip]:hover::after,
+[data-dd-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+  /* 200ms delay so accidental passes don't flicker the tooltip. */
+  transition:
+    opacity 140ms cubic-bezier(.2, .8, .2, 1) 200ms,
+    visibility 0s linear 200ms,
+    transform 140ms cubic-bezier(.2, .8, .2, 1) 200ms;
+}
+/* Disable on touch — no real hover, and the active state ::after
+   would briefly flash on tap. Accessibility-equivalent info is in
+   the element's aria-label. */
+@media (pointer: coarse) {
+  [data-dd-tooltip]::after { display: none !important; }
+}
+
 /* ── Universal press state on coarse pointers ───────────────────────── */
 @media (pointer: coarse) {
   button:not(:disabled):active {
