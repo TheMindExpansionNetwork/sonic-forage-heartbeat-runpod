@@ -979,16 +979,25 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   left: 0;
   width: 100%;
   height: calc(100% + var(--ribbon-bleed));
-  -webkit-mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black 100%);
-          mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black 100%);
+  /* Symmetric fade at BOTH ends — the trailing edge (left) where the
+     ribbon writhe begins AND the far edge (right) where the gray
+     "track" ribbons terminate at the bar's outer end. Same
+     ribbon-tail-fade width on each side so the bar reads as
+     symmetric. */
+  -webkit-mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+          mask-image: linear-gradient(to right, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
 }
 .install-edge-left .install-ribbons {
   top: 0;
   left: 0;
   width: calc(100% + var(--ribbon-bleed));
   height: 100%;
-  -webkit-mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
-          mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+  /* Fade BOTH ends: the trailing edge (bottom, where the writhe
+     begins) and the far edge (top, where the gray "track" ribbons
+     terminate at the bar's outer end). flipAlong=true means
+     "along=ALONG" maps to canvas top. */
+  -webkit-mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+          mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
 }
 .install-edge-right .install-ribbons {
   top: 0;
@@ -998,8 +1007,10 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   left: calc(-1 * var(--ribbon-bleed));
   width: calc(100% + var(--ribbon-bleed));
   height: 100%;
-  -webkit-mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
-          mask-image: linear-gradient(to bottom, black 0, black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+  /* Fade BOTH ends — same as left bar (mirrored layout, same mask
+     applies). */
+  -webkit-mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
+          mask-image: linear-gradient(to bottom, transparent var(--ribbon-along-inset), black calc(var(--ribbon-along-inset) + var(--ribbon-tail-fade)), black calc(100% - var(--ribbon-along-inset) - var(--ribbon-tail-fade)), transparent calc(100% - var(--ribbon-along-inset)));
 }
 .install-edge.install-edge-pulse .install-edge-bar { opacity: 1; }
 .install-edge.install-edge-pulse .install-edge-label {
@@ -3706,6 +3717,10 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   -webkit-backdrop-filter: blur(6px);
           backdrop-filter: blur(6px);
   border: 1px solid var(--frame-line);
+  /* The brand gradient ::before IS the top edge — no separate top
+     border, otherwise hover (which repaints border to --accent-line)
+     would stack a colored 1px line beneath the gradient strip. */
+  border-top: none;
   /* Right edge is the shared seam with the upload button — flatten that
      corner so the two pieces sit flush, and keep the right border so
      the seam reads as one 1px frame-line (the upload button drops its
@@ -3754,6 +3769,7 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
           backdrop-filter: blur(6px);
   border: 1px solid var(--frame-line);
   border-left: none; /* the placard's right border is the seam */
+  border-top: none;  /* gradient strip ::before owns the top edge */
   border-radius: 0 var(--radius-md) var(--radius-md) 0;
   color: var(--text-dim);
   cursor: pointer;

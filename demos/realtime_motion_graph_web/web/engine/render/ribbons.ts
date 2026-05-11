@@ -17,15 +17,6 @@ const PALETTE = [
   "#f08a48", // orange
   "#e84f3d", // coral
 ];
-// rgb triplets parsed once at module load — used to build per-frame
-// linear-gradient strokeStyles that fade each ribbon's leading end to
-// alpha 0. Kept in sync with PALETTE by index.
-const PALETTE_RGB: ReadonlyArray<readonly [number, number, number]> = [
-  [0x3d, 0xb6, 0xbe],
-  [0xc7, 0xb5, 0x66],
-  [0xf0, 0x8a, 0x48],
-  [0xe8, 0x4f, 0x3d],
-];
 
 const ALONG = 1000;
 const ACROSS = 100;
@@ -47,16 +38,6 @@ const ALONG_END_INSET_PX = 16;
 const HEAD_CURL_STEPS = 8;
 const HEAD_CURL_BASE_R = 7;
 const HEAD_CURL_KICK_R = 3;
-
-// Leading-end fade — mirrors the trailing-end's CSS mask fade but
-// tracks the value position. Implemented via a createLinearGradient()
-// strokeStyle so it's a single stroke per ribbon (no sub-stroke alpha
-// juggling). Fade region: from FADE_START_T × drawLen (still full
-// color) → drawLen + FADE_END_EXTRA_PX (transparent), which makes
-// the visible ribbon look ~10% shorter than its drawLen + the curl
-// dissolves cleanly past the fade.
-const LEAD_FADE_START_T = 0.82;
-const LEAD_FADE_END_EXTRA_PX = 18;
 
 // Gray "track" ribbons drawn drawLen..ALONG behind the colored fill so
 // the slider reads as a traditional fill-up-to-value control — but the
@@ -246,10 +227,10 @@ function viewBoxToCanvas(
 }
 
 /** Colored "fill" ribbon — 0..drawLen along the bar, terminating in
- *  the original half-revolution curl. Stroked with a per-frame linear
- *  gradient strokeStyle so the leading end fades to alpha 0 — mirrors
- *  the trailing-end CSS mask fade but tracks the value position.
- *  Single beginPath / stroke per ribbon. */
+ *  the original half-revolution curl. Uses the strokeStyle set by the
+ *  caller (one of the PALETTE colors). The leading edge is SOLID; the
+ *  far end of the bar fades via the .install-ribbons CSS mask in
+ *  globals.css. Single beginPath / stroke per ribbon. */
 function drawFillRibbon(
   ctx: CanvasRenderingContext2D,
   progress: number,
@@ -273,30 +254,6 @@ function drawFillRibbon(
   const center =
     bar.innerSign > 0 ? ACROSS - INWARD_DISTANCE : INWARD_DISTANCE;
   const tform = barTransform(bar, bleedPx);
-
-  // ── Leading-end fade gradient ─────────────────────────────────────
-  // Build a linear gradient along the bar's along axis. Points where
-  // the path falls BEFORE the gradient's start get the first stop
-  // (full color); points AFTER the end get the last stop (transparent).
-  // So the writhe is full color from along=0 to ~82% of drawLen, then
-  // fades to 0 over the next ~18% + the curl extent.
-  const [cr, cg, cb] = PALETTE_RGB[ribbonIdx];
-  let g0x = 0, g0y = 0, g1x = 0, g1y = 0;
-  if (bar.horizontal) {
-    g0x = tform.alongOffset + drawLen * LEAD_FADE_START_T * tform.sx;
-    g1x = tform.alongOffset + drawLen * tform.sx + LEAD_FADE_END_EXTRA_PX;
-  } else if (bar.flipAlong) {
-    // Vertical bar, value end at TOP of canvas (small y).
-    g0y = tform.alongOffset + (ALONG - drawLen * LEAD_FADE_START_T) * tform.sy;
-    g1y = tform.alongOffset + (ALONG - drawLen) * tform.sy - LEAD_FADE_END_EXTRA_PX;
-  } else {
-    g0y = tform.alongOffset + drawLen * LEAD_FADE_START_T * tform.sy;
-    g1y = tform.alongOffset + drawLen * tform.sy + LEAD_FADE_END_EXTRA_PX;
-  }
-  const grad = ctx.createLinearGradient(g0x, g0y, g1x, g1y);
-  grad.addColorStop(0, `rgba(${cr},${cg},${cb},1)`);
-  grad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
-  ctx.strokeStyle = grad;
 
   // ── Writhe (full lateral spread, no convergence — pre-2026-05 look) ──
   ctx.beginPath();
@@ -456,11 +413,12 @@ export function tickRibbons(
     }
 
     // PASS 2 — Colored fill ribbons (0..value), each terminating in
-    // the original half-revolution curl. Per-ribbon gradient
-    // strokeStyle (set inside drawFillRibbon) fades the leading end
-    // so the curl dissolves rather than ending abruptly.
+    // the original half-revolution curl at the head. Solid stroke;
+    // the .install-ribbons CSS mask handles the far-end fade where
+    // the gray track terminates at the bar's outer edge.
     ctx.globalAlpha = alpha;
     for (let i = 0; i < PALETTE.length; i++) {
+      ctx.strokeStyle = PALETTE[i];
       drawFillRibbon(ctx, fill, i, time, kick, bar, bar.bleedPx);
     }
     ctx.restore();
