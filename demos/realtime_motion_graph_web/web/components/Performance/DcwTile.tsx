@@ -43,11 +43,10 @@ export function DcwTile() {
           >
             DCW: {dcwEnabled ? "ON" : "OFF"}
           </button>
-          <label className="dcw-row">
+          <label className="dcw-row" data-dd-tooltip="Cycle DCW mode (Shift + T)">
             <span className="dcw-row-label">DCW mode</span>
             <select
               className="dcw-select"
-              title="Cycle DCW mode (Shift + T)"
               value={dcwMode}
               onChange={(e) =>
                 setMode(e.target.value as (typeof DCW_MODES)[number])
@@ -60,11 +59,10 @@ export function DcwTile() {
               ))}
             </select>
           </label>
-          <label className="dcw-row">
+          <label className="dcw-row" data-dd-tooltip="Cycle wavelet (Shift + W)">
             <span className="dcw-row-label">wavelet</span>
             <select
               className="dcw-select"
-              title="Cycle wavelet (Shift + W)"
               value={dcwWavelet}
               onChange={(e) =>
                 setWavelet(e.target.value as (typeof DCW_WAVELETS)[number])

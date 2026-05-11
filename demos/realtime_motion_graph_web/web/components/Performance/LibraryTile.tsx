@@ -114,7 +114,7 @@ function LoraRow({ id, name }: RowProps) {
         role="switch"
         aria-checked={enabled}
         onClick={toggle}
-        title={enabled ? "Disable" : "Enable"}
+        data-dd-tooltip={enabled ? "Disable" : "Enable"}
       >
         <span className="lora-switch-thumb" aria-hidden="true" />
       </button>

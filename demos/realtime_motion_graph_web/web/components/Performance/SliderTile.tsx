@@ -52,9 +52,9 @@ const PARAM_TOOLTIPS: Record<string, string> = {
 
   // ── DCW ──
   dcw_scaler:
-    "Boost or attenuate the model's low end (bass, body). Push positive if the output feels thin; pull negative if the bass is overpowering. The range is small on purpose — these are fine adjustments.",
+    "Experimental — adjusts the low-band strength of an internal correction the model applies to itself during generation (DCW). This scaler is active in the early part of the run. The exact audio mapping is still being explored — sweep it to discover what it does for your source. Extreme values can be unpredictable but cool.",
   dcw_high_scaler:
-    "Boost or attenuate the model's high end (transients, brightness, air). Push up for crispness and snap; pull down to round off harsh tops.",
+    "Experimental — adjusts the high-band strength of an internal correction the model applies to itself during generation (DCW). This scaler is active in the later part of the run. The exact audio mapping is still being explored — sweep it to discover what it does for your source. Extreme values can be unpredictable but cool.",
 };
 
 // Per-channel tooltips. The 64-channel latent space hasn't been fully
@@ -66,12 +66,12 @@ const CHANNEL_GAINS = ["ch_g0", "ch_g1", "ch_g2", "ch_g3", "ch_g4", "ch_g5", "ch
 const NAMED_CHANNELS = ["ch13", "ch14", "ch19", "ch23", "ch29", "ch56"] as const;
 for (const [i, p] of CHANNEL_GAINS.entries()) {
   PARAM_TOOLTIPS[p] =
-    `Experimental — adjusts the strength of one of the model's internal audio channels (channel ${i}). Each channel encodes a different aspect of the sound (frequency band, dynamics, transients); the exact mapping is still being explored. Sweep it to discover what it does for your source.`;
+    `Experimental — adjusts the strength of one of the model's internal latent channels (channel ${i}). Each channel encodes a different aspect of the sound (frequency band, dynamics, transients); the exact mapping is still being explored. Sweep it to discover what it does for your source.`;
 }
 for (const p of NAMED_CHANNELS) {
   const idx = p.slice(2);
   PARAM_TOOLTIPS[p] =
-    `Experimental — a hand-picked internal audio channel (#${idx}) that produces a noticeable perceptual change. Sweep it to hear what this specific channel controls for your source.`;
+    `Experimental — a hand-picked internal latent channel (#${idx}) that produces a noticeable perceptual change. Sweep it to hear what this specific channel controls for your source.`;
 }
 
 export function tooltipFor(param: string): string | undefined {

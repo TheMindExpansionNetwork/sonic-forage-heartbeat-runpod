@@ -25,7 +25,12 @@ export function PromptsTile() {
       <div className="mixer-tile-label">Prompts</div>
       <div id="prompt-section">
         <div className="prompt-slot">
-          <label className="prompt-label" htmlFor="prompt-a">
+          <label
+            className="prompt-label"
+            htmlFor="prompt-a"
+            data-dd-tooltip="Primary prompt — text the model conditions on. With the blend at 0, this is the only prompt driving the output."
+            data-dd-tooltip-wide=""
+          >
             Prompt A
           </label>
           <textarea
@@ -36,7 +41,11 @@ export function PromptsTile() {
             onChange={(e) => setPromptA(e.target.value)}
           />
         </div>
-        <div id="blend-control">
+        <div
+          id="blend-control"
+          data-dd-tooltip="Crossfade between Prompt A and Prompt B. 0 = pure A, 1 = pure B. Hold B and use ▲▼ on desktop to nudge."
+          data-dd-tooltip-wide=""
+        >
           <span className="blend-label">A</span>
           <input
             type="range"
@@ -54,7 +63,12 @@ export function PromptsTile() {
           <kbd className="desktop-only blend-kbd">B + ▲▼</kbd>
         </div>
         <div className="prompt-slot">
-          <label className="prompt-label" htmlFor="prompt-b">
+          <label
+            className="prompt-label"
+            htmlFor="prompt-b"
+            data-dd-tooltip="Secondary prompt — interpolates with A based on the blend slider. With the blend at 1, only B drives the output."
+            data-dd-tooltip-wide=""
+          >
             Prompt B
           </label>
           <textarea

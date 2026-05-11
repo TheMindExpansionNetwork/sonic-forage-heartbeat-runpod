@@ -585,7 +585,7 @@ export function ScheduleCurvesOverlay() {
               }
               onClick={() => setActiveCurve(param)}
               onContextMenu={(e) => onTabContext(e, param)}
-              title={`${SCHEDULEABLE_PARAM_LABEL[param]} — ${
+              data-dd-tooltip={`${SCHEDULEABLE_PARAM_LABEL[param]} — ${
                 isEnabled ? "active" : "drawn but not driving"
               } (right-click for presets)`}
             >
@@ -613,7 +613,7 @@ export function ScheduleCurvesOverlay() {
                 ensureCurve(tab.param);
                 onTabContext(e, tab.param);
               }}
-              title={`LoRA ${tab.label} — ${
+              data-dd-tooltip={`LoRA ${tab.label} — ${
                 isEnabled ? "active" : "drawn but not driving"
               } (right-click for presets)`}
             >
