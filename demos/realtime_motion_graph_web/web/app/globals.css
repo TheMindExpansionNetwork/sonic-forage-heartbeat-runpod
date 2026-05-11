@@ -205,6 +205,33 @@ body.cursor-idle .cursor-canvas { opacity: 0; }
   justify-content: center;
   background: var(--overlay-bg);
   z-index: 20;
+  /* Kept in sync with MORPH_DURATION_MS (2400ms) in StartOverlay.tsx.
+     A touch shorter so the graph is fully visible while the lines are
+     finishing their landing into it. */
+  transition: background 2000ms ease-out, opacity 2000ms ease-out;
+}
+/* During the launch morph the temporary morph canvas (in startMorph.ts)
+   takes over the ribbon visual and animates it down onto the graph.
+   Fade the overlay backdrop so the graph beneath becomes visible by
+   the time the morph lands — without this the morph's final flat lines
+   would sit on top of an opaque dark backdrop, hiding the live graph
+   underneath. */
+body.launching-morph #start-overlay {
+  background: transparent;
+}
+/* useStartSession flips status out of idle synchronously on click, which
+   would normally apply .hidden (display:none !important) to the overlay
+   instantly — snapping the dark backdrop away and ruining the fade. While
+   the morph is running we override .hidden's display:none with a fade-out
+   opacity transition, so the overlay stays mounted and gracefully
+   dissolves over the same beat the lines straighten onto the graph. The
+   plain .hidden rule resumes ownership once .launching-morph comes off
+   (at morph end), which is purely cosmetic at that point since the
+   overlay is already at opacity 0. */
+body.launching-morph #start-overlay.hidden {
+  display: flex !important;
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* The brand mark IS the play button. No separate CTA on the title screen —
@@ -325,8 +352,14 @@ body.cursor-idle .cursor-canvas { opacity: 0; }
   animation: start-cta-launch 700ms cubic-bezier(.4, 0, .65, .25) forwards;
   pointer-events: none;
 }
+/* SVG ribbons hand off to the morph canvas (engine/render/startMorph.ts)
+   on click — the morph's first frame is pixel-identical to the SVG's
+   current state, so hiding the SVG here makes the swap invisible while
+   the morph canvas animates the unwrap into the graph polylines. The
+   old explode-and-spin keyframe stays on file (see start-ribbons-explode
+   below) but is no longer wired up. */
 .start-cta.start-cta--launching .start-mark-ribbons {
-  animation: start-ribbons-explode 700ms cubic-bezier(.4, 0, .65, .25) forwards;
+  visibility: hidden;
 }
 .start-cta.start-cta--launching .start-mark {
   animation: start-mark-zoom 700ms cubic-bezier(.4, 0, .65, .25) forwards;
@@ -607,6 +640,16 @@ body:not([data-mode="graph"]) #install-video-area #graph-wrap { display: none; }
    the graph + playhead would draw through the start overlay. Hide the
    whole subtree so the canvas isn't painting under a black screen. */
 body[data-session="idle"] #install-video-area #graph-wrap { display: none; }
+/* Launch-morph escape hatch: the title-screen → graph morph needs the
+   graph element measurable (getBoundingClientRect) AND visible (the
+   prefilled flat polylines underneath the morph canvas have to render
+   so the hand-off at t=1 doesn't flash). Higher specificity than the
+   data-session="idle" rule above so it wins while both classes are
+   present; once session leaves idle the rule above no longer matches
+   and the graph stays visible regardless. */
+body.launching-morph[data-session="idle"] #install-video-area #graph-wrap {
+  display: block;
+}
 body[data-mode="graph"] #install-video-area #video-wrap,
 body[data-mode="graph"] #install-video-area #effects-canvas,
 body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }

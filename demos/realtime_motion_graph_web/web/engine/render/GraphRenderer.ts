@@ -23,6 +23,10 @@ const GRAPH_COLORS: Record<string, RGB> = {
   feedback: [240, 138, 72],
   shift: [232, 79, 61],
   hint_strength: [199, 181, 102],
+  // Same orange as `feedback` and as ribbon idx 2 — picked so the
+  // start-screen morph's hand-off to the live graph is color-continuous
+  // (ribbon 2 = timbre = orange end-to-end).
+  timbre_strength: [240, 138, 72],
   noise_share: [61, 182, 190],
   ode_noise: [199, 181, 102],
   seed: [240, 138, 72],
@@ -86,6 +90,14 @@ const PLAYHEAD_INSET_PX_FRAC = 1 / 6;
 // Sized for the max stroke width (5 px) + shadow blur (~3 px) + a little
 // air.
 const Y_PAD = 12;
+// Re-exported under `GRAPH_*` names so the title-screen morph (which has
+// to land its end-state polyline at the exact pixel position GraphRenderer
+// draws on its first post-morph frame) can read these without
+// duplicating the constants. Keep the originals module-private so
+// internal code doesn't pay a name-import cost.
+export const GRAPH_VISIBLE_SAMPLES = VISIBLE_SAMPLES;
+export const GRAPH_PLAYHEAD_INSET_PX_FRAC = PLAYHEAD_INSET_PX_FRAC;
+export const GRAPH_Y_PAD = Y_PAD;
 // How far the line extends past the playhead before fading to alpha 0.
 // Sized as a fraction of the empty "future" space to the right of the
 // playhead (which itself is `w * PLAYHEAD_INSET_PX_FRAC` wide). Filling
@@ -330,6 +342,23 @@ export class GraphRenderer {
       hist.head = (hist.head + 1) % HISTORY_LEN;
       if (hist.filled < HISTORY_LEN) hist.filled += 1;
     }
+  }
+
+  /** Seed a signal's history with a flat line at `valueNorm` (0..1).
+   *  Used by the title-screen morph so the moment the morph canvas is
+   *  removed, the graph canvas underneath already draws an identical
+   *  flat polyline at the same on-screen position. Without this, the
+   *  graph's history would be empty and the polyline would appear to
+   *  grow leftward from the playhead over the next 6 seconds. */
+  prefillHistory(name: string, valueNorm: number): void {
+    const v = Math.max(0, Math.min(1, valueNorm));
+    const buf = new Float32Array(HISTORY_LEN);
+    buf.fill(v);
+    // head=0, filled=VISIBLE_SAMPLES is enough — draw() only consumes
+    // the most-recent VISIBLE_SAMPLES entries. Walking the ring buffer
+    // backward from head still finds `filled` entries because the
+    // ring's contiguous prefilled values cover the read range.
+    this.histories.set(name, { buf, head: 0, filled: VISIBLE_SAMPLES });
   }
 
   draw(pulse = 0, now: number = performance.now()): void {

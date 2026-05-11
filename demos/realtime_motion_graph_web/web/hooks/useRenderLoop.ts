@@ -55,6 +55,25 @@ export function useRenderLoop(refs: Refs) {
     const hud = new HUD(hudEl);
     const graph = new GraphRenderer(graphEl);
 
+    // Title-screen morph hand-off. StartOverlay dispatches this on click
+    // with already-normalized (0..1) destination values for the four
+    // morphing signals. We seed the graph's histories with flat lines at
+    // those values so the morph canvas's last frame and the graph's first
+    // post-morph frame overlay pixel-for-pixel — no visible swap. Listener
+    // lives here (not in StartOverlay) because the GraphRenderer instance
+    // is local to this effect.
+    const onGraphPrefill = (e: Event) => {
+      const detail = (e as CustomEvent).detail as
+        | { samples?: Record<string, number> }
+        | undefined;
+      const samples = detail?.samples;
+      if (!samples) return;
+      for (const [name, v] of Object.entries(samples)) {
+        graph.prefillHistory(name, v);
+      }
+    };
+    document.addEventListener("dd:graph-prefill", onGraphPrefill);
+
     // Initialise ribbons (one-time DOM mutation against the .install-edge-*
     // divs rendered by <HUDFrame />). Bars come back as { edge, ribbons[] }.
     const ribbons: RibbonBar[] = initRibbons();
@@ -289,6 +308,7 @@ export function useRenderLoop(refs: Refs) {
       sessionUnsub();
       mirrorUnsub?.();
       unsubEffectsConfig?.();
+      document.removeEventListener("dd:graph-prefill", onGraphPrefill);
       hud.destroy();
       graph.destroy();
       effects?.destroy();
