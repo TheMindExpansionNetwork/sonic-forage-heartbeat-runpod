@@ -3676,6 +3676,24 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   align-items: stretch;
   gap: 0;
   transition: transform 140ms cubic-bezier(.2, .8, .2, 1);
+  /* Brand gradient strip + bloom drop-shadow live on the dock so they
+     span placard + upload as one continuous element — no per-child
+     gradient seam, no separate shadow halos. */
+  filter: drop-shadow(0 0 calc(1px + var(--bloom-amount, 0) * 6px) var(--accent-glow));
+}
+.audio-source-dock::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--dd-gradient);
+  pointer-events: none;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  /* Sit above both children's backgrounds so the strip reads as the
+     unified top edge. */
+  z-index: 1;
 }
 /* Hover anywhere on the pair lifts the whole widget together so the
    placard + upload read as one unit, not two. :has() supported in
@@ -3708,13 +3726,11 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   gap: 10px;
   cursor: pointer;
   text-align: left;
-  /* Bloom drop-shadow ties the placard to the perimeter ribbons so it
-     pulses subtly with the audio kick — no canvas needed. */
-  filter: drop-shadow(0 0 calc(1px + var(--bloom-amount, 0) * 6px) var(--accent-glow));
+  /* Drop-shadow + gradient strip live on the .audio-source-dock parent
+     so they span placard + upload as one unit. */
   transition:
     background 160ms,
-    border-color 160ms,
-    filter 200ms;
+    border-color 160ms;
 }
 /* Always-visible upload icon button. Sits flush against the placard's
    right edge — same height, same blur background, same bloom-coupled
@@ -3736,12 +3752,11 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   border-radius: 0 var(--radius-md) var(--radius-md) 0;
   color: var(--text-dim);
   cursor: pointer;
-  filter: drop-shadow(0 0 calc(1px + var(--bloom-amount, 0) * 6px) var(--accent-glow));
+  /* Drop-shadow + gradient strip live on the .audio-source-dock parent. */
   transition:
     background 160ms,
     border-color 160ms,
-    color 160ms,
-    filter 200ms;
+    color 160ms;
 }
 .audio-source-upload-btn:hover {
   background: rgba(6, 6, 12, 0.85);
@@ -3773,17 +3788,6 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
 .audio-source-crate--open .audio-source-crate-caret {
   color: var(--accent);
   transform: rotate(180deg);
-}
-.audio-source-crate::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: var(--dd-gradient);
-  pointer-events: none;
-  border-radius: var(--radius-md) var(--radius-md) 0 0;
 }
 .audio-source-crate:hover {
   background: rgba(6, 6, 12, 0.85);
