@@ -51,6 +51,19 @@ Known-good local build environment used for the current artifacts:
 - GPU: RTX 4090, SM 8.9, 24 GB VRAM
 - Driver seen by `nvidia-smi`: `595.97`
 
+### RTX 5090 / Blackwell VAE Builds
+
+TensorRT 10.15 and 10.16 can generate a Myelin fusion for the Oobleck VAE
+graph that segfaults on RTX 5090 during the first `execute_async_v3` call.
+DEMON pins VAE TensorRT builds to `builder_optimization_level=1` in
+`acestep/engine/trt/vae_export.py` to avoid that fusion. Decoder engines do not
+use this workaround; the 10.16 decoder path has been validated separately on
+Blackwell.
+
+Any VAE or DreamVAE `.engine` built before this opt-level pin should be treated
+as unsafe on Blackwell. Rebuild those engines on the target TensorRT/CUDA/driver
+stack before running full TRT mode on an RTX 5090.
+
 ## Storage Layout
 
 Paths are resolved through `acestep.paths`.
@@ -578,6 +591,20 @@ Compile modified TRT modules:
 ```powershell
 uv run python -m py_compile acestep/engine/trt/build.py acestep/engine/trt/export.py
 ```
+
+Rebuild VAE engines after changing TensorRT, CUDA, driver, GPU architecture, or
+the VAE builder optimization level:
+
+```powershell
+uv run python -m acestep.engine.trt.build --all --vae-only --duration 60 --force-rebuild
+uv run python -m acestep.engine.trt.build --all --vae-only --duration 120 --force-rebuild
+```
+
+For a quick RTX 5090 smoke test, load the rebuilt VAE engines and execute one
+encode/decode pass before launching the realtime demo. A crash on the first
+`execute_async_v3` usually means the VAE engine was built without the
+`builder_optimization_level=1` workaround or was carried across an incompatible
+TensorRT/GPU stack.
 
 Run XL vendored loader tests:
 

@@ -167,6 +167,10 @@ class VAETRTBuildConfig:
     """Configuration for VAE TensorRT engine build."""
     fp16: bool = True
     workspace_gb: float = 8.0
+    # TensorRT 10.15+ can generate a Myelin fusion for the Oobleck VAE
+    # graph that segfaults on RTX 5090 during execute_async_v3. Level 1
+    # avoids the broken fusion while preserving the fast kernel set.
+    builder_optimization_level: int = 1
 
     # VAE decoder profile (latent frames)
     decode_min_frames: int = 125      # ~5s
@@ -249,6 +253,9 @@ def build_vae_trt_engine(
     if config.fp16:
         build_config.set_flag(trt.BuilderFlag.FP16)
 
+    if hasattr(build_config, "builder_optimization_level"):
+        build_config.builder_optimization_level = config.builder_optimization_level
+
     profile = builder.create_optimization_profile()
     profile.set_shape(
         input_name,
@@ -261,8 +268,12 @@ def build_vae_trt_engine(
         raise RuntimeError("Failed to add TensorRT optimization profile")
 
     logger.info(
-        "Building TRT engine: {} [{}, {}, {}]",
-        input_name, min_dynamic, opt_dynamic, max_dynamic,
+        "Building TRT engine: {} [{}, {}, {}] (opt_level={})",
+        input_name,
+        min_dynamic,
+        opt_dynamic,
+        max_dynamic,
+        config.builder_optimization_level,
     )
 
     serialized = builder.build_serialized_network(network, build_config)

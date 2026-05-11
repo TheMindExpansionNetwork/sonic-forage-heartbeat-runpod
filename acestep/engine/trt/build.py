@@ -746,6 +746,7 @@ def _build_decoder_engine(
         refit=refit,
         workspace_gb=workspace_gb,
         batch_max=batch_max,
+        seq_opt=min(duration * 25, 1500),
         seq_max=duration * 25,
         variant=variant,
         onnx_precision=decoder_precision,
