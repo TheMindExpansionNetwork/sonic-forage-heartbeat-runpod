@@ -25,6 +25,7 @@ const GRAPH_COLORS: Record<string, RGB> = {
   hint_strength: [199, 181, 102],
   ode_noise: [199, 181, 102],
   seed: [240, 138, 72],
+  prompt_blend: [220, 110, 220],
   ch_g0: [255, 80, 80],
   ch_g1: [255, 160, 60],
   ch_g2: [255, 220, 40],

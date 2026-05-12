@@ -18,6 +18,12 @@ export const SLIDER_META: Record<string, SliderMeta> = {
   // 0 = LoRA A only, 1 = LoRA B only, 0.5 = both at half-max. UI-only knob —
   // useEdgeLoraBinding watches this and writes the paired lora_str_<id> values.
   lora_blend: { max: 1.0, step: 0.05 },
+  // 0 = Tags A only, 1 = Tags B only. Lives in the slider system so the
+  // Smooth toggle / tween machinery / graph / MIDI generic path all work
+  // uniformly. Stripped out of the engine `params` dict by useParamSync
+  // (engine doesn't read it from there); shipped via the dedicated
+  // ``set_prompt_blend`` WS message by usePromptBlendSync.
+  prompt_blend: { max: 1.0, step: 0.05 },
 
   feedback: { max: 1.0, step: 0.1, pro: true },
   shift: { max: 1.0, step: 0.1, pro: true },

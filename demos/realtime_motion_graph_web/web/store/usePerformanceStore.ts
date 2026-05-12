@@ -227,6 +227,7 @@ const DEFAULT_SLIDER_VALUES: Record<string, number> = {
   hint_strength: 1.4,
   timbre_strength: 1.0,
   lora_blend: 0.5,
+  prompt_blend: 0.4,
   feedback: 0.0,
   shift: 0.5,
   ode_noise: 0.0,
@@ -277,9 +278,10 @@ interface PerformanceState {
   sliderDisplayOverride: Record<string, number>;
   /** Random seed in 0..1; "dice" button reroll. */
   seed: number;
-  /** Prompt A/B blend (0 = A, 1 = B). */
-  blend: number;
-  /** Two prompts. */
+  /** Two prompts. The A/B blend itself lives in
+   *  ``sliderValues["prompt_blend"]`` so it rides the Smooth tween
+   *  machinery, the graph, and the generic MIDI / keyboard / param
+   *  pipelines the same way every other knob does. */
   promptA: string;
   promptB: string;
   /** Currently active key (e.g. "G# minor"). May come from auto-detect. */
@@ -377,7 +379,6 @@ interface PerformanceState {
   bumpSlider: (param: string, delta: number) => void;
   setSeed: (seed: number) => void;
   randomizeSeed: () => void;
-  setBlend: (b: number) => void;
   setPromptA: (s: string) => void;
   setPromptB: (s: string) => void;
   setKey: (k: string) => void;
@@ -489,7 +490,6 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   sliderTargets: { ...DEFAULT_SLIDER_VALUES },
   sliderDisplayOverride: {},
   seed: 0,
-  blend: 0.4,
   promptA: "heavy dubstep, deathstep, afxdump, growl heavy bass distortion",
   promptB: "daft punk style, beautiful, four to the floor, angelic",
   activeKey: "G# minor",
@@ -584,7 +584,6 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   },
   setSeed: (seed) => set({ seed: Math.max(0, Math.min(1, seed)) }),
   randomizeSeed: () => set({ seed: Math.random() }),
-  setBlend: (b) => set({ blend: Math.max(0, Math.min(1, b)) }),
   setPromptA: (s) => set({ promptA: s }),
   setPromptB: (s) => set({ promptB: s }),
   setKey: (k) => set({ activeKey: k }),
@@ -695,7 +694,6 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
       sliderTargets: { ...DEFAULT_SLIDER_VALUES },
       sliderDisplayOverride: {},
       seed: 0,
-      blend: 0.4,
       remixStarted: false,
     }));
   },

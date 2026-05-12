@@ -88,14 +88,10 @@ function handleCC(cc: number, value: number): void {
   // an absolute MIDI knob's full sweep would map 0..127 → 0..2.0 and
   // the perf-store clamp would silently truncate the top ~10% — the
   // operator-visible slider stops at 1.8 but the MIDI input still
-  // crosses it. `prompt_blend` lives in usePerformanceStore.blend
-  // directly (not in sliderValues) and its rail is [0, 1] — both
-  // ends are meaningful, so we cap there explicitly.
+  // crosses it.
   const max = range?.max
     ?? meta?.max
-    ?? (param.startsWith("lora_str_") ? LORA_SLIDER_MAX
-        : param === "prompt_blend" ? 1.0
-        : 2.0);
+    ?? (param.startsWith("lora_str_") ? LORA_SLIDER_MAX : 2.0);
   const span = Math.max(0, max - min);
   const reverse = range?.reverse ?? false;
   const step = meta?.step ?? 0.05;
@@ -134,15 +130,6 @@ function handleCC(cc: number, value: number): void {
  *  knob sweeps debounce into one engine-side refit per gesture,
  *  matching the touch/edge-drag paths. */
 function applyMidiSet(param: string, value: number): void {
-  // `prompt_blend` is the Tags-A↔Tags-B slider in PromptsTile. It lives
-  // in usePerformanceStore.blend (a 0..1 scalar with its own setter),
-  // NOT in sliderValues, so the generic setSlider path won't move the
-  // visible slider or trigger the PromptsTile auto-submit useEffect.
-  // Route it to setBlend instead.
-  if (param === "prompt_blend") {
-    usePerformanceStore.getState().setBlend(value);
-    return;
-  }
   if (param.startsWith("lora_str_")) {
     const id = param.slice("lora_str_".length);
     loraStrengthDispatcher.set(id, value);
@@ -152,11 +139,6 @@ function applyMidiSet(param: string, value: number): void {
 }
 
 function applyMidiBump(param: string, delta: number): void {
-  if (param === "prompt_blend") {
-    const cur = usePerformanceStore.getState().blend;
-    usePerformanceStore.getState().setBlend(cur + delta);
-    return;
-  }
   if (param.startsWith("lora_str_")) {
     const id = param.slice("lora_str_".length);
     // Compute the new absolute target from sliderTargets (kept current

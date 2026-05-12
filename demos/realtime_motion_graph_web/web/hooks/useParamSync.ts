@@ -47,6 +47,10 @@ export function useParamSync() {
       // the cached cond_silence/cond_self pair on the spot. The params
       // path doesn't recognize it.
       delete raw.timbre_strength;
+      // prompt_blend rides its own dedicated WS message
+      // (usePromptBlendSync → sendSetPromptBlend); the server's params
+      // handler doesn't read it from here.
+      delete raw.prompt_blend;
       // Per-LoRA strength sliders ride along under lora_str_<id> keys.
       // We prefer perf.sliderValues (smoothed via the tween) and only
       // fall back to lora.strengths when the perf store hasn't seen

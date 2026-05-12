@@ -83,8 +83,10 @@ export function useKeyboardShortcuts() {
     }
 
     function bumpBlend(direction: 1 | -1): void {
-      const s = usePerformanceStore.getState();
-      s.setBlend(Math.max(0, Math.min(1, s.blend + direction * 0.05)));
+      // prompt_blend lives in the slider system — bumpSlider gives us
+      // smoothing (when enabled), clamping via SLIDER_META, and graph
+      // sampling for free.
+      usePerformanceStore.getState().bumpSlider("prompt_blend", direction * 0.05);
     }
 
     function sendPrompt(): void {

@@ -6,12 +6,17 @@ import { useSessionStore } from "@/store/useSessionStore";
 export function PromptsTile() {
   const promptA = usePerformanceStore((s) => s.promptA);
   const promptB = usePerformanceStore((s) => s.promptB);
-  const blend = usePerformanceStore((s) => s.blend);
+  // Read sliderTargets (instant) so the thumb tracks the cursor without
+  // the smoothing lag — the engine sees the smoothed sliderValues via
+  // usePromptBlendSync.
+  const blend = usePerformanceStore(
+    (s) => s.sliderTargets.prompt_blend ?? 0,
+  );
   const activeKey = usePerformanceStore((s) => s.activeKey);
   const activeTimeSignature = usePerformanceStore((s) => s.activeTimeSignature);
   const setPromptA = usePerformanceStore((s) => s.setPromptA);
   const setPromptB = usePerformanceStore((s) => s.setPromptB);
-  const setBlend = usePerformanceStore((s) => s.setBlend);
+  const setSlider = usePerformanceStore((s) => s.setSlider);
 
   // Send Tags is the only path that pays the server-side text encoder:
   // it ships both A and B so the backend caches a cond pair for each,
@@ -50,9 +55,8 @@ export function PromptsTile() {
         {/* data-param wrapper makes the right-click → MIDI learn
             handler in useMidi.ts pick this up (kind="cc",
             target="prompt_blend") without adopting slider-group
-            styling. useMidi has a #blend-control branch in the
-            contextmenu handler and special-cases this param to route
-            writes through setBlend instead of setSlider. */}
+            styling. MIDI writes flow through the generic setSlider
+            path now that prompt_blend lives in sliderValues. */}
         <div
           id="blend-control"
           data-param="prompt_blend"
@@ -67,7 +71,7 @@ export function PromptsTile() {
             max="1"
             step="0.01"
             value={blend}
-            onChange={(e) => setBlend(parseFloat(e.target.value))}
+            onChange={(e) => setSlider("prompt_blend", parseFloat(e.target.value))}
           />
           <span className="blend-value" id="blend-value">
             {blend.toFixed(2)}

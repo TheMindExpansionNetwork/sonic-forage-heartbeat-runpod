@@ -394,18 +394,19 @@ export function applyConfig(c: RtmgConfig): void {
   _activeConfig = c;
 
   // Numeric controls land on sliderValues + sliderTargets so the slider
-  // UI and the param-sync tick agree.
+  // UI and the param-sync tick agree. prompt_blend rides in here too —
+  // it lives in the slider system alongside lora_blend.
   const sliderUpdates: Record<string, number> = {};
   for (const [k, v] of Object.entries(c.controls)) {
     if (typeof v === "number") sliderUpdates[k] = v;
   }
+  sliderUpdates.prompt_blend = c.prompts.blend;
 
   usePerformanceStore.setState((s) => ({
     sliderValues: { ...s.sliderValues, ...sliderUpdates },
     sliderTargets: { ...s.sliderTargets, ...sliderUpdates },
     promptA: c.prompts.a,
     promptB: c.prompts.b,
-    blend: c.prompts.blend,
     activeKey: c.engine.key,
     activeTimeSignature: isTimeSignature(c.engine.time_signature)
       ? c.engine.time_signature
@@ -487,7 +488,7 @@ export function captureRtmgConfig(): RtmgConfig {
     prompts: {
       a: perf.promptA,
       b: perf.promptB,
-      blend: perf.blend,
+      blend: perf.sliderTargets.prompt_blend ?? 0,
     },
     controls,
     channel_ranges: active.channel_ranges,
