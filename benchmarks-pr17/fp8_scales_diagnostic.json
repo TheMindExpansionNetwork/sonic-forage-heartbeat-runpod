@@ -1,0 +1,56 @@
+{
+  "fp16_to_fp8_zero_to_floor": {
+    "checked": 627,
+    "initializers_with_flip": 0,
+    "total_flips": 0,
+    "suspects": []
+  },
+  "dq_scales": {
+    "dq_count": 4,
+    "fp16_scale": 4,
+    "fp32_scale": 0,
+    "scale_has_zero": 0,
+    "scale_has_denormal": 1,
+    "scale_has_nan_inf": 0,
+    "scale_lt_1e_4": 1,
+    "scale_lt_1e_6": 1,
+    "scale_examples_small": [
+      {
+        "min_pos": 2.384185791015625e-07,
+        "scale_init": "expand_scale_2",
+        "node": "expand_DequantizeLinear",
+        "shape": [
+          64
+        ]
+      },
+      {
+        "min_pos": 0.003986358642578125,
+        "scale_init": "val_30_scale_2",
+        "node": "val_30_DequantizeLinear",
+        "shape": [
+          2560
+        ]
+      },
+      {
+        "min_pos": 0.02777099609375,
+        "scale_init": "encoder_hidden_states_scale_2",
+        "node": "encoder_hidden_states_DequantizeLinear",
+        "shape": []
+      },
+      {
+        "min_pos": 20.796875,
+        "scale_init": "_to_copy_7_scale_2",
+        "node": "_to_copy_7_DequantizeLinear",
+        "shape": []
+      }
+    ]
+  },
+  "fp8_weights_sampled": {
+    "count": 10,
+    "with_nan_bits": 0,
+    "with_inf_bits": 0,
+    "all_zero": 8,
+    "max_abs_at_saturation": 0,
+    "examples_saturating": []
+  }
+}

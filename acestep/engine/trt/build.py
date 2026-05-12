@@ -71,6 +71,7 @@ _DECODER_PRECISION_CHOICES = (
     "fp32",
     "fp16_mixed",
     "bf16_mixed",
+    "fp8_mixed",
 )
 
 
@@ -250,6 +251,8 @@ def _decoder_precision_is_strongly_typed(decoder_precision: str, decoder_mixed: 
         return True
     if decoder_precision == "bf16_mixed":
         return True
+    if decoder_precision == "fp8_mixed":
+        return True
     return decoder_mixed
 
 
@@ -259,10 +262,12 @@ def _decoder_onnx_needs_dynbatch_patch(
     decoder_precision: str,
     batch_max: int,
 ) -> bool:
+    # FP8 reuses the bf16 ONNX as its base; same dynbatch concern applies.
+    needs_bf16_base = decoder_precision in ("bf16_mixed", "fp8_mixed")
     return (
         batch_max > 1
         and _looks_like_xl_checkpoint(checkpoint)
-        and decoder_precision == "bf16_mixed"
+        and needs_bf16_base
     )
 
 
@@ -296,6 +301,61 @@ def _patch_decoder_onnx_for_dynamic_batch(
         patched[key] = str(
             patch_decoder_onnx_dynamic_batch_reshapes(
                 patched[key],
+                force=force,
+            )
+        )
+    return patched
+
+
+def _patch_decoder_onnx_for_fp8(
+    onnx_paths: dict[str, str],
+    *,
+    need_decoder_std: bool,
+    need_decoder_refit: bool,
+    decoder_precision: str,
+    calibration_npz: str,
+    activation_absmax_json: str | None,
+    force: bool,
+) -> dict[str, str]:
+    """Insert FP8 QDQ into decoder ONNX(es) when decoder_precision='fp8_mixed'.
+
+    Runs after the dynbatch reshape patch so the FP8 graph inherits the
+    dynamic-batch-safe reshapes. The patched ONNX is a sibling of the
+    source; this function rewrites the paths dict to point at it.
+
+    When ``activation_absmax_json`` is provided, the patch runs in W8A8
+    mode (activation Q->DQ inserted alongside weight DQ); otherwise it
+    runs in weight-only W8A16 mode.
+    """
+    if decoder_precision != "fp8_mixed":
+        return onnx_paths
+
+    cal_path = None
+    if calibration_npz:
+        cal_path = Path(calibration_npz)
+        if not cal_path.exists():
+            raise FileNotFoundError(f"Calibration .npz not found: {cal_path}")
+
+    amax_path = None
+    if activation_absmax_json:
+        amax_path = Path(activation_absmax_json)
+        if not amax_path.exists():
+            raise FileNotFoundError(f"Activation absmax JSON not found: {amax_path}")
+
+    from .fp8_onnx import patch_bf16_onnx_to_fp8
+
+    patched = dict(onnx_paths)
+    for key, needed in (
+        ("decoder", need_decoder_std),
+        ("decoder_refit", need_decoder_refit),
+    ):
+        if not needed:
+            continue
+        patched[key] = str(
+            patch_bf16_onnx_to_fp8(
+                bf16_onnx_path=patched[key],
+                calibration_npz_path=cal_path,
+                activation_absmax_json_path=amax_path,
                 force=force,
             )
         )
@@ -575,11 +635,19 @@ def _ensure_onnx(
     if export_decoder_refit or export_decoder_std:
         from .export import OnnxExportConfig, export_decoder_onnx
 
+        # fp8_mixed reuses the bf16_mixed ONNX as its export base; the
+        # FP8 QDQ patch runs afterwards in a separate step. So at export
+        # time we ask for bf16_mixed.
+        underlying_precision = (
+            "bf16_mixed" if decoder_precision == "fp8_mixed"
+            else decoder_precision
+        )
+
         def decoder_export_config(*, for_refit: bool) -> OnnxExportConfig:
-            if decoder_precision == "fp16_mixed":
+            if underlying_precision == "fp16_mixed":
                 return OnnxExportConfig(mixed_precision=True, for_refit=for_refit)
             return OnnxExportConfig(
-                precision=decoder_precision,
+                precision=underlying_precision,
                 mixed_precision=False,
                 for_refit=for_refit,
             )
@@ -1014,7 +1082,19 @@ def main():
                         help="Decoder ONNX export precision recipe. "
                              "'auto' keeps the legacy fp16_mixed recipe for "
                              "2B mixed builds and uses bf16_mixed for XL "
-                             "checkpoints.")
+                             "checkpoints. 'fp8_mixed' is bf16 base with "
+                             "weight-only FP8 QDQ on every DiT MatMul.")
+    single.add_argument("--calibration-npz", type=str, default=None,
+                        help="Calibration .npz path (unused since the FP8 "
+                             "weight pass is data-free). Kept for back-compat.")
+    single.add_argument("--activation-absmax-json", type=str, default=None,
+                        help="Path to the per-Linear activation absmax JSON "
+                             "produced by "
+                             "scripts/collect_activation_absmax.py. When set, "
+                             "fp8_mixed runs in W8A8 (activation Q->DQ + "
+                             "weight DQ), which is what unlocks TRT's FP8 "
+                             "GEMM tactics. When omitted, fp8_mixed stays "
+                             "weight-only (W8A16).")
     single.add_argument("--decoder-refit",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Build refit-enabled decoder for LoRA "
@@ -1108,6 +1188,15 @@ def _run_all(args, project_root, onnx_dir, env):
             checkpoint=args.checkpoint,
             decoder_precision=decoder_precision,
             batch_max=args.batch_max,
+            force=args.force_onnx,
+        )
+        onnx_paths = _patch_decoder_onnx_for_fp8(
+            onnx_paths,
+            need_decoder_std=False,
+            need_decoder_refit=build_decoder,
+            decoder_precision=decoder_precision,
+            calibration_npz=args.calibration_npz,
+            activation_absmax_json=args.activation_absmax_json,
             force=args.force_onnx,
         )
     else:
@@ -1216,6 +1305,15 @@ def _run_single(args, project_root, onnx_dir, env):
         checkpoint=args.checkpoint,
         decoder_precision=decoder_precision,
         batch_max=args.batch_max,
+        force=args.force_onnx,
+    )
+    onnx_paths = _patch_decoder_onnx_for_fp8(
+        onnx_paths,
+        need_decoder_std=build_decoder and not args.decoder_refit,
+        need_decoder_refit=build_decoder and args.decoder_refit,
+        decoder_precision=decoder_precision,
+        calibration_npz=args.calibration_npz,
+        activation_absmax_json=args.activation_absmax_json,
         force=args.force_onnx,
     )
 
