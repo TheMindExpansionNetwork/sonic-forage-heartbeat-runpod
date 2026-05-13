@@ -1,18 +1,27 @@
 import { useNetworkStore } from "@/store/useNetworkStore";
-import { useSessionStore } from "@/store/useSessionStore";
 import type { RemoteBackend } from "@/engine/protocol";
 import type { AudioSlice } from "@/types/protocol";
 
 // Detect "connection is actually broken" from existing WebSocket signals.
-// Two inputs, one verdict:
+// One input, one verdict:
 //
-//   1. Stall watchdog — no AudioSlice received in STALL_MS. This is the
-//      one signal that always corresponds to a real user-audible problem:
-//      slices stopped arriving, so the AudioPlayer's buffer drains and
-//      playback hitches.
+//   Stall watchdog — no AudioSlice received in STALL_MS. The one signal
+//   that always corresponds to a real user-audible problem: slices
+//   stopped arriving, so the AudioPlayer's buffer drains and playback
+//   hitches. If the WebSocket dies for any reason (transient blip the
+//   server side recovered from, hard close, network drop), slices
+//   stop flowing and this catches it.
 //
-//   2. Session status — useSessionStore reports "error" / "closed" when
-//      the WebSocket has actually torn down. Beats every other gate.
+// What this monitor used to do but no longer does (2026-05-13):
+//
+//   - **sessionStatus === "error" | "closed" override.** Fired instantly
+//     (no debounce) on every WebSocket close — including transient
+//     close codes the connection recovered from at the protocol layer.
+//     There is no path that flips the store back to "ready" once
+//     frames resume, so once stuck the pill stayed on until the next
+//     full session-start `reset()`. Redundant with the stall watchdog
+//     for the cases that actually matter (real disconnects stop the
+//     slice flow on their own).
 //
 // What this monitor used to do but no longer does (2026-05-12):
 //
@@ -81,7 +90,6 @@ export function createNetworkMonitor(remote: RemoteBackend): NetworkMonitor {
 
   const evaluate = () => {
     const now = performance.now();
-    const sessionStatus = useSessionStore.getState().status;
     const staleMs = lastSliceAt > 0 ? now - lastSliceAt : 0;
 
     // Only meaningful once we've seen at least one slice — pre-first-
@@ -89,10 +97,6 @@ export function createNetworkMonitor(remote: RemoteBackend): NetworkMonitor {
     const haveBaseline = lastSliceAt > 0;
     let candidate: "healthy" | "unstable" = "healthy";
     if (haveBaseline && staleMs >= THRESHOLDS.STALL_MS) {
-      candidate = "unstable";
-    }
-    // WS error/close beats every other signal — connection's gone.
-    if (sessionStatus === "error" || sessionStatus === "closed") {
       candidate = "unstable";
     }
 
@@ -124,7 +128,20 @@ export function createNetworkMonitor(remote: RemoteBackend): NetworkMonitor {
       // removed (see header).
       jitterRatio: 1,
     });
-    if (shouldFlip) pendingTicks = 0;
+    if (shouldFlip) {
+      // Diagnostic trip-wire. This surface has been patched twice
+      // already (2026-05-12 trigger pruning, 2026-05-13 sessionStatus
+      // override removal). If the pill ever flips on a healthy session
+      // again, the next regression should be observable, not guessed
+      // at — a single line in the console gives us staleMs +
+      // lastSliceAt + the direction of the flip.
+      console.debug("[networkMonitor]", {
+        quality: pendingQuality,
+        staleMs: Math.round(staleMs),
+        lastSliceAt: Math.round(lastSliceAt),
+      });
+      pendingTicks = 0;
+    }
   };
 
   const intervalId = window.setInterval(

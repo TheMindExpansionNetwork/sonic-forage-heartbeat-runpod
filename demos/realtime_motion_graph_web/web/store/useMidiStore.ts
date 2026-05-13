@@ -171,6 +171,10 @@ export const useMidiStore = create<MidiState>((set, get) => ({
       notes: { ...DEFAULT_MIDI_MAP.notes },
     };
     saveMap(def);
+    // Drop every per-CC delta-tracking baseline. After a full map
+    // reset, the next message on any CC should re-establish a
+    // baseline, not compute a delta against the previous binding.
+    resetKnobDelta();
     set({ map: def, status: { message: "MIDI reset", tone: "ok" } });
   },
 }));
