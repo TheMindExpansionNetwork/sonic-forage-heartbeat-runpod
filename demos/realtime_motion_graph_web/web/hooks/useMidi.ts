@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 
 import { loraStrengthDispatcher } from "@/engine/lora/dispatcher";
-import { readKnob } from "@/engine/midi/absoluteDelta";
+import { readKnob, resetKnobDelta } from "@/engine/midi/absoluteDelta";
 import { decodeKnob } from "@/engine/midi/knob";
 import { LORA_SLOT_MARKER, type NoteAction } from "@/engine/midi/types";
 import { getChannelRange } from "@/lib/config";
@@ -216,6 +216,14 @@ export function useMidi() {
         a.inputs.forEach(bindInput);
         a.onstatechange = () => {
           a.inputs.forEach(bindInput);
+          // Plug/unplug invalidates the per-CC `lastValue` cache used
+          // by readKnob() — the next message from a reconnected
+          // controller would otherwise compute its delta against a
+          // pre-disconnect value, yanking every bound slider on the
+          // first wiggle. Clearing here means the first message after
+          // any state change is treated as a fresh baseline (no
+          // motion), matching first-time-mapping behaviour.
+          resetKnobDelta();
           useMidiStore
             .getState()
             .setStatus(`MIDI ${a.inputs.size} dev`, "ok");
