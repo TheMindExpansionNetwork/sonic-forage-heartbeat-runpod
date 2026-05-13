@@ -17,22 +17,24 @@ import { RefSelect } from "./RefSelect";
 
 // Unified picker for the timbre and structure references. Both
 // reference axes share the exact same UI shape (caption + dropdown
-// with "Input Track" / "Upload…" pinned, then library + your-tracks
-// optgroups) and the exact same upload flow (decode locally → push to
-// useCustomTracksStore → ship to the server). The only differences
-// are the store field for the displayed name, the remote send method,
-// and the status-bar prefix — everything else is shared.
+// with "Input Track" pinned + library + your-tracks optgroups, plus a
+// sibling upload icon button) and the exact same upload flow (decode
+// locally → push to useCustomTracksStore → ship to the server). The
+// only differences are the store field for the displayed name, the
+// remote send method, and the status-bar prefix — everything else is
+// shared.
 //
-// Default options at the top:
+// Default option at the top:
 //   "Input Track"  — clear any active override; server falls back to
 //                    encoding against the playback source's own latent.
-//   "Upload…"      — open a file picker. The new clip is added to
-//                    useCustomTracksStore (the same pool the audio-
-//                    source crate uses) so it shows up everywhere.
-// Then any tracks already in useCustomTracksStore appear underneath.
+//
+// Upload sits NEXT TO the dropdown, not inside it: opening a file
+// picker through the dropdown closes the menu and then the
+// AlmostReadyDialog modal hides whatever the user was just comparing
+// against. The sibling button lets the user upload without ever
+// opening (or hiding) the list.
 
 const VAL_INPUT = "__input__";
-const VAL_UPLOAD = "__upload__";
 
 export type RefKind = "timbre" | "structure";
 
@@ -214,12 +216,6 @@ export function RefControl({ kind }: { kind: RefKind }) {
       clearActive();
       return;
     }
-    if (v === VAL_UPLOAD) {
-      // The displayed value snaps back via the controlled `value` prop
-      // on the next render — no need to update store state here.
-      fileInputRef.current?.click();
-      return;
-    }
     if (v !== currentName) void pickExisting(v);
   }
 
@@ -228,10 +224,7 @@ export function RefControl({ kind }: { kind: RefKind }) {
       <RefSelect
         label={bind.label}
         value={value}
-        pinned={[
-          { value: VAL_INPUT, label: "Input Track" },
-          { value: VAL_UPLOAD, label: "Upload…" },
-        ]}
+        pinned={[{ value: VAL_INPUT, label: "Input Track" }]}
         groups={[
           {
             label: "Library",
@@ -245,6 +238,8 @@ export function RefControl({ kind }: { kind: RefKind }) {
         onSelect={onSelect}
         disabled={busy}
         ariaLabel={bind.ariaLabel}
+        onUpload={() => fileInputRef.current?.click()}
+        uploadLabel={`Upload ${bind.label}`}
       />
       <input
         ref={fileInputRef}

@@ -1472,7 +1472,7 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
    above the bottom edge. Clicking the handle (or Esc / `o`) toggles open.
    ============================================================================ */
 :root {
-  --drawer-handle-h: 28px;
+  --drawer-handle-h: 40px;
   --drawer-h: clamp(380px, 50vh, 540px);
 }
 
@@ -1491,11 +1491,11 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
 }
 .install-sheet.open { transform: translateY(0); }
 
-/* Drawer handle — full-width bar at the top of the drawer. The only
-   on-screen close affordance, so it's deliberately bigger and more
-   discoverable than the old corner button. Two rounded "grip"
-   indicators flank a small label so the bar reads as a draggable
-   surface even on first sight. */
+/* Drawer handle — full-width bar at the top of the drawer. Painted
+   with an accent-tinted top edge + bright label so it reads as a
+   *button* (not a chrome divider) even on a busy canvas. The handle
+   used to be 28px of frame-dark text-dim that disappeared into the
+   HUD; bumped to 40px with persistent legibility. */
 .install-drawer-handle {
   flex-shrink: 0;
   height: var(--drawer-handle-h);
@@ -1504,31 +1504,44 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   justify-content: center;
   gap: 14px;
   padding: 0 18px;
-  background: var(--frame);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--accent) 14%, var(--frame)) 0%,
+    var(--frame) 100%
+  );
   border: none;
+  border-top: 1px solid var(--accent-line);
   border-bottom: 1px solid var(--frame-line);
-  color: var(--text-dim);
+  color: var(--text-strong);
   font: inherit;
   font-family: var(--font-mono);
-  font-size: 0.7em;
-  letter-spacing: var(--tracking-bar);
+  font-size: 0.78em;
+  font-weight: 600;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
   cursor: pointer;
-  transition: color 120ms, background 120ms;
+  transition: color 120ms, background 120ms, border-color 120ms;
 }
 .install-drawer-handle:hover {
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--accent-hover);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--accent) 22%, var(--frame)) 0%,
+    var(--frame) 100%
+  );
+  border-top-color: var(--accent);
 }
 .install-drawer-handle-grip {
   width: 56px;
   height: 4px;
-  background: var(--frame-line);
+  background: var(--accent);
   border-radius: 2px;
   transition: background 120ms;
+  opacity: 0.85;
 }
 .install-drawer-handle:hover .install-drawer-handle-grip {
-  background: var(--accent);
+  background: var(--accent-hover);
+  opacity: 1;
 }
 .install-drawer-handle-label {
   white-space: nowrap;
@@ -1539,10 +1552,12 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   pointer-events: none;
   background: var(--frame);
   color: var(--text-dim);
+  border-top-color: var(--frame-line);
   cursor: not-allowed;
 }
 .install-drawer-handle--disabled .install-drawer-handle-grip {
   background: var(--frame-line);
+  opacity: 1;
 }
 
 /* First-run coachmark — floats above the drawer handle to teach new
@@ -5333,6 +5348,40 @@ body.drawer-open .waveform-scrub-box[data-curves-open="true"] {
   flex: 1 1 0;
   min-width: 0;
   display: flex;
+  gap: 4px;
+}
+/* Sibling upload button. Lives outside the dropdown so opening the
+   file picker (and the AlmostReadyDialog modal that follows) no
+   longer closes / occludes the ref list the user was browsing.
+   Square footprint matches the dropdown button height; --accent hover
+   matches the rest of the mixer-tile palette. */
+.ref-control-upload {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--frame-line);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 80ms linear, border-color 80ms linear, background 80ms linear;
+}
+.ref-control-upload:hover:not(:disabled) {
+  color: var(--accent-hover);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.ref-control-upload:focus-visible {
+  outline: none;
+  border-color: var(--accent-line);
+  color: var(--accent-hover);
+}
+.ref-control-upload:disabled {
+  opacity: 0.5;
+  cursor: progress;
 }
 .ref-control-button {
   flex: 1 1 0;
