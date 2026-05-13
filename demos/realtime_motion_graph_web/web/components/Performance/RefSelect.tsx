@@ -27,6 +27,33 @@ interface Props {
   onSelect: (value: string) => void;
   disabled?: boolean;
   ariaLabel: string;
+  /** Optional sibling action button rendered next to the dropdown. Used
+   *  for the inline upload affordance so the modal that follows doesn't
+   *  occlude the dropdown list the user was just browsing. */
+  onUpload?: () => void;
+  /** Tooltip / aria-label for the upload button, kind-specific so screen
+   *  readers and the one-shot tooltip both get useful copy. */
+  uploadLabel?: string;
+}
+
+function UploadIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width={size}
+      height={size}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.4}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M8 10V2" />
+      <path d="M4.5 5.5L8 2l3.5 3.5" />
+      <path d="M2.5 10v3a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-3" />
+    </svg>
+  );
 }
 
 export function RefSelect({
@@ -37,6 +64,8 @@ export function RefSelect({
   onSelect,
   disabled,
   ariaLabel,
+  onUpload,
+  uploadLabel,
 }: Props) {
   const [open, setOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
@@ -93,6 +122,18 @@ export function RefSelect({
           <span className="ref-control-button-text">{displayed}</span>
           <span className="ref-control-button-caret" aria-hidden="true" />
         </button>
+        {onUpload && (
+          <button
+            type="button"
+            className="ref-control-upload"
+            onClick={onUpload}
+            disabled={disabled}
+            aria-label={uploadLabel ?? "Upload"}
+            title={uploadLabel ?? "Upload"}
+          >
+            <UploadIcon />
+          </button>
+        )}
         {open && (
           <div ref={menuRef} className="ref-control-menu" role="listbox">
             {pinned.map((o) => (

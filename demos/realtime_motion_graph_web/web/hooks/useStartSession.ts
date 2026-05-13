@@ -4,6 +4,7 @@ import { useCallback } from "react";
 
 import { AudioPlayer } from "@/engine/audio/AudioPlayer";
 import { listFixtures, loadFixtureAudio, pickDefaultFixture } from "@/engine/audio/loadFixture";
+import { resetKnobDelta } from "@/engine/midi/absoluteDelta";
 import { createNetworkMonitor } from "@/engine/networkMonitor";
 import { defaultWsUrl } from "@/engine/podUrl";
 import { RemoteBackend, SLICE_FLAG_DELTA } from "@/engine/protocol";
@@ -96,6 +97,11 @@ export function useStartSession() {
       prev.remote?.close();
     } catch {}
     reset();
+    // Clear the per-CC MIDI delta cache. Stale `lastValue` entries
+    // from the previous session would otherwise produce phantom
+    // deltas on the first knob wiggle of the new one — a long-
+    // reported "knobs go crazy on session start" complaint.
+    resetKnobDelta();
 
     setStatus("loading-fixture", "Loading track…");
 
