@@ -765,6 +765,8 @@ def _build_decoder_engine(
     workspace_gb: float,
     batch_max: int,
     env: dict,
+    batch_opt: int | None = None,
+    builder_optimization_level: int | None = None,
     force_rebuild: bool = False,
     checkpoint: str = "acestep-v15-turbo",
     decoder_precision: str = "fp16_mixed",
@@ -789,6 +791,10 @@ def _build_decoder_engine(
         variant=variant,
         onnx_precision=decoder_precision,
     )
+    if batch_opt is not None:
+        config.batch_opt = batch_opt
+    if builder_optimization_level is not None:
+        config.builder_optimization_level = builder_optimization_level
 
     name = config.engine_filename().replace(".engine", "")
     engine_dir = os.path.join(output_dir, name)
@@ -1014,12 +1020,27 @@ def main():
                              "(default: True, use --no-decoder-refit)")
     single.add_argument("--batch-max", type=int, default=8,
                         help="Max batch size for decoder (default: 8)")
+    single.add_argument("--batch-opt", type=int, default=None,
+                        help="Optimal batch size for decoder TRT profile "
+                             "(default: TRTBuildConfig default)")
+    single.add_argument("--builder-optimization-level", type=int, default=None,
+                        help="TensorRT builder optimization level, 0-5 "
+                             "(default: TRTBuildConfig default)")
     single.add_argument("--skip-vae", action="store_true",
                         help="Skip VAE engine build")
 
     args = parser.parse_args()
     if args.skip_onnx and args.force_onnx:
         parser.error("--skip-onnx and --force-onnx are mutually exclusive")
+    if args.batch_opt is not None and args.batch_opt < 1:
+        parser.error("--batch-opt must be >= 1")
+    if args.batch_opt is not None and args.batch_opt > args.batch_max:
+        parser.error("--batch-opt must be <= --batch-max")
+    if (
+        args.builder_optimization_level is not None
+        and not 0 <= args.builder_optimization_level <= 5
+    ):
+        parser.error("--builder-optimization-level must be between 0 and 5")
     if args.force_onnx:
         args.export_locally = True
 
@@ -1119,6 +1140,8 @@ def _run_all(args, project_root, onnx_dir, env):
                 refit=True,
                 workspace_gb=args.workspace_gb,
                 batch_max=args.batch_max,
+                batch_opt=args.batch_opt,
+                builder_optimization_level=args.builder_optimization_level,
                 env=env,
                 force_rebuild=args.force_rebuild,
                 checkpoint=args.checkpoint,
@@ -1227,6 +1250,8 @@ def _run_single(args, project_root, onnx_dir, env):
             refit=args.decoder_refit,
             workspace_gb=args.workspace_gb,
             batch_max=args.batch_max,
+            batch_opt=args.batch_opt,
+            builder_optimization_level=args.builder_optimization_level,
             env=env,
             force_rebuild=args.force_rebuild,
             checkpoint=args.checkpoint,
