@@ -18,6 +18,14 @@ export interface DecodedFixture {
   sampleRate: number;
 }
 
+export type StemSourceMode = "full" | "vocals" | "instruments";
+export type StemOverlayKind = "vocals" | "instruments";
+
+export interface DecodedStemAssets {
+  vocals: DecodedFixture;
+  instruments: DecodedFixture;
+}
+
 // Server-side latent pool size (1920 * 5 = 9600 samples = 0.2 s at
 // 48 kHz). backend.py and the sidecar precompute both align to this;
 // trimming the decoded fixture to the same boundary keeps the runtime

@@ -3913,6 +3913,87 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   max-width: 100%;
 }
 
+.stem-overlay-panel {
+  position: fixed;
+  bottom: max(calc(var(--hud-thickness) + 78px), env(safe-area-inset-bottom, 0px));
+  left: max(calc(var(--hud-thickness) + 24px), env(safe-area-inset-left, 0px));
+  z-index: 8;
+  width: min(300px, calc(100vw - 32px));
+  padding: 9px 10px 10px;
+  background: rgba(6, 6, 12, 0.78);
+  -webkit-backdrop-filter: blur(6px);
+          backdrop-filter: blur(6px);
+  border: 1px solid var(--frame-line);
+  border-radius: var(--radius-md);
+  box-shadow:
+    0 14px 36px rgba(0, 0, 0, 0.45),
+    0 0 calc(1px + var(--bloom-amount, 0) * 8px) var(--accent-glow);
+  font-family: var(--font-mono);
+}
+.stem-overlay-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.stem-overlay-title {
+  font-size: 9px;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-strong);
+}
+.stem-overlay-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+.stem-overlay-controls {
+  display: grid;
+  gap: 6px;
+}
+.stem-overlay-row {
+  display: grid;
+  grid-template-columns: 94px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+.stem-overlay-toggle {
+  appearance: none;
+  border: 1px solid var(--frame-line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 140ms, border-color 140ms, color 140ms;
+}
+.stem-overlay-toggle:hover:not(:disabled),
+.stem-overlay-toggle.active {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent-hover);
+}
+.stem-overlay-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.stem-overlay-volume {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.stem-overlay-volume:disabled {
+  opacity: 0.45;
+}
+
 /* ── Fan: scrollable column of track sleeves + pinned upload sleeve ──── */
 .audio-source-fan {
   position: fixed;

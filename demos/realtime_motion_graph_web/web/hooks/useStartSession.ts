@@ -9,6 +9,7 @@ import { defaultWsUrl } from "@/engine/podUrl";
 import { RemoteBackend, SLICE_FLAG_DELTA } from "@/engine/protocol";
 import { getApiKey } from "@/engine/rtmgConfig";
 import { getConfig } from "@/lib/config";
+import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { useLoraStore } from "@/store/useLoraStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
@@ -58,6 +59,8 @@ function buildConfig(fixtureName: string): SessionConfig {
   // latency, ~11.3/s vs 12.3/s throughput on a 32 GB card. The VRAM
   // headroom is what unlocks longer audio uploads (cap lives in
   // loadFixture.ts; depth=4 makes future bumps VRAM-safe).
+  const custom = useCustomTracksStore.getState();
+  const sourceMode = custom.resolveSourceMode(fixtureName);
   return {
     sde: cfg.sde,
     lora: cfg.lora,
@@ -80,6 +83,7 @@ function buildConfig(fixtureName: string): SessionConfig {
     // dropdown's stale value here would only re-introduce the
     // override-wins-over-sidecar regression.
     fixture_name: fixtureName,
+    ...(sourceMode ? { stem_source_mode: sourceMode } : {}),
   };
 }
 
@@ -132,6 +136,12 @@ export function useStartSession() {
 
     setStatus("connecting", "Connecting…");
     const config = buildConfig(fixtureName);
+    const sourceMode = useCustomTracksStore
+      .getState()
+      .resolveSourceMode(fixtureName);
+    if (sourceMode) {
+      useCustomTracksStore.getState().setStemStatus(fixtureName, "processing");
+    }
     const wsUrl = resolveWsUrl(useSessionStore.getState().wsUrl);
     const remote = new RemoteBackend(
       wsUrl,
@@ -163,6 +173,48 @@ export function useStartSession() {
     remote.addEventListener("lora_catalog", (e) => {
       const detail = (e as CustomEvent).detail;
       useLoraStore.getState().setCatalog(detail);
+    });
+
+    remote.addEventListener("stem_assets", (e) => {
+      const detail = (e as CustomEvent<{
+        fixture_name?: string;
+        sample_rate: number;
+        channels: number;
+        frames: number;
+        source_mode?: "full" | "vocals" | "instruments";
+        buffers: Record<"vocals" | "instruments", Float32Array>;
+      }>).detail;
+      const name = detail.fixture_name || usePerformanceStore.getState().fixture;
+      if (!name) return;
+      if (detail.source_mode) {
+        useCustomTracksStore.getState().setSourceMode(name, detail.source_mode);
+      }
+      useCustomTracksStore.getState().setStems(name, {
+        vocals: {
+          interleaved: detail.buffers.vocals,
+          channels: detail.channels,
+          frames: detail.frames,
+          sampleRate: detail.sample_rate,
+        },
+        instruments: {
+          interleaved: detail.buffers.instruments,
+          channels: detail.channels,
+          frames: detail.frames,
+          sampleRate: detail.sample_rate,
+        },
+      });
+    });
+
+    remote.addEventListener("stem_failed", (e) => {
+      const detail = (e as CustomEvent<{
+        fixture_name?: string;
+        error?: string;
+      }>).detail;
+      const name = detail.fixture_name || usePerformanceStore.getState().fixture;
+      if (!name) return;
+      useCustomTracksStore
+        .getState()
+        .setStemStatus(name, "failed", detail.error || "Stem extraction failed");
     });
 
     remote.addEventListener("close", (e) => {

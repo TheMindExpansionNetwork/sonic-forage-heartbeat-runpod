@@ -4,6 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import {
+  type StemSourceMode,
+} from "@/engine/audio/loadFixture";
+import {
   DEFAULT_TIME_SIGNATURE,
   TIME_SIGNATURE_LABELS,
   VALID_KEYSCALES,
@@ -44,6 +47,7 @@ export interface AlmostReadyDialogProps {
   onContinue: (opts: {
     keyOverride: string | null;
     timeSignatureOverride: TimeSignature | null;
+    sourceMode: StemSourceMode;
   }) => void;
   /** Only invoked when wasTrimmed is true; parent re-opens the file
    *  picker so the user can swap to a shorter source instead of
@@ -67,6 +71,7 @@ export function AlmostReadyDialog({
     VALID_KEYSCALES.includes(defaultKey) ? defaultKey : "C major",
   );
   const [timeSigMode, setTimeSigMode] = useState<TimeSigMode>("auto");
+  const [sourceMode, setSourceMode] = useState<StemSourceMode>("full");
   const [manualTimeSig, setManualTimeSig] = useState<TimeSignature>(
     isTimeSignature(defaultTimeSignature)
       ? defaultTimeSignature
@@ -94,12 +99,13 @@ export function AlmostReadyDialog({
           keyOverride: mode === "manual" ? manualKey : null,
           timeSignatureOverride:
             timeSigMode === "manual" ? manualTimeSig : null,
+          sourceMode,
         });
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [mode, manualKey, timeSigMode, manualTimeSig, onClose, onContinue]);
+  }, [mode, manualKey, timeSigMode, manualTimeSig, sourceMode, onClose, onContinue]);
 
   // Move keyboard focus to the primary button when the dialog mounts so
   // Enter / Space immediately fires Continue.
@@ -150,6 +156,59 @@ export function AlmostReadyDialog({
               upload to fit within this limit.
             </p>
           )}
+
+          <fieldset className="almost-ready-key-section">
+            <legend className="almost-ready-key-legend">Inference source</legend>
+
+            <label className="almost-ready-key-mode">
+              <input
+                type="radio"
+                name="source-mode"
+                value="full"
+                checked={sourceMode === "full"}
+                onChange={() => setSourceMode("full")}
+              />
+              <span>
+                <strong>Use full track</strong>
+                <span className="almost-ready-key-mode-hint">
+                  Feed the full upload to inference. Stems are still ripped
+                  automatically for realtime layers.
+                </span>
+              </span>
+            </label>
+
+            <label className="almost-ready-key-mode">
+              <input
+                type="radio"
+                name="source-mode"
+                value="vocals"
+                checked={sourceMode === "vocals"}
+                onChange={() => setSourceMode("vocals")}
+              />
+              <span>
+                <strong>Use vocals</strong>
+                <span className="almost-ready-key-mode-hint">
+                  Auto-rip stems, then feed only the vocal stem to inference.
+                </span>
+              </span>
+            </label>
+
+            <label className="almost-ready-key-mode">
+              <input
+                type="radio"
+                name="source-mode"
+                value="instruments"
+                checked={sourceMode === "instruments"}
+                onChange={() => setSourceMode("instruments")}
+              />
+              <span>
+                <strong>Use instruments</strong>
+                <span className="almost-ready-key-mode-hint">
+                  Auto-rip stems, then feed the instrumental bed to inference.
+                </span>
+              </span>
+            </label>
+          </fieldset>
 
           <fieldset className="almost-ready-key-section">
             <legend className="almost-ready-key-legend">Key</legend>
@@ -287,6 +346,7 @@ export function AlmostReadyDialog({
                 keyOverride: mode === "manual" ? manualKey : null,
                 timeSignatureOverride:
                   timeSigMode === "manual" ? manualTimeSig : null,
+                sourceMode,
               })
             }
           >

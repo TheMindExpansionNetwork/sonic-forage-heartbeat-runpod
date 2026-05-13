@@ -36,6 +36,9 @@ export interface SessionConfig {
   enabled_loras?: string[];
   prompt?: string;
   lora_strengths?: Record<string, number>;
+  /** For uploaded tracks, asks the server to model-rip stems and choose
+   *  which source should feed inference. Built-in fixtures omit this. */
+  stem_source_mode?: "full" | "vocals" | "instruments";
   // Allow extras — pyproject's config object is permissive.
   [k: string]: unknown;
 }
@@ -84,6 +87,22 @@ export interface SwapReadyMessage {
   time_signature?: string;
 }
 
+export interface StemAssetsMessage {
+  type: "stem_assets";
+  fixture_name: string;
+  sample_rate: number;
+  channels: number;
+  frames: number;
+  stems: ("vocals" | "instruments")[];
+  source_mode?: "full" | "vocals" | "instruments";
+}
+
+export interface StemFailedMessage {
+  type: "stem_failed";
+  fixture_name?: string;
+  error?: string;
+}
+
 export interface SwapFailedMessage {
   type: "swap_failed";
   error?: string;
@@ -97,6 +116,8 @@ export type ServerJsonMessage =
   | LoraCatalogMessage
   | SwapReadyMessage
   | SwapFailedMessage
+  | StemAssetsMessage
+  | StemFailedMessage
   | { type: string; [k: string]: unknown };
 
 /** Parsed binary slice from the server. */

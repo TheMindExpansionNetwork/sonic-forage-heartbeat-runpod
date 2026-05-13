@@ -13,6 +13,14 @@ import {
 } from "./lufs";
 
 type MirrorListener = () => void;
+type StemOverlayKind = "vocals" | "instruments";
+
+interface StemOverlayState {
+  buffer: AudioBuffer | null;
+  gain: GainNode | null;
+  source: AudioBufferSourceNode | null;
+  volume: number;
+}
 
 // –1 dBTP ceiling, expressed as linear amplitude (10 ** (-1/20)).
 const LUFS_PEAK_CEILING = 0.891;
@@ -81,6 +89,11 @@ export class AudioPlayer {
   private _spBuffer: Float32Array | null = null;
   private _spPosition = 0;
   private _recordDest: MediaStreamAudioDestinationNode | null = null;
+  private _masterOut: GainNode | null = null;
+  private _stemOverlays: Record<StemOverlayKind, StemOverlayState> = {
+    vocals: { buffer: null, gain: null, source: null, volume: 0 },
+    instruments: { buffer: null, gain: null, source: null, volume: 0 },
+  };
 
   // Loop + seek state. The worklet path owns its own copy of `loop` (set
   // via postMessage); these fields are the main-thread mirror so the SP
@@ -198,10 +211,14 @@ export class AudioPlayer {
       sp.onaudioprocess = (e: AudioProcessingEvent) => this._spProcess(e);
     }
 
+    this._masterOut = this.ctx.createGain();
+    this._masterOut.gain.value = 1.0;
+    this._masterOut.connect(this.ctx.destination);
+
     this._makeupGain = this.ctx.createGain();
     this._makeupGain.gain.value = 1.0;
     this.node.connect(this._makeupGain);
-    this._makeupGain.connect(this.ctx.destination);
+    this._makeupGain.connect(this._masterOut);
 
     this._measureSourceTarget();
     if (this._lufsEnabled) this._startMetering();
@@ -228,6 +245,7 @@ export class AudioPlayer {
    * swap (the seam-fade still hides the wrap).
    */
   swap(interleavedBuffer: Float32Array, channels?: number): void {
+    this.clearStemOverlays();
     this.channels = channels || this.channels;
     this.frameCount = interleavedBuffer.length / this.channels;
     this._mirror = interleavedBuffer.slice();
@@ -265,6 +283,49 @@ export class AudioPlayer {
     }
   }
 
+  setStemOverlay(
+    kind: StemOverlayKind,
+    interleaved: Float32Array,
+    channels: number,
+  ): void {
+    if (!this.ctx) return;
+    const state = this._stemOverlays[kind];
+    this._stopStemOverlay(kind);
+    state.buffer = this._audioBufferFromInterleaved(interleaved, channels);
+    if (!state.gain) {
+      state.gain = this.ctx.createGain();
+      state.gain.gain.value = state.volume;
+      state.gain.connect(this._masterOut ?? this.ctx.destination);
+    }
+    if (state.volume > 0) this._startStemOverlay(kind, this.positionSec);
+  }
+
+  clearStemOverlays(): void {
+    (Object.keys(this._stemOverlays) as StemOverlayKind[]).forEach((kind) => {
+      this._stopStemOverlay(kind);
+      this._stemOverlays[kind].buffer = null;
+    });
+  }
+
+  setStemOverlayVolume(kind: StemOverlayKind, volume: number): void {
+    const state = this._stemOverlays[kind];
+    state.volume = Math.max(0, Math.min(1.5, volume));
+    if (!this.ctx) return;
+    if (!state.gain) {
+      state.gain = this.ctx.createGain();
+      state.gain.gain.value = state.volume;
+      state.gain.connect(this._masterOut ?? this.ctx.destination);
+    }
+    const t = this.ctx.currentTime;
+    state.gain.gain.cancelScheduledValues(t);
+    state.gain.gain.setTargetAtTime(state.volume, t, 0.025);
+    if (state.volume > 0 && state.buffer && !state.source) {
+      this._startStemOverlay(kind, this.positionSec);
+    } else if (state.volume <= 0) {
+      this._stopStemOverlay(kind);
+    }
+  }
+
   /** Read-only view of the current buffer (for waveform rendering). */
   getMirror(): Float32Array | null {
     return this._mirror;
@@ -294,7 +355,7 @@ export class AudioPlayer {
       // reflect what the user hears with LUFS normalization applied.
       // Falls back to the raw node if init somehow ran without creating
       // the gain (defensive — current init() always does).
-      const tap = this._makeupGain ?? this.node;
+      const tap = this._masterOut ?? this._makeupGain ?? this.node;
       tap.connect(this._recordDest);
     }
     return this._recordDest.stream;
@@ -330,6 +391,9 @@ export class AudioPlayer {
   setLoop(enabled: boolean): void {
     this._loop = enabled;
     this._spEndSignaled = false;
+    for (const state of Object.values(this._stemOverlays)) {
+      if (state.source) state.source.loop = enabled;
+    }
     if (this._useWorklet && this.node) {
       (this.node as AudioWorkletNode).port.postMessage({
         type: "setLoop",
@@ -347,6 +411,10 @@ export class AudioPlayer {
     );
     this.positionSec = target / SAMPLE_RATE;
     this._spEndSignaled = false;
+    (Object.keys(this._stemOverlays) as StemOverlayKind[]).forEach((kind) => {
+      const state = this._stemOverlays[kind];
+      if (state.buffer && state.volume > 0) this._startStemOverlay(kind, this.positionSec);
+    });
     if (this._useWorklet && this.node) {
       (this.node as AudioWorkletNode).port.postMessage({
         type: "seek",
@@ -407,8 +475,12 @@ export class AudioPlayer {
 
   async close(): Promise<void> {
     this._stopMetering();
+    this.clearStemOverlays();
     try {
       this.node?.disconnect();
+    } catch {}
+    try {
+      this._masterOut?.disconnect();
     } catch {}
     this._recordDest = null;
     try {
@@ -417,6 +489,67 @@ export class AudioPlayer {
   }
 
   // ── internals ────────────────────────────────────────────────────────
+
+  private _audioBufferFromInterleaved(
+    interleaved: Float32Array,
+    channels: number,
+  ): AudioBuffer {
+    if (!this.ctx) {
+      throw new Error("Audio context is not initialized");
+    }
+    const frameCount = Math.floor(interleaved.length / channels);
+    const buffer = this.ctx.createBuffer(channels, frameCount, SAMPLE_RATE);
+    for (let c = 0; c < channels; c++) {
+      const dst = buffer.getChannelData(c);
+      for (let i = 0; i < frameCount; i++) {
+        dst[i] = interleaved[i * channels + c] ?? 0;
+      }
+    }
+    return buffer;
+  }
+
+  private _startStemOverlay(kind: StemOverlayKind, offsetSec: number): void {
+    if (!this.ctx) return;
+    const state = this._stemOverlays[kind];
+    const buffer = state.buffer;
+    if (!buffer) return;
+    this._stopStemOverlay(kind);
+    if (!state.gain) {
+      state.gain = this.ctx.createGain();
+      state.gain.gain.value = state.volume;
+      state.gain.connect(this._masterOut ?? this.ctx.destination);
+    }
+    const source = this.ctx.createBufferSource();
+    source.buffer = buffer;
+    source.loop = this._loop;
+    source.connect(state.gain);
+    source.onended = () => {
+      if (state.source === source) state.source = null;
+    };
+    const duration = Math.max(0.001, buffer.duration);
+    const offset = this._loop
+      ? ((offsetSec % duration) + duration) % duration
+      : Math.min(offsetSec, Math.max(0, duration - 0.001));
+    state.source = source;
+    try {
+      source.start(this.ctx.currentTime, offset);
+    } catch {
+      state.source = null;
+    }
+  }
+
+  private _stopStemOverlay(kind: StemOverlayKind): void {
+    const state = this._stemOverlays[kind];
+    if (!state.source) return;
+    try {
+      state.source.onended = null;
+      state.source.stop();
+    } catch {}
+    try {
+      state.source.disconnect();
+    } catch {}
+    state.source = null;
+  }
 
   private _startMetering(): void {
     if (this._meterIntervalId !== null) return;

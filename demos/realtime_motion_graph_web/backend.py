@@ -35,7 +35,7 @@ from acestep.engine.trt.profile_manager import TRTProfileManager
 from acestep.fixtures import (
     FixtureSidecar, KNOWN_FIXTURES, audio_fixture, fixture_sidecar,
 )
-from acestep.nodes.types import Audio, Latent
+from acestep.nodes.types import Audio, Curve, Latent
 from acestep.paths import (
     EngineNotBuiltError,
     available_dreamvae_decode_engine,
@@ -108,6 +108,7 @@ def _decode_audio_msg(audio_msg: bytes) -> torch.Tensor:
 
 
 _VALID_TIME_SIG_STRS = frozenset(str(s) for s in VALID_TIME_SIGNATURES)
+_VALID_STEM_SOURCE_MODES = {"full", "vocals", "instruments"}
 
 
 def _normalize_time_signature(value: object) -> str | None:
@@ -126,6 +127,232 @@ def _normalize_time_signature(value: object) -> str | None:
         s = value.strip()
         return s if s in _VALID_TIME_SIG_STRS else None
     return None
+
+
+def _normalize_stem_source_mode(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    mode = value.strip().lower()
+    return mode if mode in _VALID_STEM_SOURCE_MODES else None
+
+
+def _resolve_upload_stem_source_mode(
+    fixture_name: object,
+    requested_mode: str | None,
+) -> str | None:
+    """Auto-stem user uploads while keeping built-in fixtures cheap by default."""
+    if requested_mode is not None:
+        return requested_mode
+    if isinstance(fixture_name, str) and fixture_name in KNOWN_FIXTURES:
+        return None
+    return "full"
+
+
+def _fit_stem_waveform(wf: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Coerce decoded model output to the uploaded waveform's [C, N] shape."""
+    if wf.ndim == 3:
+        wf = wf[0]
+    if wf.ndim == 1:
+        wf = wf.unsqueeze(0)
+    wf = wf.detach().to(dtype=torch.float32, device=target.device)
+    if wf.shape[0] == 1 and target.shape[0] == 2:
+        wf = wf.repeat(2, 1)
+    elif wf.shape[0] > target.shape[0]:
+        wf = wf[:target.shape[0]]
+    elif wf.shape[0] < target.shape[0]:
+        wf = torch.cat(
+            [wf, wf[-1:].repeat(target.shape[0] - wf.shape[0], 1)],
+            dim=0,
+        )
+    if wf.shape[-1] > target.shape[-1]:
+        wf = wf[:, :target.shape[-1]]
+    elif wf.shape[-1] < target.shape[-1]:
+        wf = torch.nn.functional.pad(wf, (0, target.shape[-1] - wf.shape[-1]))
+    return torch.nan_to_num(wf)
+
+
+def _spectral_vocal_suppress(
+    mix: torch.Tensor,
+    vocal_guides: list[torch.Tensor],
+    *,
+    strength: float = 1.35,
+    max_mask: float = 0.985,
+    n_fft: int = 4096,
+    hop_length: int = 1024,
+) -> torch.Tensor:
+    """Build an instrumental bed by masking vocal-dominant bins in the mix."""
+    target_device = mix.device
+    mix_cpu = mix.detach().cpu().float()
+    guides = [_fit_stem_waveform(guide.detach().cpu(), mix_cpu) for guide in vocal_guides]
+    window = torch.hann_window(n_fft)
+    channels: list[torch.Tensor] = []
+    for ch in range(mix_cpu.shape[0]):
+        mix_stft = torch.stft(
+            mix_cpu[ch],
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            window=window,
+            return_complex=True,
+        )
+        mix_mag = mix_stft.abs()
+        guide_mag = torch.zeros_like(mix_mag)
+        for guide in guides:
+            guide_stft = torch.stft(
+                guide[ch],
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=n_fft,
+                window=window,
+                return_complex=True,
+            )
+            guide_mag = torch.maximum(guide_mag, guide_stft.abs())
+
+        active = guide_mag > torch.quantile(guide_mag.flatten(), 0.65)
+        if active.any():
+            ratios = mix_mag[active] / (guide_mag[active] + 1e-7)
+            scale = torch.quantile(ratios.clamp(0, 10), 0.45)
+        else:
+            scale = torch.tensor(1.0)
+
+        vocal_mask = ((scale * guide_mag) / (mix_mag + 1e-7)).clamp(0, max_mask)
+        keep = (1.0 - strength * vocal_mask).clamp(0.0, 1.0)
+        inst_stft = mix_stft * keep
+        channels.append(
+            torch.istft(
+                inst_stft,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=n_fft,
+                window=window,
+                length=mix_cpu.shape[-1],
+            )
+        )
+    return torch.stack(channels).clamp(-1.0, 1.0).to(target_device)
+
+
+def _ace_extract_track(
+    session: Session,
+    *,
+    source: PreparedSource,
+    waveform: torch.Tensor,
+    tags: str,
+    bpm: int,
+    duration: float,
+    key: str,
+    time_signature: str,
+    track_name: str,
+    steps: int,
+    seed: int,
+) -> torch.Tensor:
+    """Run ACE-Step extract through the active session backend.
+
+    Realtime usually runs the decoder through TensorRT, which means the
+    PyTorch decoder weights may be skipped. Route through Session.generate()
+    so extraction uses the selected checkpoint/backend instead of bypassing TRT.
+    """
+    handler = session.handler
+    dtype = handler.dtype
+
+    instruction = TASK_INSTRUCTIONS["extract"].format(
+        TRACK_NAME=track_name.upper(),
+    )
+    cond = session.encode_text(
+        tags=tags,
+        lyrics="",
+        duration=duration,
+        instruction=instruction,
+        refer_latent=source.latent,
+        bpm=bpm,
+        key=key,
+        time_signature=time_signature,
+    )
+    negative = session.null_conditioning(cond)
+    frames = int(source.latent.tensor.shape[1])
+    guidance = Curve(tensor=torch.full((frames,), 7.5, dtype=dtype))
+    model_module = type(handler.model).__module__
+    extract_steps = 20 if "turbo" in model_module else max(int(steps), 50)
+    latent = session.generate(
+        conditioning=cond,
+        negative=negative,
+        guidance_curve=guidance,
+        context_latent=source.latent,
+        seed=seed,
+        steps=extract_steps,
+        shift=1.0,
+        method="ode",
+        denoise=1.0,
+        dcw_enabled=False,
+    )
+
+    audio = session.decode(latent)
+    return _fit_stem_waveform(audio.waveform, waveform)
+
+
+def _extract_upload_stems(
+    session: Session,
+    *,
+    waveform: torch.Tensor,
+    source: PreparedSource,
+    tags: str,
+    bpm: int,
+    duration: float,
+    key: str,
+    time_signature: str,
+    steps: int,
+) -> dict[str, torch.Tensor]:
+    """Use one ACE vocal extract pass and derive the instrumental locally.
+
+    This deliberately stays on the already-loaded Session. Session.generate()
+    routes through the selected checkpoint/backend, whether the decoder/VAE are
+    eager, compiled, or TensorRT.
+    """
+    vocals = _ace_extract_track(
+        session,
+        source=source,
+        waveform=waveform,
+        tags=tags,
+        bpm=bpm,
+        duration=duration,
+        key=key,
+        time_signature=time_signature,
+        track_name="vocals",
+        steps=steps,
+        seed=1528,
+    )
+    instruments = _spectral_vocal_suppress(
+        waveform.float(),
+        [vocals],
+    )
+    return {
+        "vocals": vocals.contiguous(),
+        "instruments": instruments.contiguous(),
+    }
+
+
+def _send_stem_payload(
+    ws,
+    *,
+    fixture_name: str | None,
+    source_mode: str | None,
+    stems: dict[str, torch.Tensor],
+) -> None:
+    order = ["vocals", "instruments"]
+    first = stems[order[0]]
+    frames = int(first.shape[-1])
+    channels = int(first.shape[0])
+    ws.send(json.dumps({
+        "type": "stem_assets",
+        "fixture_name": fixture_name or "",
+        "sample_rate": SAMPLE_RATE,
+        "channels": channels,
+        "frames": frames,
+        "stems": order,
+        "source_mode": source_mode or "full",
+    }))
+    for name in order:
+        arr = stems[name].detach().cpu().numpy().T.astype(np.float16)
+        ws.send(arr.tobytes())
 
 
 def _resolve_bpm_key_source(
@@ -382,6 +609,10 @@ def handle_client(
     # key, source latent, conditioning). Absent / unknown name -> fully
     # live path; same behavior as before sidecars existed.
     fixture_name = config.get("fixture_name")
+    stem_source_mode = _resolve_upload_stem_source_mode(
+        fixture_name,
+        _normalize_stem_source_mode(config.get("stem_source_mode")),
+    )
 
     # LoRA selection.  ``enabled_loras`` is the new id-keyed protocol;
     # ``lora_paths`` / ``lora_path`` are interpreted as filesystem paths
@@ -588,6 +819,48 @@ def handle_client(
             checkpoint=checkpoint,
         )
     )
+    upload_stems: dict[str, torch.Tensor] | None = None
+    stem_error: str | None = None
+    if stem_source_mode is not None:
+        print(
+            f"[Server] Ripping upload stems via ACE extract "
+            f"(source_mode={stem_source_mode})..."
+        )
+        try:
+            upload_stems = _extract_upload_stems(
+                session,
+                waveform=waveform,
+                source=source,
+                tags=prompt,
+                bpm=detected_bpm,
+                duration=audio_duration_s,
+                key=detected_key,
+                time_signature=detected_time_signature,
+                steps=steps,
+            )
+            if stem_source_mode != "full":
+                selected_wf = upload_stems[stem_source_mode]
+                print(f"[Server] Preparing {stem_source_mode} stem as source...")
+                selected_audio = Audio(
+                    waveform=selected_wf, sample_rate=SAMPLE_RATE,
+                )
+                source = session.prepare_source(selected_audio)
+                waveform = selected_wf
+                audio_in = selected_audio
+        except Exception as exc:
+            stem_error = str(exc)
+            print(f"[Server] stem extraction failed: {exc}")
+            if stem_source_mode != "full":
+                try:
+                    ws.send(json.dumps({
+                        "type": "error",
+                        "code": "stem_extract_failed",
+                        "message": f"Stem extraction failed: {exc}",
+                    }))
+                except Exception:
+                    pass
+                ws.close(1011, "stem extraction failed")
+                return
 
     def _active_trigger_prefix() -> str:
         """Comma-separated activation tokens for every currently-ENABLED
@@ -757,6 +1030,19 @@ def handle_client(
         "time_signature": detected_time_signature,
     }))
     ws.send(src_np.astype(np.float16).tobytes())
+    if upload_stems is not None:
+        _send_stem_payload(
+            ws,
+            fixture_name=fixture_name,
+            source_mode=stem_source_mode,
+            stems=upload_stems,
+        )
+    elif stem_error is not None:
+        ws.send(json.dumps({
+            "type": "stem_failed",
+            "fixture_name": fixture_name or "",
+            "error": stem_error,
+        }))
     print(f"[Server] Sent initial buffer ({len(src_np) / SAMPLE_RATE:.1f}s)")
 
     # ---- Phase 2: Streaming ----
@@ -1498,6 +1784,11 @@ def handle_client(
                                     )
                                 )
                                 swap_pending["fixture_name"] = data.get("fixture_name")
+                                swap_pending["stem_source_mode"] = (
+                                    _normalize_stem_source_mode(
+                                        data.get("stem_source_mode")
+                                    )
+                                )
             except TimeoutError:
                 pass
             except ConnectionClosed:
@@ -1546,6 +1837,10 @@ def handle_client(
             requested_key = swap_pending.get("key")
             requested_time_sig = swap_pending.get("time_signature")
             new_fixture_name = swap_pending.get("fixture_name")
+            new_stem_source_mode = _resolve_upload_stem_source_mode(
+                new_fixture_name,
+                swap_pending.get("stem_source_mode"),
+            )
             if audio_msg is None:
                 return
             swap_pending["bytes"] = None
@@ -1553,6 +1848,7 @@ def handle_client(
             swap_pending["key"] = None
             swap_pending["time_signature"] = None
             swap_pending["fixture_name"] = None
+            swap_pending["stem_source_mode"] = None
         try:
             new_wf = _decode_audio_msg(audio_msg)
             # Cap at the same ceiling the initial upload used so swaps
@@ -1597,6 +1893,45 @@ def handle_client(
                     time_signature_override=requested_time_sig,
                 )
             )
+            new_upload_stems: dict[str, torch.Tensor] | None = None
+            new_stem_error: str | None = None
+            if new_stem_source_mode is not None:
+                print(
+                    f"[Server] swap: ripping upload stems via ACE extract "
+                    f"(source_mode={new_stem_source_mode})..."
+                )
+                try:
+                    new_upload_stems = _extract_upload_stems(
+                        session,
+                        waveform=new_wf,
+                        source=new_source,
+                        tags=tags,
+                        bpm=new_bpm,
+                        duration=new_audio_duration_s,
+                        key=new_key,
+                        time_signature=new_time_sig,
+                        steps=steps,
+                    )
+                    if new_stem_source_mode != "full":
+                        new_wf = new_upload_stems[new_stem_source_mode]
+                        new_audio_in = Audio(
+                            waveform=new_wf, sample_rate=SAMPLE_RATE,
+                        )
+                        print(
+                            f"[Server] swap: preparing "
+                            f"{new_stem_source_mode} stem as source..."
+                        )
+                        new_source = session.prepare_source(new_audio_in)
+                except Exception as exc:
+                    new_stem_error = str(exc)
+                    print(f"[Server] swap: stem extraction failed: {exc}")
+                    if new_stem_source_mode != "full":
+                        with send_lock:
+                            ws.send(json.dumps({
+                                "type": "swap_failed",
+                                "error": f"Stem extraction failed: {exc}",
+                            }))
+                        return
             # Use the active timbre reference if one is uploaded; otherwise
             # the new playback source's own latent. Override persists
             # across source swaps.
@@ -1683,6 +2018,19 @@ def handle_client(
                     "time_signature": new_time_sig,
                 }))
                 ws.send(new_src_np.astype(np.float16).tobytes())
+                if new_upload_stems is not None:
+                    _send_stem_payload(
+                        ws,
+                        fixture_name=new_fixture_name,
+                        source_mode=new_stem_source_mode,
+                        stems=new_upload_stems,
+                    )
+                elif new_stem_error is not None:
+                    ws.send(json.dumps({
+                        "type": "stem_failed",
+                        "fixture_name": new_fixture_name or "",
+                        "error": new_stem_error,
+                    }))
             print(f"[Server] Source swap complete ({len(new_src_np) / SAMPLE_RATE:.1f}s)")
         except ConnectionClosed:
             running[0] = False

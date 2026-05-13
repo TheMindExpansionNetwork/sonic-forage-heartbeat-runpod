@@ -7,6 +7,7 @@ import {
   listFixtures,
   pickDefaultFixture,
   type DecodedFixture,
+  type StemSourceMode,
 } from "@/engine/audio/loadFixture";
 import { togglePauseAndAudio } from "@/engine/audio/togglePauseAndAudio";
 import {
@@ -199,10 +200,11 @@ export function OperatorStrip() {
   function commitPending(
     keyOverride: string | null,
     timeSignatureOverride: TimeSignature | null,
+    sourceMode: StemSourceMode,
   ) {
     if (!pending) return;
     const { decoded, fileName, originalFile } = pending;
-    addCustomTrack(fileName, decoded, originalFile);
+    addCustomTrack(fileName, decoded, originalFile, sourceMode);
     const perf = usePerformanceStore.getState();
     if (keyOverride) {
       perf.setPendingKeyOverride(keyOverride);
@@ -538,8 +540,8 @@ export function OperatorStrip() {
           wasTrimmed={pending.wasTrimmed}
           defaultKey={activeKey}
           defaultTimeSignature={activeTimeSignature}
-          onContinue={({ keyOverride, timeSignatureOverride }) =>
-            commitPending(keyOverride, timeSignatureOverride)
+          onContinue={({ keyOverride, timeSignatureOverride, sourceMode }) =>
+            commitPending(keyOverride, timeSignatureOverride, sourceMode)
           }
           onPickAnother={() => {
             setPending(null);
