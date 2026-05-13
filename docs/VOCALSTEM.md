@@ -27,122 +27,34 @@ decoded, trimmed/profile-aligned, and prepared with `Session.prepare_source()`.
 For source swaps, the same extraction path runs inside `apply_swap_if_pending()`
 after the new uploaded waveform has been decoded and prepared.
 
-## Vocal Extraction
+## Stem Extraction
 
-Vocal extraction is performed with ACE-Step's native `extract` task through
-`_ace_extract_track()`.
+Stem extraction is performed with Mel-Band RoFormer through
+`_extract_upload_stems()`. The backend caches the RoFormer model separately from
+the active ACE-Step `Session`; it no longer uses ACE-Step's native `extract`
+task for uploaded-track separation.
 
-The backend builds one ACE extract instruction:
+The RoFormer checkpoint runs at 44.1 kHz, while the realtime backend and client
+protocol run at 48 kHz. The extraction path therefore:
 
-```text
-Extract the VOCALS track from the audio:
-```
+1. Takes the backend upload waveform as `[channels, frames]` at 48 kHz.
+2. Runs Mel-Band RoFormer separation, internally resampling to 44.1 kHz.
+3. Receives `vocals` and `instruments` from the separator.
+4. Resamples both stems back to 48 kHz.
+5. Normalizes each stem back to the upload shape with `_fit_stem_waveform()`,
+   which fixes batch/channel/length differences and replaces non-finite values.
 
-The text conditioning is built with `Session.encode_text()` and the actual
-generation goes through `Session.generate()`. This is intentional: the realtime
-backend often runs the decoder through TensorRT, so the PyTorch decoder weights
-may not be loaded. Routing through `Session.generate()` keeps stem extraction on
-the currently selected checkpoint and backend. For example, if the server is
-launched with the XL checkpoint, stem extraction uses that XL session instead of
-loading a separate base model.
-
-The important generation inputs are:
-
-- `refer_latent`: the raw VAE source latent from `PreparedSource.latent`, used
-  as the timbre reference while encoding conditioning.
-- `context_latent`: the same raw source latent. This is important: ACE extract
-  uses raw source latents as context. The semantic-hint cover path is for
-  cover-style regeneration and makes extract output quiet/incorrect here.
-- `chunk_mask`: omitted, which causes `Session.generate()` to build an all-ones
-  mask matching the context latent shape.
-- `guidance_curve`: a constant CFG curve at `7.5`.
-- `steps`: `20` for turbo checkpoints, and at least `50` for non-turbo
-  checkpoints.
-- `infer_method`: `ode`.
-- `shift`: `1.0`.
-- `dcw_enabled`: `False`, so the stem pass does not apply the realtime DCW
-  correction.
-
-The decoded output is normalized back to the upload waveform shape with
-`_fit_stem_waveform()`, which fixes batch/channel/length differences and
-replaces non-finite values.
-
-The backend extracts only `vocals`. That same stem is sent to the frontend as
-the vocal overlay and is also used as the guide for instrumental suppression.
-
-## Why Instrumentals Are Not ACE-Extracted Directly
-
-ACE-Step's native extract task supports named track classes such as:
-
-- `vocals`
-- `backing_vocals`
-- `drums`
-- `bass`
-- `guitar`
-- `keyboard`
-- `strings`
-- `percussion`
-- `synth`
-- `fx`
-- `brass`
-- `woodwinds`
-
-It does not expose an `instrumental` or "everything except vocals" class. Asking
-ACE to extract `INSTRUMENTAL` is out-of-distribution and can return a mix that
-still contains vocals.
-
-The backend also does not use simple time-domain subtraction:
+The model checkpoint defaults to `Kijai/MelBandRoFormer_comfy` /
+`MelBandRoformer_fp16.safetensors`. Operators can override it with:
 
 ```text
-instrumental = original - vocals
+MELBAND_ROFORMER_MODEL_PATH
+MELBAND_ROFORMER_MODEL_REPO
+MELBAND_ROFORMER_MODEL_FILE
 ```
 
-ACE's vocal output can sound perceptually correct, but it is a generated /
-reconstructed stem, not the exact phase-aligned vocal waveform that was summed
-into the original master. Direct subtraction therefore does not null the vocal
-cleanly and can leave obvious vocal leakage.
-
-## Instrumental Generation
-
-The instrumental bed is created by `_spectral_vocal_suppress()`.
-
-This function treats ACE's `vocals` output as a guide for where vocal content
-lives in the time-frequency domain. It keeps the original mix phase and
-attenuates vocal-dominant STFT bins instead of subtracting the generated vocal
-waveform.
-
-For each channel:
-
-1. Compute the complex STFT of the original uploaded mix.
-2. Compute STFT magnitudes for the vocal guide stems.
-3. Combine the guides by taking the per-bin maximum magnitude.
-4. Estimate a scale between the guide magnitude and the original mix magnitude
-   using active vocal bins.
-5. Build a vocal mask:
-
-   ```text
-   vocal_mask = scaled_guide_magnitude / original_mix_magnitude
-   ```
-
-6. Clamp the mask to avoid fully deleting bins (`max_mask = 0.985`).
-7. Convert the mask into a keep mask:
-
-   ```text
-   keep = clamp(1.0 - 1.35 * vocal_mask, 0.0, 1.0)
-   ```
-
-8. Apply the keep mask to the original complex STFT.
-9. Reconstruct the instrumental with inverse STFT.
-
-Current mask settings:
-
-- `n_fft = 4096`
-- `hop_length = 1024`
-- `strength = 1.35`
-- `max_mask = 0.985`
-
-This produces an instrumental that is still based on the original upload, but
-with vocal-dominant regions attenuated using ACE's extracted vocal estimates.
+The instrumental bed is the RoFormer instrumental output, not ACE-guided
+spectral suppression.
 
 ## Returned Stem Assets
 
@@ -180,11 +92,6 @@ with the original source.
 
 ## Known Limitations
 
-The instrumental stem is vocal-suppressed, not a perfect studio instrumental.
-It depends on how accurately ACE's vocal estimate identifies vocal energy.
-Strong vocal reverb, doubled vocals, backing vocals, or vocal-like synths can
-still leak or be over-suppressed.
-
-The implementation intentionally uses ACE-Step for vocal identification and a
-spectral suppression pass for the instrumental complement because ACE-Step does
-not provide a native all-non-vocal extract class.
+The instrumental stem is still model-separated, not a perfect studio
+instrumental. Strong vocal reverb, doubled vocals, backing vocals, or vocal-like
+synths can still leak or be over-suppressed.

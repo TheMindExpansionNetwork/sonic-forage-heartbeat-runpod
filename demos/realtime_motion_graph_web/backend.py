@@ -12,6 +12,7 @@ through :class:`.pipeline.PipelineRunner`, with:
 """
 
 import json
+import os
 import socket
 import struct
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torchaudio.functional as TAF
 import zstandard as zstd
 
 torch.set_grad_enabled(False)
@@ -35,7 +37,7 @@ from acestep.engine.trt.profile_manager import TRTProfileManager
 from acestep.fixtures import (
     FixtureSidecar, KNOWN_FIXTURES, audio_fixture, fixture_sidecar,
 )
-from acestep.nodes.types import Audio, Curve, Latent
+from acestep.nodes.types import Audio, Latent
 from acestep.paths import (
     EngineNotBuiltError,
     available_dreamvae_decode_engine,
@@ -58,6 +60,15 @@ from .protocol import (
     T,
 )
 from .pipeline import PipelineRunner
+
+from scripts.extract_stems_melbandreformer import (
+    DEFAULT_MODEL_FILE as MELBAND_DEFAULT_MODEL_FILE,
+    DEFAULT_MODEL_REPO as MELBAND_DEFAULT_MODEL_REPO,
+    SAMPLE_RATE as MELBAND_SAMPLE_RATE,
+    MelBandRoformer,
+    load_model as load_melband_model,
+    separate_stems as separate_melband_stems,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +120,9 @@ def _decode_audio_msg(audio_msg: bytes) -> torch.Tensor:
 
 _VALID_TIME_SIG_STRS = frozenset(str(s) for s in VALID_TIME_SIGNATURES)
 _VALID_STEM_SOURCE_MODES = {"full", "vocals", "instruments"}
+_MELBAND_MODEL_LOCK = threading.Lock()
+_MELBAND_INFER_LOCK = threading.Lock()
+_MELBAND_MODEL_CACHE: dict[tuple[str, str], MelBandRoformer] = {}
 
 
 def _normalize_time_signature(value: object) -> str | None:
@@ -171,158 +185,81 @@ def _fit_stem_waveform(wf: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(wf)
 
 
-def _spectral_vocal_suppress(
-    mix: torch.Tensor,
-    vocal_guides: list[torch.Tensor],
-    *,
-    strength: float = 1.35,
-    max_mask: float = 0.985,
-    n_fft: int = 4096,
-    hop_length: int = 1024,
-) -> torch.Tensor:
-    """Build an instrumental bed by masking vocal-dominant bins in the mix."""
-    target_device = mix.device
-    mix_cpu = mix.detach().cpu().float()
-    guides = [_fit_stem_waveform(guide.detach().cpu(), mix_cpu) for guide in vocal_guides]
-    window = torch.hann_window(n_fft)
-    channels: list[torch.Tensor] = []
-    for ch in range(mix_cpu.shape[0]):
-        mix_stft = torch.stft(
-            mix_cpu[ch],
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=n_fft,
-            window=window,
-            return_complex=True,
-        )
-        mix_mag = mix_stft.abs()
-        guide_mag = torch.zeros_like(mix_mag)
-        for guide in guides:
-            guide_stft = torch.stft(
-                guide[ch],
-                n_fft=n_fft,
-                hop_length=hop_length,
-                win_length=n_fft,
-                window=window,
-                return_complex=True,
-            )
-            guide_mag = torch.maximum(guide_mag, guide_stft.abs())
+def _resolve_melband_model_path() -> Path:
+    explicit_path = os.environ.get("MELBAND_ROFORMER_MODEL_PATH")
+    if explicit_path:
+        return Path(explicit_path).expanduser()
 
-        active = guide_mag > torch.quantile(guide_mag.flatten(), 0.65)
-        if active.any():
-            ratios = mix_mag[active] / (guide_mag[active] + 1e-7)
-            scale = torch.quantile(ratios.clamp(0, 10), 0.45)
-        else:
-            scale = torch.tensor(1.0)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "huggingface_hub is required to auto-download the Mel-Band "
+            "RoFormer checkpoint. Install it or set MELBAND_ROFORMER_MODEL_PATH."
+        ) from exc
 
-        vocal_mask = ((scale * guide_mag) / (mix_mag + 1e-7)).clamp(0, max_mask)
-        keep = (1.0 - strength * vocal_mask).clamp(0.0, 1.0)
-        inst_stft = mix_stft * keep
-        channels.append(
-            torch.istft(
-                inst_stft,
-                n_fft=n_fft,
-                hop_length=hop_length,
-                win_length=n_fft,
-                window=window,
-                length=mix_cpu.shape[-1],
-            )
-        )
-    return torch.stack(channels).clamp(-1.0, 1.0).to(target_device)
+    repo = os.environ.get("MELBAND_ROFORMER_MODEL_REPO", MELBAND_DEFAULT_MODEL_REPO)
+    filename = os.environ.get("MELBAND_ROFORMER_MODEL_FILE", MELBAND_DEFAULT_MODEL_FILE)
+    return Path(hf_hub_download(repo_id=repo, filename=filename))
 
 
-def _ace_extract_track(
-    session: Session,
-    *,
-    source: PreparedSource,
-    waveform: torch.Tensor,
-    tags: str,
-    bpm: int,
-    duration: float,
-    key: str,
-    time_signature: str,
-    track_name: str,
-    steps: int,
-    seed: int,
-) -> torch.Tensor:
-    """Run ACE-Step extract through the active session backend.
+def _get_melband_model(device: torch.device) -> MelBandRoformer:
+    model_path = _resolve_melband_model_path()
+    key = (str(model_path), str(device))
+    with _MELBAND_MODEL_LOCK:
+        cached = _MELBAND_MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
 
-    Realtime usually runs the decoder through TensorRT, which means the
-    PyTorch decoder weights may be skipped. Route through Session.generate()
-    so extraction uses the selected checkpoint/backend instead of bypassing TRT.
-    """
-    handler = session.handler
-    dtype = handler.dtype
+        print(f"[Server] Loading Mel-Band RoFormer model on {device}...")
+        t0 = time.time()
+        model = load_melband_model(model_path, device)
+        _MELBAND_MODEL_CACHE[key] = model
+        print(f"[Server] Mel-Band RoFormer loaded in {time.time() - t0:.1f}s")
+        return model
 
-    instruction = TASK_INSTRUCTIONS["extract"].format(
-        TRACK_NAME=track_name.upper(),
-    )
-    cond = session.encode_text(
-        tags=tags,
-        lyrics="",
-        duration=duration,
-        instruction=instruction,
-        refer_latent=source.latent,
-        bpm=bpm,
-        key=key,
-        time_signature=time_signature,
-    )
-    negative = session.null_conditioning(cond)
-    frames = int(source.latent.tensor.shape[1])
-    guidance = Curve(tensor=torch.full((frames,), 7.5, dtype=dtype))
-    model_module = type(handler.model).__module__
-    extract_steps = 20 if "turbo" in model_module else max(int(steps), 50)
-    latent = session.generate(
-        conditioning=cond,
-        negative=negative,
-        guidance_curve=guidance,
-        context_latent=source.latent,
-        seed=seed,
-        steps=extract_steps,
-        shift=1.0,
-        method="ode",
-        denoise=1.0,
-        dcw_enabled=False,
-    )
 
-    audio = session.decode(latent)
-    return _fit_stem_waveform(audio.waveform, waveform)
+def _resample_melband_stem_to_backend_rate(stem: torch.Tensor) -> torch.Tensor:
+    stem = stem.detach().cpu().float()
+    if MELBAND_SAMPLE_RATE == SAMPLE_RATE:
+        return stem
+    return TAF.resample(stem, orig_freq=MELBAND_SAMPLE_RATE, new_freq=SAMPLE_RATE)
 
 
 def _extract_upload_stems(
     session: Session,
     *,
     waveform: torch.Tensor,
-    source: PreparedSource,
-    tags: str,
-    bpm: int,
-    duration: float,
-    key: str,
-    time_signature: str,
-    steps: int,
 ) -> dict[str, torch.Tensor]:
-    """Use one ACE vocal extract pass and derive the instrumental locally.
+    """Use Mel-Band RoFormer for vocal and instrumental separation.
 
-    This deliberately stays on the already-loaded Session. Session.generate()
-    routes through the selected checkpoint/backend, whether the decoder/VAE are
-    eager, compiled, or TensorRT.
+    The realtime backend runs sources at 48 kHz, while the RoFormer checkpoint
+    is trained for 44.1 kHz. The separator handles the downsample internally;
+    we resample its returned stems back to the backend sample rate before
+    sending overlays or preparing a selected stem as the inference source.
     """
-    vocals = _ace_extract_track(
-        session,
-        source=source,
-        waveform=waveform,
-        tags=tags,
-        bpm=bpm,
-        duration=duration,
-        key=key,
-        time_signature=time_signature,
-        track_name="vocals",
-        steps=steps,
-        seed=1528,
+    device = torch.device(session.handler.device)
+    model = _get_melband_model(device)
+
+    t0 = time.time()
+    with _MELBAND_INFER_LOCK:
+        vocals_44k, instruments_44k = separate_melband_stems(
+            model,
+            waveform.detach().cpu().float().unsqueeze(0),
+            SAMPLE_RATE,
+            device,
+        )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    print(f"[Server] Mel-Band RoFormer stems complete in {time.time() - t0:.1f}s")
+
+    vocals = _fit_stem_waveform(
+        _resample_melband_stem_to_backend_rate(vocals_44k),
+        waveform,
     )
-    instruments = _spectral_vocal_suppress(
-        waveform.float(),
-        [vocals],
+    instruments = _fit_stem_waveform(
+        _resample_melband_stem_to_backend_rate(instruments_44k),
+        waveform,
     )
     return {
         "vocals": vocals.contiguous(),
@@ -823,20 +760,13 @@ def handle_client(
     stem_error: str | None = None
     if stem_source_mode is not None:
         print(
-            f"[Server] Ripping upload stems via ACE extract "
+            f"[Server] Ripping upload stems via Mel-Band RoFormer "
             f"(source_mode={stem_source_mode})..."
         )
         try:
             upload_stems = _extract_upload_stems(
                 session,
                 waveform=waveform,
-                source=source,
-                tags=prompt,
-                bpm=detected_bpm,
-                duration=audio_duration_s,
-                key=detected_key,
-                time_signature=detected_time_signature,
-                steps=steps,
             )
             if stem_source_mode != "full":
                 selected_wf = upload_stems[stem_source_mode]
@@ -1897,20 +1827,13 @@ def handle_client(
             new_stem_error: str | None = None
             if new_stem_source_mode is not None:
                 print(
-                    f"[Server] swap: ripping upload stems via ACE extract "
+                    f"[Server] swap: ripping upload stems via Mel-Band RoFormer "
                     f"(source_mode={new_stem_source_mode})..."
                 )
                 try:
                     new_upload_stems = _extract_upload_stems(
                         session,
                         waveform=new_wf,
-                        source=new_source,
-                        tags=tags,
-                        bpm=new_bpm,
-                        duration=new_audio_duration_s,
-                        key=new_key,
-                        time_signature=new_time_sig,
-                        steps=steps,
                     )
                     if new_stem_source_mode != "full":
                         new_wf = new_upload_stems[new_stem_source_mode]
