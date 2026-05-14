@@ -7,6 +7,11 @@ Directory layout under MODELS_DIR:
     checkpoints/          Model weights (acestep-v15-turbo, etc.)
     trt_engines/          TensorRT engines and ONNX exports
     loras/                LoRA .safetensors files (flat — id is filename stem)
+    fixtures/             Test fixtures (mirrored from the daydreamlive/
+                          demon-fixtures HF dataset) + their precomputed
+                          sidecars (.sidecar.json + .sidecar.safetensors)
+    user_uploads/         User-uploaded audio + their precomputed sidecars
+                          (same on-disk layout as fixtures/)
 
 Resolution order for MODELS_DIR:
     1. ACESTEP_MODELS_DIR environment variable
@@ -44,6 +49,36 @@ def loras_dir() -> Path:
     id is the filename stem. Subdirectories are not scanned.
     """
     return models_dir() / "loras"
+
+
+def fixtures_dir() -> Path:
+    """Directory containing test fixture WAVs + their precomputed sidecars.
+
+    Materialization target for ``acestep/fixtures.py:audio_fixture``: each
+    known fixture downloads from the ``daydreamlive/demon-fixtures`` HF
+    dataset into this directory the first time it's accessed, and stays
+    there for subsequent uses. The matching ``<name>.sidecar.json`` +
+    ``<name>.sidecar.safetensors`` pair lives alongside the WAV — either
+    downloaded from HF (when uploaded to the dataset) or written by
+    ``scripts/precompute_fixture_sidecars.py``.
+
+    Replaces the previous split storage (HF cache for WAVs, ``out/
+    fixture_sidecars`` for locally-precomputed sidecars).
+    """
+    return models_dir() / "fixtures"
+
+
+def user_uploads_dir() -> Path:
+    """Directory containing user-uploaded audio + their precomputed sidecars.
+
+    Mirrors ``fixtures_dir()``'s layout: audio files (any extension the
+    browser decoders accept — wav/mp3/flac/ogg/m4a) sit next to their
+    ``<name>.sidecar.json`` + ``<name>.sidecar.safetensors`` pair. The
+    rtmg backend writes the sidecar after the first session that needs
+    to ``prepare_source`` an upload, so subsequent sessions get the same
+    fast path test fixtures do.
+    """
+    return models_dir() / "user_uploads"
 
 
 def discover_loras(directory: Path | None = None) -> list[Path]:

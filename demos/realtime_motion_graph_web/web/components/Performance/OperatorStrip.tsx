@@ -6,9 +6,11 @@ import {
   decodeAudioFile,
   listFixtures,
   pickDefaultFixture,
+  uploadTrackToServer,
   type DecodedFixture,
 } from "@/engine/audio/loadFixture";
 import { togglePauseAndAudio } from "@/engine/audio/togglePauseAndAudio";
+import { useSeedUserUploads } from "@/hooks/useSeedUserUploads";
 import {
   applyConfig,
   captureRtmgConfig,
@@ -95,6 +97,7 @@ export function OperatorStrip() {
       })
       .catch(() => setFixtures([]));
   }, [setFixture, sessionWsUrl]);
+  useSeedUserUploads();
 
   // Push LUFS state to the live AudioPlayer. Re-runs whenever the user
   // toggles, and whenever a new player instance appears (session
@@ -173,20 +176,16 @@ export function OperatorStrip() {
     setUploading(true);
     setStatus(useSessionStore.getState().status, `Loading ${file.name}…`);
     try {
+      // Decode locally first so we can run the trim check + show the
+      // AlmostReadyDialog. The dialog is a gate — nothing server-side
+      // happens until the user clicks Continue.
       const { decoded, wasTrimmed } = await decodeAudioFile(file);
-      // De-collide names: appending an index when the same filename is
-      // uploaded twice keeps prior uploads selectable while letting the
-      // new one win the dropdown. The decoded buffer is what the pod
-      // actually consumes, so the displayed name is purely for the UI.
-      const baseName = file.name;
-      let chosen = baseName;
-      let i = 1;
-      while (useCustomTracksStore.getState().has(chosen)) {
-        chosen = `${baseName} (${i++})`;
-      }
-      // Defer addCustomTrack + setFixture to commitPending so cancelling
-      // leaves the previously playing track intact.
-      setPending({ decoded, fileName: chosen, wasTrimmed, originalFile: file });
+      setPending({
+        decoded,
+        fileName: file.name,
+        wasTrimmed,
+        originalFile: file,
+      });
       setStatus(useSessionStore.getState().status, "");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -196,24 +195,36 @@ export function OperatorStrip() {
     }
   }
 
-  function commitPending(
+  async function commitPending(
     keyOverride: string | null,
     timeSignatureOverride: TimeSignature | null,
   ) {
     if (!pending) return;
     const { decoded, fileName, originalFile } = pending;
-    addCustomTrack(fileName, decoded, originalFile);
-    const perf = usePerformanceStore.getState();
-    if (keyOverride) {
-      perf.setPendingKeyOverride(keyOverride);
-      perf.setKey(keyOverride);
-    }
-    if (timeSignatureOverride) {
-      perf.setPendingTimeSignatureOverride(timeSignatureOverride);
-      perf.setTimeSignature(timeSignatureOverride);
-    }
-    setFixture(fileName);
+    // Close the dialog immediately; status-bar progress carries the
+    // rest of the feedback while the 10-30s upload runs.
     setPending(null);
+    const { setStatus } = useSessionStore.getState();
+    try {
+      setStatus(useSessionStore.getState().status, `Encoding ${fileName}…`);
+      const upload = await uploadTrackToServer(originalFile);
+      const chosen = upload.name;
+      addCustomTrack(chosen, decoded, originalFile);
+      const perf = usePerformanceStore.getState();
+      if (keyOverride) {
+        perf.setPendingKeyOverride(keyOverride);
+        perf.setKey(keyOverride);
+      }
+      if (timeSignatureOverride) {
+        perf.setPendingTimeSignatureOverride(timeSignatureOverride);
+        perf.setTimeSignature(timeSignatureOverride);
+      }
+      setFixture(chosen);
+      setStatus(useSessionStore.getState().status, "");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(useSessionStore.getState().status, `Upload failed: ${msg}`);
+    }
   }
 
   // The pod's WS URL is allocated by the queue and not user-editable.

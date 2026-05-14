@@ -12,7 +12,9 @@ through :class:`.pipeline.PipelineRunner`, with:
 """
 
 import json
+import os
 import queue
+import re
 import socket
 import struct
 import sys
@@ -33,9 +35,7 @@ from acestep.audio.key_detection import detect_key
 from acestep.constants import TASK_INSTRUCTIONS, VALID_TIME_SIGNATURES
 from acestep.engine.session import PreparedSource, Session
 from acestep.engine.trt.profile_manager import TRTProfileManager
-from acestep.fixtures import (
-    FixtureSidecar, KNOWN_FIXTURES, audio_fixture, fixture_sidecar,
-)
+from acestep.audio_clips import audio_clip_sidecar, resolve_audio_clip
 from acestep.nodes.types import Audio, Latent
 from acestep.paths import (
     EngineNotBuiltError,
@@ -47,7 +47,15 @@ from acestep.paths import (
     max_profile_duration_s,
     smallest_fitting_profile_duration_s,
     trt_engine_path,
+    user_uploads_dir,
 )
+from acestep.sidecars import (
+    AudioSidecar,
+    POOL as SIDECAR_POOL,
+    save_sidecar,
+    truncate_to_pool,
+)
+from acestep.user_uploads import USER_UPLOAD_EXTS
 
 from .audio_engine import AudioEngine
 from .knobs import build_banks, CHANNEL_GROUPS, KEYSTONE_CHANNELS
@@ -68,18 +76,20 @@ from . import session_registry
 
 def _try_load_sidecar(
     fixture_name: str | None, *, checkpoint: str, samples: int,
-) -> FixtureSidecar | None:
-    """Look up a fixture sidecar; return None on miss / mismatch.
+) -> AudioSidecar | None:
+    """Look up a sidecar for ``fixture_name``; return None on miss / mismatch.
 
-    Length check guards against runtime truncation that disagrees with
-    what the sidecar was precomputed for (e.g. a smaller TRT profile
-    cap kicking in). The caller falls back to live computation in that
-    case so cached tensor shapes can't poison the streaming pipeline.
+    Spans both libraries (user uploads first, then test fixtures) via
+    ``audio_clip_sidecar``. Length check guards against runtime
+    truncation that disagrees with what the sidecar was precomputed for
+    (e.g. a smaller TRT profile cap kicking in). The caller falls back
+    to live computation in that case so cached tensor shapes can't
+    poison the streaming pipeline.
     """
     if not fixture_name:
         return None
     try:
-        sc = fixture_sidecar(fixture_name, checkpoint=checkpoint)
+        sc = audio_clip_sidecar(fixture_name, checkpoint=checkpoint)
     except Exception as e:
         print(f"[Server] sidecar lookup failed for {fixture_name!r}: {e}")
         return None
@@ -107,6 +117,40 @@ def _decode_audio_msg(audio_msg: bytes) -> torch.Tensor:
     ch, n = struct.unpack("<II", audio_msg[:8])
     arr = np.frombuffer(audio_msg[8:], dtype=np.float32).reshape(n, ch)
     return torch.from_numpy(arr.T.copy())[:2]
+
+
+def _truncate_to_profile(
+    waveform: torch.Tensor,
+    *,
+    max_seconds: float | None = None,
+) -> torch.Tensor:
+    """Cap the source waveform to the largest built TRT profile and align to POOL.
+
+    Two truncations applied in order:
+
+      1. Duration cap at :func:`max_profile_duration_s` so the source
+         fits *some* built engine; anything longer would fail at session
+         init regardless of which profile we pick. Operators stretch up
+         to that ceiling and the smallest-fitting profile gets picked
+         downstream by :func:`available_trt_engines`. The caller can
+         override the ceiling via ``max_seconds`` — used by the streaming
+         init path so the cap is the *active* checkpoint's largest
+         profile rather than the default checkpoint's.
+      2. Stereo cap + mod-:data:`SIDECAR_POOL` drop via
+         :func:`acestep.sidecars.truncate_to_pool` so the waveform is
+         the same shape any sidecar precomputed for this source would
+         describe.
+
+    Shared by the streaming init path (the live upload over WS) and the
+    upload-time sidecar precompute path (:func:`_handle_upload_track`).
+    Keeping the rule in one place is what lets ``_try_load_sidecar``'s
+    length check stay an exact-equality check instead of a fuzzy match.
+    """
+    if max_seconds is None:
+        max_seconds = max_profile_duration_s()
+    max_samples = int(max_seconds * SAMPLE_RATE)
+    waveform = waveform[:, :max_samples]
+    return truncate_to_pool(waveform)
 
 
 _VALID_TIME_SIG_STRS = frozenset(str(s) for s in VALID_TIME_SIGNATURES)
@@ -299,6 +343,355 @@ class VirtualMidiKnobs:
 
 
 # ---------------------------------------------------------------------------
+# Upload-time sidecar precompute
+# ---------------------------------------------------------------------------
+#
+# When a track is uploaded via the WS upload path (first message is
+# ``{"type":"upload_track",...}``), the server decodes + analyses +
+# encodes synchronously and writes the audio + sidecar before the
+# upload returns. From that point on every reader (session init, timbre
+# swap, structure override) hits the cached sidecar identically —
+# there's only one code path through the pipeline regardless of how
+# the audio landed on disk.
+#
+# The encode step uses a dedicated module-level eager Session rather
+# than the per-WS streaming Session, which is intentional:
+#   - The streaming Session's lifecycle is bound to one WS connection;
+#     uploads have to work before and between Play clicks, when no
+#     streaming Session is alive.
+#   - Eager backends mean the upload path doesn't require any built
+#     TRT engines (matches scripts/precompute_fixture_sidecars.py).
+#   - The cost is a second VAE/encoder resident in VRAM whenever any
+#     streaming Session is also alive. On a single-user local DEMON
+#     pod this is acceptable; if memory pressure becomes an issue,
+#     close the encoder Session between uploads (lose ~5-10s warmup
+#     per upload) or share the streaming Session's VAE via a refactor.
+# The lock serialises concurrent uploads — only one prepare_source
+# runs at a time (local DEMON is single-user; this is a backstop).
+
+
+_UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9_.\-() ]")
+
+_encoder_lock = threading.Lock()
+_encoder_session: Session | None = None
+_encoder_checkpoint: str | None = None
+
+
+def _encode_upload_and_save_sidecar(
+    session: Session,
+    *,
+    name: str,
+    waveform: torch.Tensor,
+    checkpoint: str,
+    bpm: int,
+    key: str,
+    time_signature: str,
+) -> None:
+    """Eager-VAE variant of :func:`acestep.sidecars.encode_and_save_sidecar`.
+
+    Why this exists instead of just calling
+    :func:`acestep.sidecars.encode_and_save_sidecar`:
+
+      * That function calls ``Session.prepare_source``, which calls
+        ``VAEEncodeAudio().execute``, which routes to TRT whenever any
+        VAE engine is present in the module-level
+        ``acestep.nodes.vae_nodes._trt_vae_cache`` — regardless of the
+        Session's ``vae_backend`` setting.
+      * The streaming WS handler populates that cache with TRT VAE
+        engines whose profile range is 5-60s. A 240s upload blows the
+        profile.
+      * Clearing the cache around the call would race the streaming
+        session's in-flight VAE decodes (the streaming handler's
+        ``self.vae`` is unset whenever TRT is the active backend, so a
+        cleared cache means the eager fallback NPEs).
+
+    Solution: skip ``VAEEncodeAudio`` entirely and call the encoder
+    handler's ``_encode_audio_to_latents`` directly — that goes through
+    the tiled eager VAE and handles arbitrary durations. ``SemanticExtract``
+    is fine to leave on the node path; it uses
+    ``handler._load_model_context("model")`` and never touches the VAE
+    TRT cache.
+    """
+    from acestep.nodes.semantic_nodes import SemanticExtract
+
+    handler = session.vae.handler
+    audio_b = waveform.unsqueeze(0) if waveform.dim() == 2 else waveform
+
+    t0 = time.time()
+    with handler._load_model_context("vae"):
+        latent_tensor = handler._encode_audio_to_latents(audio_b)
+    context_latent_obj = SemanticExtract().execute(
+        model=session.model, latent=Latent(tensor=latent_tensor),
+    )["latent"]
+    elapsed = time.time() - t0
+
+    samples = int(waveform.shape[1])
+    channels = int(waveform.shape[0])
+    duration_s = samples / SAMPLE_RATE
+    save_sidecar(
+        user_uploads_dir(),
+        name,
+        latent=latent_tensor,
+        context_latent=context_latent_obj.tensor,
+        checkpoint=checkpoint,
+        bpm=bpm,
+        key=key,
+        time_signature=time_signature,
+        duration_s=duration_s,
+        samples=samples,
+        sample_rate=SAMPLE_RATE,
+        channels=channels,
+    )
+    print(
+        f"[Server] upload_track: prepare_source + save_sidecar "
+        f"{elapsed:.2f}s ({duration_s:.1f}s / {samples} samples / {channels}ch)"
+    )
+
+
+def _get_encoder_session(checkpoint: str) -> Session:
+    """Lazy-load and cache the eager Session used for upload-time precomputes.
+
+    See the module-level comment for why this is a separate Session
+    from the streaming one. Re-creates if the checkpoint changed
+    between calls (shouldn't happen in normal operation — the server's
+    --checkpoint is fixed at startup — but the check keeps the cached
+    session honest if a caller ever passes a different one).
+    """
+    global _encoder_session, _encoder_checkpoint
+    with _encoder_lock:
+        if _encoder_session is not None and _encoder_checkpoint == checkpoint:
+            return _encoder_session
+        if _encoder_session is not None:
+            try:
+                _encoder_session.close()
+            except Exception:
+                pass
+            _encoder_session = None
+        print(f"[Server] Loading encoder session (eager, ckpt={checkpoint})...")
+        t0 = time.time()
+        _encoder_session = Session(
+            project_root=str(checkpoints_dir()),
+            config_path=checkpoint,
+            decoder_backend="eager",
+            vae_backend="eager",
+        )
+        _encoder_checkpoint = checkpoint
+        print(f"  Encoder session loaded in {time.time() - t0:.1f}s")
+        return _encoder_session
+
+
+def _sanitize_upload_name(raw: str) -> str:
+    """Validate + strip a client-supplied filename to a safe upload name.
+
+    Returns a basename with a recognised audio extension. Raises
+    :class:`ValueError` on a blank / `.`-only / extension-mismatched
+    input so the caller can reply ``upload_failed`` with the message.
+    """
+    base = os.path.basename(str(raw or "")).strip()
+    base = _UPLOAD_NAME_RE.sub("_", base)
+    if not base or base in (".", ".."):
+        raise ValueError(f"invalid upload filename: {raw!r}")
+    ext = Path(base).suffix.lower()
+    if ext not in USER_UPLOAD_EXTS:
+        raise ValueError(
+            f"upload extension {ext!r} not supported "
+            f"(want one of {sorted(USER_UPLOAD_EXTS)})"
+        )
+    return base
+
+
+def _unique_upload_path(name: str) -> Path:
+    """Resolve ``name`` to a free path inside ``user_uploads_dir()``.
+
+    Appends `` (1)`` / `` (2)`` etc. before the extension so a second
+    upload of ``track.mp3`` lands as ``track (1).mp3`` instead of
+    overwriting the first.
+    """
+    d = user_uploads_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    candidate = d / name
+    if not candidate.exists():
+        return candidate
+    stem = Path(name).stem
+    ext = Path(name).suffix
+    i = 1
+    while True:
+        c = d / f"{stem} ({i}){ext}"
+        if not c.exists():
+            return c
+        i += 1
+
+
+def _decode_upload_file(path: Path) -> torch.Tensor:
+    """Decode an upload from disk and apply the same truncation the streaming path uses.
+
+    Returns the post-truncation stereo waveform at :data:`SAMPLE_RATE`.
+    Non-48k sources (the common case — most MP3s are 44.1k) are
+    resampled here via librosa so the sidecar's tensors match what the
+    client's Web Audio decode produces at session init. Drift between
+    the two resamplers is bounded well below the mod-:data:`SIDECAR_POOL`
+    alignment in :func:`_truncate_to_profile`, so the upload-time
+    sidecar still satisfies the length-match check on subsequent reads.
+
+    Disk-backed (not BytesIO) because libsndfile's format detection
+    keys off the filename extension for some codecs (notably MP3):
+    handing it a raw stream with no extension hint causes it to
+    mis-read the header.
+    """
+    import soundfile as sf  # local: only needed on the upload path
+
+    audio_data, sr = sf.read(str(path), always_2d=True, dtype="float32")
+    # sf.read with always_2d returns [samples, channels]; the rest of
+    # the pipeline wants [channels, samples].
+    pcm = np.ascontiguousarray(audio_data.T)
+    if sr != SAMPLE_RATE:
+        import librosa  # local: only needed on the upload path
+        print(f"[Server] upload_track: resampling {sr} -> {SAMPLE_RATE}")
+        pcm = librosa.resample(pcm, orig_sr=sr, target_sr=SAMPLE_RATE)
+    waveform = _truncate_to_profile(torch.from_numpy(pcm.copy()))
+    if waveform.shape[-1] < SIDECAR_POOL:
+        raise ValueError("audio too short after pool alignment")
+    return waveform
+
+
+def _analyze_upload(waveform: torch.Tensor) -> tuple[int, str, str]:
+    """Run BPM + key detection on a stereo waveform.
+
+    Returns ``(bpm, key, time_signature)``. ``time_signature`` is
+    always ``"4"`` for now (no automated detector); the operator can
+    edit the sidecar JSON to override.
+    """
+    import librosa  # local: only needed on the upload path
+
+    mono_np = waveform.mean(dim=0).numpy()
+    bpm_raw, _ = librosa.beat.beat_track(y=mono_np, sr=SAMPLE_RATE)
+    bpm = int(round(float(np.asarray(bpm_raw).flat[0])))
+    key = detect_key(mono_np, SAMPLE_RATE)
+    return bpm, key, "4"
+
+
+def _handle_upload_track(ws, header: dict, *, checkpoint: str) -> None:
+    """Receive a single upload, decode + encode + write, reply, close.
+
+    Wire format (matches the streaming init handshake's binary frame):
+        client -> {"type":"upload_track","name":"track.mp3"}
+        client -> raw encoded audio bytes (mp3 / wav / flac / ogg / m4a)
+        server -> {"type":"upload_ok","name":"...","bpm":...,"key":"...",
+                   "time_signature":"4","duration_s":..,"samples":..}
+        OR
+        server -> {"type":"upload_failed","error":"..."}
+
+    Pipeline:
+      1. Read the encoded body off the WS.
+      2. Validate the requested name + extension.
+      3. Reserve a unique upload path, write the encoded bytes.
+      4. Decode from disk + pre-truncate to a sidecar-shaped waveform.
+      5. BPM + key analysis.
+      6. ``Session.prepare_source`` + write the sidecar atomically.
+      7. Reply ``upload_ok``.
+
+    On any failure after step 3 the encoded file is unlinked so a
+    half-finished upload doesn't show up in :func:`enumerate_user_uploads`.
+    Decode is intentionally disk-backed (not in-memory BytesIO) because
+    libsndfile relies on filename-extension hints for some codec
+    headers — see :func:`_decode_upload_file`.
+    """
+    print(f"[Server] upload_track: header={header}")
+    requested_name = header.get("name") or "upload"
+
+    try:
+        audio_msg = ws.recv()
+    except ConnectionClosed:
+        return
+    if isinstance(audio_msg, str):
+        _send_upload_failure(ws, "expected binary audio frame after header")
+        return
+
+    try:
+        sanitized_name = _sanitize_upload_name(requested_name)
+    except ValueError as e:
+        _send_upload_failure(ws, str(e))
+        return
+
+    final_path = _unique_upload_path(sanitized_name)
+    try:
+        final_path.write_bytes(audio_msg)
+    except OSError as e:
+        _send_upload_failure(ws, f"write failed: {e}")
+        return
+
+    final_name = final_path.name
+
+    try:
+        waveform = _decode_upload_file(final_path)
+    except Exception as e:
+        final_path.unlink(missing_ok=True)
+        _send_upload_failure(ws, f"decode failed: {e}")
+        return
+
+    try:
+        bpm, key, time_signature = _analyze_upload(waveform)
+    except Exception as e:
+        final_path.unlink(missing_ok=True)
+        _send_upload_failure(ws, f"analysis failed: {e}")
+        return
+
+    samples = int(waveform.shape[1])
+    duration_s = samples / SAMPLE_RATE
+    channels = int(waveform.shape[0])
+
+    # Run prepare_source + sidecar write. A failure here unlinks the
+    # encoded file too, matching the contract that a failed upload
+    # doesn't leak state.
+    try:
+        print(
+            f"[Server] upload_track: prepare_source + sidecar "
+            f"({duration_s:.1f}s, {channels}ch)..."
+        )
+        _encode_upload_and_save_sidecar(
+            _get_encoder_session(checkpoint),
+            name=final_name,
+            waveform=waveform,
+            checkpoint=checkpoint,
+            bpm=bpm,
+            key=key,
+            time_signature=time_signature,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        final_path.unlink(missing_ok=True)
+        _send_upload_failure(ws, f"sidecar precompute failed: {e}")
+        return
+
+    try:
+        ws.send(json.dumps({
+            "type": "upload_ok",
+            "name": final_name,
+            "bpm": bpm,
+            "key": key,
+            "time_signature": time_signature,
+            "duration_s": duration_s,
+            "samples": samples,
+        }))
+    except ConnectionClosed:
+        pass
+    print(
+        f"[Server] upload_track: ready name={final_name!r} "
+        f"bpm={bpm} key={key!r} duration={duration_s:.1f}s"
+    )
+
+
+def _send_upload_failure(ws, error: str) -> None:
+    """Best-effort failure reply on the upload WS path."""
+    print(f"[Server] upload_track failed: {error}")
+    try:
+        ws.send(json.dumps({"type": "upload_failed", "error": error}))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # WebSocket handler
 # ---------------------------------------------------------------------------
 
@@ -331,8 +724,28 @@ def handle_client(
     config = json.loads(ws.recv())
     print(f"[Server] Config: {config}")
 
+    # Upload mode: a single-shot precompute flow that shares the
+    # WebSocket plumbing (no separate HTTP route — the websockets sync
+    # server's process_request hook can't read POST bodies, so all
+    # client->server bytes flow through here). When the client opens a
+    # WS solely to upload a track, the first message carries
+    # ``type=="upload_track"`` and we run the full sidecar precompute
+    # synchronously before closing. By the time the WS resolves, the
+    # uploaded track is stored alongside the test fixtures and every
+    # subsequent reader (session init, timbre swap, structure override)
+    # hits the same sidecar fast path — no special-cased "upload"
+    # branch downstream.
+    if isinstance(config, dict) and config.get("type") == "upload_track":
+        try:
+            _handle_upload_track(ws, config, checkpoint=checkpoint)
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        return
+
     audio_bytes = ws.recv()
-    waveform = _decode_audio_msg(audio_bytes)
     use_trt = decoder_backend == "tensorrt" or vae_backend == "tensorrt"
     trt_profile_checkpoint = checkpoint if decoder_backend == "tensorrt" else "acestep-v15-turbo"
 
@@ -358,11 +771,7 @@ def handle_client(
             return
     else:
         max_seconds = max_profile_duration_s()
-    waveform = waveform[:, :int(max_seconds * SAMPLE_RATE)]
-    pool = 1920 * 5
-    rem = waveform.shape[-1] % pool
-    if rem:
-        waveform = waveform[:, :waveform.shape[-1] - rem]
+    waveform = _truncate_to_profile(_decode_audio_msg(audio_bytes), max_seconds=max_seconds)
     print(f"[Server] Audio: {waveform.shape[1] / SAMPLE_RATE:.1f}s, {waveform.shape[0]}ch")
 
     use_sde = config.get("sde", False)
@@ -910,23 +1319,25 @@ def handle_client(
             r.mark_hint_dirty()
 
     def _load_fixture_waveform(name: str) -> torch.Tensor:
-        """Read a known fixture WAV from the local HF cache into a
+        """Read a fixture / user-upload WAV from the local pod disk into a
         ``[≤2, N]`` float32 tensor. Used by the ``set_*_fixture`` fast
         path so a Library pick doesn't have to round-trip through the
         browser as decoded PCM (the file already lives on this pod's
-        disk; ``audio_fixture`` resolves to the cache hit). Caller is
-        responsible for any further truncation / pool alignment."""
-        if name not in KNOWN_FIXTURES:
-            raise ValueError(f"unknown fixture: {name}")
+        disk). Resolves user uploads first, then test fixtures, via
+        ``resolve_audio_clip``. Caller is responsible for any further
+        truncation / pool alignment."""
         # Lazy import: the byte-upload path doesn't pull soundfile, and
         # we don't want a hard import-time dep just for this fast path.
         import soundfile as sf
 
-        path = audio_fixture(name)
+        try:
+            path = resolve_audio_clip(name)
+        except KeyError as e:
+            raise ValueError(f"unknown audio clip: {name}") from e
         audio_data, sr = sf.read(str(path), always_2d=True)
         if sr != SAMPLE_RATE:
             raise ValueError(
-                f"fixture {name!r} sample rate {sr}, expected {SAMPLE_RATE}",
+                f"clip {name!r} sample rate {sr}, expected {SAMPLE_RATE}",
             )
         return torch.from_numpy(audio_data.T.copy()).float()[:2]
 
@@ -947,10 +1358,10 @@ def handle_client(
         try:
             cap = int(duration_ref[0] * SAMPLE_RATE)
             t_wf = t_wf[:, :cap]
-            rem = t_wf.shape[-1] % pool
+            rem = t_wf.shape[-1] % SIDECAR_POOL
             if rem:
                 t_wf = t_wf[:, :t_wf.shape[-1] - rem]
-            if t_wf.shape[-1] < pool:
+            if t_wf.shape[-1] < SIDECAR_POOL:
                 raise ValueError("timbre clip too short")
             clip_s = t_wf.shape[-1] / SAMPLE_RATE
             sc = _try_load_sidecar(
@@ -1583,14 +1994,12 @@ def handle_client(
             swap_pending["time_signature"] = None
             swap_pending["fixture_name"] = None
         try:
-            new_wf = _decode_audio_msg(audio_msg)
             # Cap at the same ceiling the initial upload used so swaps
             # take advantage of every built engine profile, not a stale
             # 60 s default.
-            new_wf = new_wf[:, :int(max_seconds * SAMPLE_RATE)]
-            rem = new_wf.shape[-1] % pool
-            if rem:
-                new_wf = new_wf[:, :new_wf.shape[-1] - rem]
+            new_wf = _truncate_to_profile(
+                _decode_audio_msg(audio_msg), max_seconds=max_seconds
+            )
             new_audio_duration_s = new_wf.shape[1] / SAMPLE_RATE
             print(
                 f"[Server] Swapping source ({new_audio_duration_s:.1f}s, "

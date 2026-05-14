@@ -8,8 +8,9 @@
 // existing Play / fixture-swap paths work unchanged when the active
 // fixture is an upload.
 
-import { podHttp } from "@/engine/podUrl";
+import { defaultWsUrl, podHttp } from "@/engine/podUrl";
 import { SAMPLE_RATE } from "@/engine/protocol";
+import { getApiKey } from "@/engine/rtmgConfig";
 
 export interface DecodedFixture {
   interleaved: Float32Array;
@@ -99,20 +100,49 @@ async function decodeArrayBuffer(bytes: ArrayBuffer): Promise<DecodedFixture> {
   return { interleaved, channels, frames, sampleRate: sr };
 }
 
-export async function loadFixtureAudio(name: string): Promise<DecodedFixture> {
-  // Custom uploads short-circuit the pod fetch — they live in memory only.
-  // Imported lazily to avoid a Zustand cycle at module load.
-  const { useCustomTracksStore } = await import("@/store/useCustomTracksStore");
-  const cached = useCustomTracksStore.getState().decoded.get(name);
-  if (cached) return cached;
-
-  const url = podHttp(`/fixtures/${encodeURIComponent(name)}`);
+async function fetchAndDecode(url: string): Promise<DecodedFixture> {
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`Fixture fetch failed: ${res.status} ${res.statusText}`);
   }
   const bytes = await res.arrayBuffer();
   return decodeArrayBuffer(bytes);
+}
+
+/** Fetch and decode, but treat a 404 as a miss (returns null) so the
+ *  caller can try the next library. Any other non-2xx is a real error
+ *  and propagates. Mirrors the server-side fallthrough in
+ *  ``acestep.audio_clips.resolve_audio_clip``. */
+async function fetchAndDecodeOptional(
+  url: string,
+): Promise<DecodedFixture | null> {
+  const res = await fetch(url);
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw new Error(`Fixture fetch failed: ${res.status} ${res.statusText}`);
+  }
+  const bytes = await res.arrayBuffer();
+  return decodeArrayBuffer(bytes);
+}
+
+export async function loadFixtureAudio(name: string): Promise<DecodedFixture> {
+  // Resolution order, mirroring the backend's resolve_audio_clip():
+  //   1. in-memory custom-tracks store (just-uploaded eager decode)
+  //   2. /user_uploads/<name> (persisted upload on the pod's disk)
+  //   3. /fixtures/<name> (test fixture from the HF dataset)
+  // We don't gate the /user_uploads attempt on listUserUploads() —
+  // that would force every swap to wait for an extra HTTP roundtrip
+  // when the catalog of names is already known to the server. Instead,
+  // we try /user_uploads first and let a 404 fall through to /fixtures.
+  // Lazy import to avoid a Zustand cycle at module load.
+  const { useCustomTracksStore } = await import("@/store/useCustomTracksStore");
+  const cached = useCustomTracksStore.getState().decoded.get(name);
+  if (cached) return cached;
+
+  const encoded = encodeURIComponent(name);
+  const fromUpload = await fetchAndDecodeOptional(podHttp(`/user_uploads/${encoded}`));
+  if (fromUpload) return fromUpload;
+  return fetchAndDecode(podHttp(`/fixtures/${encoded}`));
 }
 
 // Cap user-supplied audio at DEMON's largest TRT engine profile
@@ -170,6 +200,139 @@ export async function listFixtures(): Promise<string[]> {
   if (!res.ok) throw new Error(`Fixture list failed: ${res.status}`);
   const json = (await res.json()) as string[];
   return json;
+}
+
+/** Fetch the pod's list of persisted user uploads. Same shape as
+ *  listFixtures so the picker can merge both lists into one. */
+export async function listUserUploads(): Promise<string[]> {
+  const res = await fetch(podHttp("/api/user_uploads"));
+  if (!res.ok) throw new Error(`User-upload list failed: ${res.status}`);
+  const json = (await res.json()) as string[];
+  return json;
+}
+
+export interface UploadTrackResult {
+  /** Server-canonical name (may differ from file.name after sanitisation
+   *  or collision-suffixing). Use this as fixture_name for subsequent
+   *  WS session inits — the server's sidecar lookup matches by exactly
+   *  this string. */
+  name: string;
+  bpm: number;
+  key: string;
+  timeSignature: string;
+  durationS: number;
+  samples: number;
+}
+
+/**
+ * Upload a track to the pod and run the sidecar precompute synchronously.
+ *
+ * Wire format (matches backend.py:_handle_upload_track):
+ *   client -> {"type":"upload_track","name":"<filename>"}
+ *   client -> raw encoded audio bytes (mp3/wav/flac/ogg/m4a)
+ *   server -> {"type":"upload_ok",...} (or "upload_failed")
+ *
+ * Uses a dedicated WebSocket (not the streaming session's) so uploads
+ * work before / between Play clicks. Server runs Session.prepare_source
+ * + BPM + key detection on its eager encoder Session and writes the
+ * sidecar before returning. From that point on, any session that opens
+ * with this name as fixture_name hits the sidecar fast path
+ * identically to test fixtures.
+ */
+/** Mirror of useStartSession.ts:resolveWsUrl so uploads share the
+ *  streaming session's URL when one has been issued by queue admit.
+ *  Pre-Play (no session yet), defaultWsUrl is the right thing for
+ *  DEMON local; daydream-public's fork handles queue admit. */
+async function resolveUploadWsUrl(): Promise<string> {
+  let url = defaultWsUrl();
+  // Lazy import to avoid pulling Zustand into the module graph of the
+  // RemoteBackend → loadFixture.ts → useSessionStore triangle.
+  const { useSessionStore } = await import("@/store/useSessionStore");
+  const serverUrl = useSessionStore.getState().wsUrl;
+  if (serverUrl) url = serverUrl;
+  const apiKey = getApiKey();
+  if (apiKey) {
+    const sep = url.includes("?") ? "&" : "?";
+    url = `${url}${sep}apiKey=${encodeURIComponent(apiKey)}`;
+  }
+  return url;
+}
+
+export async function uploadTrackToServer(
+  file: File,
+): Promise<UploadTrackResult> {
+  const wsUrl = await resolveUploadWsUrl();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws.close();
+      } catch {}
+      fn();
+    };
+
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({ type: "upload_track", name: file.name }));
+        // Read the encoded file bytes and forward as one binary frame.
+        // The server's max_size (100 MiB) is sized for the streaming
+        // PCM path; any browser-decodable encoded file fits well under
+        // that ceiling.
+        file.arrayBuffer().then(
+          (buf) => {
+            try {
+              ws.send(buf);
+            } catch (e) {
+              finish(() => reject(e instanceof Error ? e : new Error(String(e))));
+            }
+          },
+          (e) => finish(() => reject(e instanceof Error ? e : new Error(String(e)))),
+        );
+      } catch (e) {
+        finish(() => reject(e instanceof Error ? e : new Error(String(e))));
+      }
+    };
+
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== "string") return;
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(ev.data) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (msg.type === "upload_ok") {
+        finish(() =>
+          resolve({
+            name: String(msg.name),
+            bpm: Number(msg.bpm ?? 0),
+            key: String(msg.key ?? ""),
+            timeSignature: String(msg.time_signature ?? "4"),
+            durationS: Number(msg.duration_s ?? 0),
+            samples: Number(msg.samples ?? 0),
+          }),
+        );
+      } else if (msg.type === "upload_failed") {
+        finish(() => reject(new Error(String(msg.error ?? "upload failed"))));
+      }
+    };
+
+    ws.onerror = () => {
+      finish(() => reject(new Error("upload connection failed")));
+    };
+
+    ws.onclose = (ev) => {
+      if (settled) return;
+      finish(() =>
+        reject(new Error(ev.reason || `upload connection closed (${ev.code})`)),
+      );
+    };
+  });
 }
 
 // Preferred default the UI picks when no fixture is yet selected. Falls

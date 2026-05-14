@@ -6,7 +6,9 @@ import {
   decodeAudioFile,
   listFixtures,
   loadFixtureAudio,
+  uploadTrackToServer,
 } from "@/engine/audio/loadFixture";
+import { useSeedUserUploads } from "@/hooks/useSeedUserUploads";
 import { LOCAL_MODE } from "@/lib/runtime";
 import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
@@ -104,6 +106,7 @@ export function RefControl({ kind }: { kind: RefKind }) {
       .then(setFixtures)
       .catch(() => setFixtures([]));
   }, [sessionWsUrl]);
+  useSeedUserUploads();
 
   function clearActive() {
     const session = useSessionStore.getState();
@@ -173,20 +176,22 @@ export function RefControl({ kind }: { kind: RefKind }) {
     setStatus("ready", `Loading ${bind.statusPrefix} ${file.name}…`);
     try {
       // decodeAudioFile now returns { decoded, wasTrimmed } since the
-      // soft-trim-to-MAX_FIXTURE_DURATION_S feature landed. Unwrap before
-      // passing to add() / bind.send(), which still expect a bare
-      // DecodedFixture. wasTrimmed is informational only here — the
-      // ref-track upload UX doesn't surface a trim warning the way the
-      // main AudioSourceCrate flow does.
+      // soft-trim-to-MAX_FIXTURE_DURATION_S feature landed. Unwrap
+      // before passing to add() / bind.send(), which still expect a
+      // bare DecodedFixture. wasTrimmed is informational only here.
       const { decoded } = await decodeAudioFile(file);
-      // Mirror AudioSourceCrate's de-dup naming so uploads land in the
-      // shared "your tracks" pool without colliding.
-      const baseName = file.name;
-      let chosen = baseName;
-      let i = 1;
-      while (useCustomTracksStore.getState().has(chosen)) {
-        chosen = `${baseName} (${i++})`;
-      }
+      // Upload-and-precompute on the pod via the same path the main
+      // fixture picker uses. Persists the audio under
+      // MODELS_DIR/user_uploads + writes the sidecar before returning,
+      // so the timbre / structure swap below hits the same sidecar
+      // fast path test fixtures get. The server-canonical name is what
+      // we send for the swap.
+      setStatus(
+        "ready",
+        `Encoding ${bind.statusPrefix} ${file.name}…`,
+      );
+      const upload = await uploadTrackToServer(file);
+      const chosen = upload.name;
       useCustomTracksStore.getState().add(chosen, decoded, file);
       const ok = bind.send(
         session.remote,

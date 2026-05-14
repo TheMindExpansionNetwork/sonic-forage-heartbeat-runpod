@@ -6,8 +6,10 @@ import {
   decodeAudioFile,
   listFixtures,
   pickDefaultFixture,
+  uploadTrackToServer,
   type DecodedFixture,
 } from "@/engine/audio/loadFixture";
+import { useSeedUserUploads } from "@/hooks/useSeedUserUploads";
 import { LOCAL_MODE } from "@/lib/runtime";
 import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
@@ -94,6 +96,7 @@ export function AudioSourceCrate() {
       })
       .catch(() => setFixtures([]));
   }, [setFixture, sessionWsUrl]);
+  useSeedUserUploads();
 
   useEffect(() => {
     if (!open) return;
@@ -121,18 +124,18 @@ export function AudioSourceCrate() {
     setUploading(true);
     setStatus(useSessionStore.getState().status, `Loading ${file.name}…`);
     try {
+      // Decode locally first so we can run the trim check + show the
+      // AlmostReadyDialog. The dialog is a gate — nothing server-side
+      // happens until the user clicks Continue. The decoded buffer
+      // also seeds the in-memory cache so the first Play after
+      // Continue doesn't re-fetch + re-decode bytes.
       const { decoded, wasTrimmed } = await decodeAudioFile(file);
-      const baseName = file.name;
-      let chosen = baseName;
-      let i = 1;
-      while (useCustomTracksStore.getState().has(chosen)) {
-        chosen = `${baseName} (${i++})`;
-      }
-      // Hand the decoded buffer + trim flag to the dialog. We DON'T add
-      // it to the custom-tracks store yet, and we DON'T setFixture()
-      // yet — that all happens on Continue so the previously playing
-      // song keeps playing if the user cancels.
-      setPending({ decoded, fileName: chosen, wasTrimmed, originalFile: file });
+      setPending({
+        decoded,
+        fileName: file.name,
+        wasTrimmed,
+        originalFile: file,
+      });
       setStatus(useSessionStore.getState().status, "");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -142,32 +145,49 @@ export function AudioSourceCrate() {
     }
   }
 
-  function commitPending(
+  async function commitPending(
     keyOverride: string | null,
     timeSignatureOverride: TimeSignature | null,
   ) {
     if (!pending) return;
     const { decoded, fileName, originalFile } = pending;
-    addCustomTrack(fileName, decoded, originalFile);
-    const perf = usePerformanceStore.getState();
-    if (keyOverride) {
-      perf.setPendingKeyOverride(keyOverride);
-      // Pre-set activeKey so the swap_source send carries the override
-      // as the model hint — useFixtureSwap reads activeKey when calling
-      // remote.sendSwapSource().
-      perf.setKey(keyOverride);
-    }
-    if (timeSignatureOverride) {
-      // Mirror the keyscale override: stash a one-shot value so the
-      // swap_ready handler in useFixtureSwap can re-apply it (and tell
-      // the server) even though the server's own resolver won't have
-      // it during the in-flight swap. Pre-set activeTimeSignature so
-      // the same UI control reflects the choice immediately.
-      perf.setPendingTimeSignatureOverride(timeSignatureOverride);
-      perf.setTimeSignature(timeSignatureOverride);
-    }
-    setFixture(fileName);
+    // Close the dialog immediately — the upload that follows can take
+    // 10-30s, and the user has already given consent by clicking
+    // Continue. Status-bar progress carries the rest of the feedback.
     setPending(null);
+    const { setStatus } = useSessionStore.getState();
+    try {
+      // Upload-and-precompute now that the user has confirmed. Server
+      // saves the encoded file under MODELS_DIR/user_uploads/<name>
+      // and writes the sidecar before returning. Server may sanitize
+      // / collision-suffix the name.
+      setStatus(useSessionStore.getState().status, `Encoding ${fileName}…`);
+      const upload = await uploadTrackToServer(originalFile);
+      const chosen = upload.name;
+      addCustomTrack(chosen, decoded, originalFile);
+      const perf = usePerformanceStore.getState();
+      if (keyOverride) {
+        perf.setPendingKeyOverride(keyOverride);
+        // Pre-set activeKey so the swap_source send carries the override
+        // as the model hint — useFixtureSwap reads activeKey when calling
+        // remote.sendSwapSource().
+        perf.setKey(keyOverride);
+      }
+      if (timeSignatureOverride) {
+        // Mirror the keyscale override: stash a one-shot value so the
+        // swap_ready handler in useFixtureSwap can re-apply it (and tell
+        // the server) even though the server's own resolver won't have
+        // it during the in-flight swap. Pre-set activeTimeSignature so
+        // the same UI control reflects the choice immediately.
+        perf.setPendingTimeSignatureOverride(timeSignatureOverride);
+        perf.setTimeSignature(timeSignatureOverride);
+      }
+      setFixture(chosen);
+      setStatus(useSessionStore.getState().status, "");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setStatus(useSessionStore.getState().status, `Upload failed: ${msg}`);
+    }
   }
 
   if (kiosk) return null;
