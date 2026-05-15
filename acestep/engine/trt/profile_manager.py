@@ -20,6 +20,7 @@ Typical usage from a streaming session::
     mgr = TRTProfileManager(
         decoder_backend="tensorrt",
         vae_backend="tensorrt",
+        checkpoint="acestep-v15-turbo",
         device="cuda",
     )
 
@@ -63,10 +64,12 @@ class TRTProfileManager:
         *,
         decoder_backend: str,
         vae_backend: str,
+        checkpoint: str = "acestep-v15-turbo",
         device: str = "cuda",
     ):
         self._decoder_tensorrt = decoder_backend == "tensorrt"
         self._vae_tensorrt = vae_backend == "tensorrt"
+        self._checkpoint = checkpoint
         self._device = torch.device(device)
 
         self._diffusion_engine = None
@@ -106,7 +109,11 @@ class TRTProfileManager:
         update internal state. Used by callers building the initial
         Session before :meth:`bind`.
         """
-        return available_trt_engines(duration_s, needs=self._needs())
+        return available_trt_engines(
+            duration_s,
+            needs=self._needs(),
+            checkpoint=self._checkpoint,
+        )
 
     def bind(
         self,

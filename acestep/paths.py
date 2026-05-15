@@ -131,7 +131,54 @@ _TRT_ENGINE_PROFILES: dict[float, dict[str, str]] = {
     },
 }
 
+_XL_TURBO_TRT_ENGINE_PROFILES: dict[float, dict[str, str]] = {
+    60.0: {
+        "decoder": "decoder_xl-turbo_mixed_refit_b4_60s",
+        "vae_encode": "vae_encode_fp16_60s",
+        "vae_decode": "vae_decode_fp16_60s",
+    },
+    120.0: {
+        "decoder": "decoder_xl-turbo_mixed_refit_b4_120s",
+        "vae_encode": "vae_encode_fp16_120s",
+        "vae_decode": "vae_decode_fp16_120s",
+    },
+}
+
+_DEFAULT_TRT_CHECKPOINT = "acestep-v15-turbo"
+_TRT_ENGINE_PROFILES_BY_CHECKPOINT: dict[str, dict[float, dict[str, str]]] = {
+    _DEFAULT_TRT_CHECKPOINT: _TRT_ENGINE_PROFILES,
+    "acestep-v15-xl-turbo": _XL_TURBO_TRT_ENGINE_PROFILES,
+}
+
 _DEFAULT_TRT_NEEDS: tuple[str, ...] = ("decoder", "vae_encode", "vae_decode")
+
+
+def _checkpoint_name(checkpoint: str | Path | None) -> str:
+    if checkpoint is None:
+        return _DEFAULT_TRT_CHECKPOINT
+    raw = str(checkpoint).replace("\\", "/").rstrip("/")
+    return raw.rsplit("/", 1)[-1] or _DEFAULT_TRT_CHECKPOINT
+
+
+def trt_engine_profiles(
+    checkpoint: str | Path = _DEFAULT_TRT_CHECKPOINT,
+) -> dict[float, dict[str, str]]:
+    """Canonical TRT engine profiles for a checkpoint.
+
+    The VAE engine names are shared across ACE-Step 1.5 checkpoints, but
+    decoder engines are checkpoint-specific. Raising for unknown checkpoints
+    prevents demos from accidentally loading a 2B decoder engine for a
+    different DiT variant.
+    """
+    name = _checkpoint_name(checkpoint)
+    try:
+        return _TRT_ENGINE_PROFILES_BY_CHECKPOINT[name]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_TRT_ENGINE_PROFILES_BY_CHECKPOINT))
+        raise ValueError(
+            f"No canonical TRT engine profiles registered for checkpoint "
+            f"{name!r}. Supported checkpoints: {supported}."
+        ) from exc
 
 
 def default_trt_engines(
@@ -157,7 +204,9 @@ def default_trt_engines(
     }
 
 
-def max_profile_duration_s() -> float:
+def max_profile_duration_s(
+    checkpoint: str | Path = _DEFAULT_TRT_CHECKPOINT,
+) -> float:
     """Largest registered TRT engine duration profile, in seconds.
 
     Useful as the upper bound on user-supplied audio: anything longer
@@ -165,10 +214,15 @@ def max_profile_duration_s() -> float:
     inference time anyway. Demos cap at this value rather than
     hardcoding a single duration.
     """
-    return max(_TRT_ENGINE_PROFILES.keys())
+    profiles = trt_engine_profiles(checkpoint)
+    return max(profiles.keys())
 
 
-def smallest_fitting_profile_duration_s(duration_s: float) -> float:
+def smallest_fitting_profile_duration_s(
+    duration_s: float,
+    *,
+    checkpoint: str | Path = _DEFAULT_TRT_CHECKPOINT,
+) -> float:
     """Smallest registered profile duration that can hold ``duration_s``.
 
     Pure: ignores filesystem state. Returns the registered profile,
@@ -177,13 +231,18 @@ def smallest_fitting_profile_duration_s(duration_s: float) -> float:
     Falls back to ``max_profile_duration_s()`` when no registered
     profile is large enough (matches ``select_trt_engines``).
     """
-    for max_dur in sorted(_TRT_ENGINE_PROFILES.keys()):
+    profiles = trt_engine_profiles(checkpoint)
+    for max_dur in sorted(profiles.keys()):
         if max_dur >= duration_s:
             return max_dur
-    return max(_TRT_ENGINE_PROFILES.keys())
+    return max(profiles.keys())
 
 
-def select_trt_engines(duration_s: float = 60.0) -> dict[str, str]:
+def select_trt_engines(
+    duration_s: float = 60.0,
+    *,
+    checkpoint: str | Path = _DEFAULT_TRT_CHECKPOINT,
+) -> dict[str, str]:
     """Pick the smallest engine profile that can handle ``duration_s``.
 
     Pure: returns paths without checking the filesystem. Use
@@ -200,11 +259,39 @@ def select_trt_engines(duration_s: float = 60.0) -> dict[str, str]:
         Dict with ``decoder`` / ``vae_encode`` / ``vae_decode`` keys
         mapping to absolute engine file paths as strings.
     """
-    for max_dur in sorted(_TRT_ENGINE_PROFILES.keys()):
+    profiles = trt_engine_profiles(checkpoint)
+    for max_dur in sorted(profiles.keys()):
         if max_dur >= duration_s:
-            return default_trt_engines(**_TRT_ENGINE_PROFILES[max_dur])
-    largest = max(_TRT_ENGINE_PROFILES.keys())
-    return default_trt_engines(**_TRT_ENGINE_PROFILES[largest])
+            return default_trt_engines(**profiles[max_dur])
+    largest = max(profiles.keys())
+    return default_trt_engines(**profiles[largest])
+
+
+def _trt_build_command(
+    *,
+    checkpoint: str,
+    duration_s: float,
+    needs: tuple[str, ...],
+) -> str:
+    duration = int(duration_s)
+    parts = ["python", "-m", "acestep.engine.trt.build", "--all"]
+    if checkpoint != _DEFAULT_TRT_CHECKPOINT:
+        parts.extend(["--checkpoint", checkpoint])
+    if "decoder" not in needs:
+        parts.append("--vae-only")
+    elif "vae_encode" not in needs and "vae_decode" not in needs:
+        parts.append("--decoder-only")
+    parts.extend(["--duration", str(duration)])
+    if checkpoint == "acestep-v15-xl-turbo" and "decoder" in needs:
+        parts.extend([
+            "--batch-max", "4",
+            "--batch-opt", "4",
+            "--builder-optimization-level", "5",
+            "--workspace-gb", "20",
+            "--export-locally",
+            "--decoder-precision", "bf16_mixed",
+        ])
+    return " ".join(parts)
 
 
 class EngineNotBuiltError(RuntimeError):
@@ -221,32 +308,38 @@ class EngineNotBuiltError(RuntimeError):
         duration_s: float,
         needs: tuple[str, ...],
         missing: dict[float, list[str]],
+        checkpoint: str | Path = _DEFAULT_TRT_CHECKPOINT,
     ) -> None:
         self.duration_s = float(duration_s)
         self.needs = tuple(needs)
+        self.checkpoint = _checkpoint_name(checkpoint)
         # Map of profile_max_dur -> list of missing engine paths for that
         # profile. Empty if no profile could even fit the duration.
         self.missing = dict(missing)
 
-        fitting = sorted(d for d in _TRT_ENGINE_PROFILES if d >= duration_s)
+        profiles = trt_engine_profiles(self.checkpoint)
+        fitting = sorted(d for d in profiles if d >= duration_s)
         if fitting:
             recommended = int(fitting[0])
-            self.build_command = (
-                f"python -m acestep.engine.trt.build --all --duration {recommended}"
+            self.build_command = _trt_build_command(
+                checkpoint=self.checkpoint,
+                duration_s=recommended,
+                needs=self.needs,
             )
             msg = (
                 f"No TRT engine profile is built that can handle "
-                f"{self.duration_s:.1f}s of audio. To build the smallest "
-                f"fitting profile, run: {self.build_command}"
+                f"{self.duration_s:.1f}s of audio for {self.checkpoint}. "
+                f"To build the smallest fitting profile, run: "
+                f"{self.build_command}"
             )
         else:
-            largest = max(_TRT_ENGINE_PROFILES.keys())
+            largest = max(profiles.keys())
             self.build_command = None
             msg = (
                 f"Audio duration {self.duration_s:.1f}s exceeds the largest "
-                f"registered profile ({largest:.0f}s). Either use shorter "
-                f"audio or add a larger profile to acestep/paths.py and "
-                f"build it."
+                f"registered TRT profile for {self.checkpoint} "
+                f"({largest:.0f}s). Either use shorter audio or add a larger "
+                f"profile to acestep/paths.py and build it."
             )
         super().__init__(msg)
 
@@ -255,6 +348,7 @@ def available_trt_engines(
     duration_s: float = 60.0,
     *,
     needs: tuple[str, ...] = _DEFAULT_TRT_NEEDS,
+    checkpoint: str | Path = _DEFAULT_TRT_CHECKPOINT,
 ) -> tuple[dict[str, str], float]:
     """Pick the smallest profile that fits ``duration_s`` AND is built.
 
@@ -282,17 +376,26 @@ def available_trt_engines(
         EngineNotBuiltError: No profile can handle ``duration_s`` with
             the requested ``needs`` keys present on disk.
     """
+    profile_checkpoint = (
+        checkpoint if "decoder" in needs else _DEFAULT_TRT_CHECKPOINT
+    )
+    profiles = trt_engine_profiles(profile_checkpoint)
     missing: dict[float, list[str]] = {}
-    for max_dur in sorted(_TRT_ENGINE_PROFILES.keys()):
+    for max_dur in sorted(profiles.keys()):
         if max_dur < duration_s:
             continue
-        profile = _TRT_ENGINE_PROFILES[max_dur]
+        profile = profiles[max_dur]
         paths = default_trt_engines(**profile)
         absent = [paths[k] for k in needs if not Path(paths[k]).exists()]
         if not absent:
             return paths, max_dur
         missing[max_dur] = absent
-    raise EngineNotBuiltError(duration_s=duration_s, needs=needs, missing=missing)
+    raise EngineNotBuiltError(
+        duration_s=duration_s,
+        needs=needs,
+        missing=missing,
+        checkpoint=profile_checkpoint,
+    )
 
 
 # ------------------------------------------------------------------

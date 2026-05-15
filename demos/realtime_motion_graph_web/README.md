@@ -67,11 +67,57 @@ pay CPU/GPU transfer cost. Add `--offload-text-encoder` on lower-VRAM GPUs to
 restore the previous lower-memory behavior.
 
 `--checkpoint <name>` selects which DiT checkpoint to load. The name
-must match a directory under `<checkpoints_dir>/` (auto-downloaded from
-HF on first use). Currently `acestep-v15-turbo` (default, 2B) is the
-only vendored variant; other entries in
-`acestep.model_downloader.SUBMODEL_REGISTRY` will load once their
-modeling files are vendored into `acestep/models/`.
+must match a directory under `<checkpoints_dir>/`. Full TensorRT mode is
+registered for `acestep-v15-turbo` (default, 2B) and
+`acestep-v15-xl-turbo` (XL). XL TRT uses dynamic-batch `b8` decoder
+profiles; build one first, then launch with:
+
+```bash
+uv run python -u -m demos.realtime_motion_graph_web \
+    --accel tensorrt --checkpoint acestep-v15-xl-turbo
+```
+
+## Headless Performance Benchmark
+
+The browser HUD receives `tick_ms` and `dec_ms` over WebSocket, but the
+server does not print structured telemetry. To compare accelerators,
+checkpoints, TRT profiles, or VAE settings without browser/audio-device
+overhead, run the headless benchmark:
+
+```bash
+uv run python -u -m demos.realtime_motion_graph_web.benchmark \
+    --accel tensorrt --checkpoint acestep-v15-xl-turbo
+```
+
+The benchmark mirrors the backend inference path: fixture/config defaults,
+TRT engine selection, `Session(...)`, `prepare_source`, `encode_text`,
+`session.stream(...)`, repeated `stream.tick(...)`, and optional VAE decode.
+It reports setup timings, per-generation `tick`, `decode`, `tick+decode`
+mean/P50/P90/P95/min/max, skip counts, and peak CUDA memory.
+
+Useful variants:
+
+```bash
+# Compare compile mode against the same workload.
+uv run python -u -m demos.realtime_motion_graph_web.benchmark --accel compile
+
+# Mixed backend, same style as the server flags.
+uv run python -u -m demos.realtime_motion_graph_web.benchmark \
+    --decoder-accel tensorrt --vae-accel eager
+
+# Persist raw samples and summary stats.
+uv run python -u -m demos.realtime_motion_graph_web.benchmark \
+    --accel tensorrt --checkpoint acestep-v15-xl-turbo \
+    --json runs/xl-trt-bench.json
+
+# Mirror PipelineRunner's decode-skip behavior.
+uv run python -u -m demos.realtime_motion_graph_web.benchmark \
+    --accel tensorrt --skip-threshold 1e-3
+```
+
+By default, `--skip-threshold -1` disables decode skipping so VAE decode
+latency is measured on every completed generation. Set `--no-decode` for
+decoder-only throughput.
 
 Once it's running:
 

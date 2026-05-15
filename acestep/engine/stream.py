@@ -249,6 +249,9 @@ class StreamPipeline:
         self._trt_stream = engine._trt_stream
         self._trt_engine = engine._trt_engine
         self._trt_io_dtype = getattr(engine, '_trt_io_dtype', torch.float32)
+        self._trt_input_dtypes = getattr(engine, "_trt_input_dtypes", {})
+        self._trt_output_dtype = getattr(engine, "_trt_output_dtype", self._trt_io_dtype)
+
         # Currently-bound TRT I/O buffers (set by _ensure_trt_bufs to one
         # entry of _trt_bufs_cache). _trt_forward reads these directly.
         self._trt_bufs: Optional[dict] = None
@@ -358,6 +361,10 @@ class StreamPipeline:
         self._trt_ctx = engine._trt_ctx
         self._trt_stream = engine._trt_stream
         self._trt_io_dtype = getattr(engine, "_trt_io_dtype", torch.float32)
+        self._trt_input_dtypes = getattr(engine, "_trt_input_dtypes", {})
+        self._trt_output_dtype = getattr(
+            engine, "_trt_output_dtype", self._trt_io_dtype
+        )
         self._trt_bufs = None
         self._trt_out_buf = None
         self._trt_bufs_cache.clear()
@@ -668,14 +675,25 @@ class StreamPipeline:
         so repeated ticks with the same ``(B, T, max_L)`` shape reuse
         allocations.
 
-        The engine is built with a fixed ``batch_max`` (typically 8).
-        If ``xt_batch.shape[0]`` exceeds the engine profile's max,
-        shape binding raises inside ``_ensure_trt_bufs``. Callers can
-        hit this when ``depth × n_conds × (1 + has_cfg)`` exceeds the
-        cap — split the batch or rebuild the engine with a larger
-        profile.
+        The active ring-buffer rows are submitted as one TensorRT
+        execution. If ``B`` exceeds the loaded engine profile, TensorRT
+        rejects the shape instead of silently falling back to sequential
+        per-row dispatch.
         """
         B, T, _ = xt_batch.shape
+        if len(timestep_list) != B:
+            raise RuntimeError(
+                "TRT stream batch mismatch: "
+                f"hidden_states batch={B}, timesteps={len(timestep_list)}"
+            )
+        if enc_batch.shape[0] != B or ctx_batch.shape[0] != B:
+            raise RuntimeError(
+                "TRT stream batch mismatch: "
+                f"hidden_states={tuple(xt_batch.shape)}, "
+                f"encoder={tuple(enc_batch.shape)}, "
+                f"context={tuple(ctx_batch.shape)}"
+            )
+
         max_L = enc_batch.shape[1]
 
         self._ensure_trt_bufs(B, T, max_L)
@@ -683,7 +701,7 @@ class StreamPipeline:
         pad = T % 2 == 1
 
         # hidden_states: cast to engine I/O dtype; pad odd T with zeros.
-        xt_io = xt_batch.to(self._trt_io_dtype)
+        xt_io = xt_batch.to(bufs["hidden_states"].dtype)
         if pad:
             bufs["hidden_states"][:, :T, :].copy_(xt_io)
             bufs["hidden_states"][:, T:, :].zero_()
@@ -697,10 +715,12 @@ class StreamPipeline:
         # encoder_hidden_states: already padded to max_L + catted by
         # the caller. The engine has no ``encoder_attention_mask``
         # input; padding is handled by zero-value convention.
-        bufs["encoder_hidden_states"].copy_(enc_batch.to(self._trt_io_dtype))
+        bufs["encoder_hidden_states"].copy_(
+            enc_batch.to(bufs["encoder_hidden_states"].dtype)
+        )
 
         # context_latents: pad odd T with zeros.
-        ctx_io = ctx_batch.to(self._trt_io_dtype)
+        ctx_io = ctx_batch.to(bufs["context_latents"].dtype)
         if pad:
             bufs["context_latents"][:, :T, :].copy_(ctx_io)
             bufs["context_latents"][:, T:, :].zero_()
@@ -712,10 +732,13 @@ class StreamPipeline:
         for name, buf in bufs.items():
             if name.startswith("_"):
                 continue
-            ctx.set_tensor_address(name, buf.data_ptr())
-        ctx.set_tensor_address("velocity", self._trt_out_buf.data_ptr())
+            if not ctx.set_tensor_address(name, buf.data_ptr()):
+                raise RuntimeError(f"TRT decoder rejected input address for {name}")
+        if not ctx.set_tensor_address("velocity", self._trt_out_buf.data_ptr()):
+            raise RuntimeError("TRT decoder rejected output address for velocity")
 
-        ctx.execute_async_v3(self._trt_stream.ptr)
+        if not ctx.execute_async_v3(self._trt_stream.ptr):
+            raise RuntimeError("TRT decoder execution failed")
         self._trt_stream.synchronize()
 
         out = self._trt_out_buf
@@ -756,16 +779,44 @@ class StreamPipeline:
 
         device = self._device
         io_dtype = self._trt_io_dtype
+        in_dtypes = self._trt_input_dtypes
         bufs = {
-            "hidden_states": torch.empty(B, eff_T, 64, dtype=io_dtype, device=device),
-            "timestep": torch.empty(B, dtype=torch.float32, device=device),
-            "encoder_hidden_states": torch.empty(B, max_L, 2048, dtype=io_dtype, device=device),
-            "context_latents": torch.empty(B, eff_T, 128, dtype=io_dtype, device=device),
+            "hidden_states": torch.empty(
+                B, eff_T, 64,
+                dtype=in_dtypes.get("hidden_states", io_dtype),
+                device=device,
+            ),
+            "timestep": torch.empty(
+                B,
+                dtype=in_dtypes.get("timestep", torch.float32),
+                device=device,
+            ),
+            "encoder_hidden_states": torch.empty(
+                B, max_L, 2048,
+                dtype=in_dtypes.get("encoder_hidden_states", io_dtype),
+                device=device,
+            ),
+            "context_latents": torch.empty(
+                B, eff_T, 128,
+                dtype=in_dtypes.get("context_latents", io_dtype),
+                device=device,
+            ),
         }
 
         for name, buf in bufs.items():
-            ctx.set_input_shape(name, tuple(buf.shape))
-            ctx.set_tensor_address(name, buf.data_ptr())
+            if not ctx.set_input_shape(name, tuple(buf.shape)):
+                raise RuntimeError(
+                    f"TRT decoder rejected input shape for {name}: "
+                    f"{tuple(buf.shape)}"
+                )
+            if not ctx.set_tensor_address(name, buf.data_ptr()):
+                raise RuntimeError(f"TRT decoder rejected input address for {name}")
+
+        missing = ctx.infer_shapes()
+        if missing:
+            raise RuntimeError(
+                f"TRT decoder shapes are insufficiently specified: {missing}"
+            )
 
         out_shape = tuple(ctx.get_tensor_shape("velocity"))
         if any(d < 0 for d in out_shape):
@@ -773,8 +824,9 @@ class StreamPipeline:
                 f"TRT output shape unresolved: {out_shape}. "
                 f"B={B}, eff_T={eff_T}, L={max_L}"
             )
-        out_buf = torch.empty(out_shape, dtype=io_dtype, device=device)
-        ctx.set_tensor_address("velocity", out_buf.data_ptr())
+        out_buf = torch.empty(out_shape, dtype=self._trt_output_dtype, device=device)
+        if not ctx.set_tensor_address("velocity", out_buf.data_ptr()):
+            raise RuntimeError("TRT decoder rejected output address for velocity")
 
         bufs["_key"] = key
         bufs["_eff_T"] = eff_T
@@ -1227,8 +1279,8 @@ class StreamPipeline:
         """Resize the ring buffer. Active slots drain naturally.
 
         Args:
-            depth: New number of concurrent slots.  Clamped to [1, 8]
-                (the TRT engine's batch_max).
+            depth: New number of concurrent slots. Clamped to [1, 8],
+                matching the canonical decoder engine batch profile.
         """
         depth = max(1, min(depth, 8))
         if depth == self._depth:
