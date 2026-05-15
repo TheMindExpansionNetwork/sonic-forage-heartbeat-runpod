@@ -39,7 +39,6 @@ from acestep.nodes.types import Audio, Latent
 from acestep.paths import (
     EngineNotBuiltError,
     available_dreamvae_decode_engine,
-    available_trt_engines,
     checkpoints_dir,
     dreamvae_decode_engine_name,
     lora_trigger,
@@ -332,12 +331,31 @@ def handle_client(
 
     audio_bytes = ws.recv()
     waveform = _decode_audio_msg(audio_bytes)
+    use_trt = decoder_backend == "tensorrt" or vae_backend == "tensorrt"
+    trt_profile_checkpoint = checkpoint if decoder_backend == "tensorrt" else "acestep-v15-turbo"
+
     # Cap at the largest registered TRT engine profile rather than
     # hardcoding 60 s. Anything longer than the largest profile can't
     # be handled by any built engine, but we let the operator stretch
     # all the way up to that ceiling — picking the smallest-fitting
     # engine happens below in available_trt_engines().
-    max_seconds = max_profile_duration_s()
+    if use_trt:
+        try:
+            max_seconds = max_profile_duration_s(checkpoint=trt_profile_checkpoint)
+        except ValueError as exc:
+            print(f"[Server] {exc}")
+            try:
+                ws.send(json.dumps({
+                    "type": "error",
+                    "code": "unsupported_trt_checkpoint",
+                    "message": str(exc),
+                }))
+            except Exception:
+                pass
+            ws.close(1011, "unsupported TRT checkpoint")
+            return
+    else:
+        max_seconds = max_profile_duration_s()
     waveform = waveform[:, :int(max_seconds * SAMPLE_RATE)]
     pool = 1920 * 5
     rem = waveform.shape[-1] % pool
@@ -386,7 +404,6 @@ def handle_client(
 
     # --- Session setup ---
     audio_duration_s = waveform.shape[1] / SAMPLE_RATE
-    use_trt = decoder_backend == "tensorrt" or vae_backend == "tensorrt"
     # Profile manager owns the engine slots. When use_trt is False, it
     # stays None and the swap path keeps the legacy engine-less behavior.
     profile_mgr: TRTProfileManager | None = None
@@ -394,6 +411,7 @@ def handle_client(
         profile_mgr = TRTProfileManager(
             decoder_backend=decoder_backend,
             vae_backend=vae_backend,
+            checkpoint=trt_profile_checkpoint,
         )
         try:
             trt_engines, picked_dur = profile_mgr.resolve(audio_duration_s)
@@ -456,7 +474,10 @@ def handle_client(
         # but wasn't built (so we genuinely fell back). For a 119.8 s
         # source the 120 s engine is the smallest fitting profile, not
         # a fallback — the previous predicate fired on that case.
-        ideal_dur = smallest_fitting_profile_duration_s(audio_duration_s)
+        ideal_dur = smallest_fitting_profile_duration_s(
+            audio_duration_s,
+            checkpoint=trt_profile_checkpoint,
+        )
         if picked_dur > ideal_dur:
             print(
                 f"[Server] WARNING: using {picked_dur:.0f}s engine for "

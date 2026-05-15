@@ -38,9 +38,18 @@ Requirements:
 """
 
 import argparse
+import hashlib
+import json
 import os
+import platform
+import re
+import subprocess
 import sys
 import time
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
+from pathlib import Path
 
 # Suppress flash_attn import (not needed for export)
 import importlib, importlib.util
@@ -53,6 +62,16 @@ importlib.util.find_spec = _patch
 
 from loguru import logger
 import torch
+
+_SUPPORTED_TRT_MIN = (10, 16)
+_SUPPORTED_TRT_MAX = (10, 17)
+_ENGINE_METADATA_SCHEMA = 1
+_DECODER_PRECISION_CHOICES = (
+    "auto",
+    "fp32",
+    "fp16_mixed",
+    "bf16_mixed",
+)
 
 
 # ------------------------------------------------------------------
@@ -70,6 +89,277 @@ def _default_checkpoints_dir() -> str:
     """Default checkpoints directory from acestep.paths."""
     from acestep.paths import checkpoints_dir
     return str(checkpoints_dir())
+
+
+def _parse_version_tuple(version: str) -> tuple[int, ...]:
+    """Extract a comparable numeric prefix from versions like 10.16.1.11."""
+    return tuple(int(p) for p in re.findall(r"\d+", version)[:3])
+
+
+def _dist_version(name: str) -> str | None:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _nvidia_smi_summary() -> dict:
+    """Best-effort driver/GPU snapshot for engine metadata."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,driver_version,compute_cap",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+    gpus = []
+    for line in result.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            gpus.append({
+                "name": parts[0],
+                "driver_version": parts[1],
+                "compute_capability": parts[2],
+            })
+    return {"available": True, "gpus": gpus}
+
+
+def _active_gpu_summary(device: str) -> dict:
+    if not torch.cuda.is_available():
+        return {"available": False}
+
+    torch_device = torch.device(device)
+    index = torch_device.index if torch_device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(index)
+    return {
+        "available": True,
+        "index": index,
+        "name": props.name,
+        "compute_capability": f"{props.major}.{props.minor}",
+        "total_memory_bytes": props.total_memory,
+    }
+
+
+def _preflight(device: str) -> dict:
+    """Validate and log the TensorRT/CUDA stack before building engines."""
+    import tensorrt as trt
+
+    trt_version = trt.__version__
+    parsed = _parse_version_tuple(trt_version)
+    if parsed < _SUPPORTED_TRT_MIN or parsed >= _SUPPORTED_TRT_MAX:
+        raise RuntimeError(
+            "DEMON TensorRT builds target TensorRT >=10.16,<10.17; "
+            f"found {trt_version}. Run `uv sync --upgrade-package tensorrt`."
+        )
+
+    env = {
+        "schema_version": _ENGINE_METADATA_SCHEMA,
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "packages": {
+            "tensorrt": trt_version,
+            "tensorrt_cu13": _dist_version("tensorrt-cu13"),
+            "tensorrt_cu13_bindings": _dist_version("tensorrt-cu13-bindings"),
+            "tensorrt_cu13_libs": _dist_version("tensorrt-cu13-libs"),
+            "cuda_python": _dist_version("cuda-python"),
+            "cuda_toolkit": _dist_version("cuda-toolkit"),
+            "polygraphy": _dist_version("polygraphy"),
+            "onnx": _dist_version("onnx"),
+            "torch": torch.__version__,
+        },
+        "torch_cuda": torch.version.cuda,
+        "onnx_parser_version": getattr(trt, "get_nv_onnx_parser_version", lambda: None)(),
+        "active_gpu": _active_gpu_summary(device),
+        "nvidia_smi": _nvidia_smi_summary(),
+    }
+
+    logger.info("=" * 60)
+    logger.info("TensorRT build preflight")
+    logger.info("=" * 60)
+    logger.info("TensorRT: {}", env["packages"]["tensorrt"])
+    logger.info("TensorRT cu13: {}", env["packages"]["tensorrt_cu13"])
+    logger.info("CUDA Python: {}", env["packages"]["cuda_python"])
+    logger.info("CUDA toolkit wheel: {}", env["packages"]["cuda_toolkit"])
+    logger.info("Polygraphy: {}", env["packages"]["polygraphy"])
+    logger.info("ONNX: {}", env["packages"]["onnx"])
+    logger.info("Torch: {} (CUDA {})", env["packages"]["torch"], env["torch_cuda"])
+    gpu = env["active_gpu"]
+    if gpu.get("available"):
+        logger.info(
+            "Active GPU: cuda:{} {} (SM {})",
+            gpu["index"], gpu["name"], gpu["compute_capability"],
+        )
+    else:
+        logger.warning("No active CUDA GPU detected in torch")
+    return env
+
+
+def _sha256_file(path: str | os.PathLike[str]) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _config_dict(config) -> dict:
+    if is_dataclass(config):
+        return asdict(config)
+    return dict(vars(config))
+
+
+def _looks_like_xl_checkpoint(checkpoint: str) -> bool:
+    return "xl" in os.path.basename(checkpoint).lower()
+
+
+def _resolve_decoder_precision(
+    *,
+    checkpoint: str,
+    requested: str,
+    decoder_mixed: bool,
+) -> str:
+    """Resolve the decoder ONNX precision recipe for this checkpoint.
+
+    ``decoder_mixed`` preserves the legacy 2B behavior: when callers ask
+    for the old mixed path, ``auto`` maps to the fp16 mixed export recipe.
+    XL checkpoints need bf16 range, so their ``auto`` default is bf16_mixed.
+    """
+    if requested != "auto":
+        return requested
+    if _looks_like_xl_checkpoint(checkpoint):
+        return "bf16_mixed"
+    if decoder_mixed:
+        return "fp16_mixed"
+    return "fp32"
+
+
+def _decoder_precision_is_strongly_typed(decoder_precision: str, decoder_mixed: bool) -> bool:
+    if decoder_precision == "fp16_mixed":
+        return True
+    if decoder_precision == "bf16_mixed":
+        return True
+    return decoder_mixed
+
+
+def _decoder_onnx_needs_dynbatch_patch(
+    *,
+    checkpoint: str,
+    decoder_precision: str,
+    batch_max: int,
+) -> bool:
+    return (
+        batch_max > 1
+        and _looks_like_xl_checkpoint(checkpoint)
+        and decoder_precision == "bf16_mixed"
+    )
+
+
+def _patch_decoder_onnx_for_dynamic_batch(
+    onnx_paths: dict[str, str],
+    *,
+    need_decoder_std: bool,
+    need_decoder_refit: bool,
+    checkpoint: str,
+    decoder_precision: str,
+    batch_max: int,
+    force: bool,
+) -> dict[str, str]:
+    """Return ONNX paths, replacing XL decoder ONNX with dynbatch-patched copies."""
+    if not _decoder_onnx_needs_dynbatch_patch(
+        checkpoint=checkpoint,
+        decoder_precision=decoder_precision,
+        batch_max=batch_max,
+    ):
+        return onnx_paths
+
+    from .export import patch_decoder_onnx_dynamic_batch_reshapes
+
+    patched = dict(onnx_paths)
+    for key, needed in (
+        ("decoder", need_decoder_std),
+        ("decoder_refit", need_decoder_refit),
+    ):
+        if not needed:
+            continue
+        patched[key] = str(
+            patch_decoder_onnx_dynamic_batch_reshapes(
+                patched[key],
+                force=force,
+            )
+        )
+    return patched
+
+
+def _metadata_path(engine_path: str | os.PathLike[str]) -> Path:
+    return Path(str(engine_path) + ".metadata.json")
+
+
+def _expected_metadata(
+    *,
+    component: str,
+    onnx_path: str,
+    config,
+    env: dict,
+) -> dict:
+    gpu = env.get("active_gpu", {})
+    return {
+        "schema_version": _ENGINE_METADATA_SCHEMA,
+        "component": component,
+        "tensorrt_version": env["packages"]["tensorrt"],
+        "gpu_compute_capability": gpu.get("compute_capability"),
+        "gpu_name": gpu.get("name"),
+        "config": _config_dict(config),
+        "onnx_path": str(Path(onnx_path).resolve()),
+        "onnx_sha256": _sha256_file(onnx_path),
+    }
+
+
+def _write_metadata(
+    *,
+    engine_path: str,
+    expected: dict,
+    env: dict,
+) -> None:
+    payload = dict(expected)
+    payload["built_at"] = datetime.now(timezone.utc).isoformat()
+    payload["environment"] = env
+    path = _metadata_path(engine_path)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("Engine metadata saved to {}", path)
+
+
+def _metadata_matches(engine_path: str, expected: dict) -> tuple[bool, str]:
+    path = _metadata_path(engine_path)
+    if not path.exists():
+        return False, "missing metadata"
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"metadata unreadable: {exc}"
+
+    for key in (
+        "schema_version",
+        "component",
+        "tensorrt_version",
+        "gpu_compute_capability",
+        "config",
+        "onnx_sha256",
+    ):
+        if actual.get(key) != expected.get(key):
+            return False, f"metadata mismatch: {key}"
+    return True, "metadata match"
 
 
 def _verify_engines(engine_paths: list[tuple[str, str]]):
@@ -130,17 +420,19 @@ def _ensure_onnx(
     need_vae: bool,
     need_decoder_std: bool,
     need_decoder_refit: bool,
-    decoder_mixed: bool,
+    decoder_precision: str,
     skip_onnx: bool,
+    force_onnx: bool = False,
     export_locally: bool = False,
 ) -> dict[str, str]:
     """Resolve ONNX paths for the build, fetching from HF when missing.
 
     Resolution order for each needed component:
-      1. Local cache present -> reuse.
+      1. Local cache present -> reuse, unless ``force_onnx`` is set.
       2. ``skip_onnx``       -> error (no fetch, no export).
-      3. ``export_locally``  -> export from the model checkpoint.
-      4. Default             -> download from HF via ``onnx_hub``.
+      3. ``force_onnx``      -> re-export from the model checkpoint.
+      4. ``export_locally``  -> export missing files from the checkpoint.
+      5. Default             -> download missing files from HF via ``onnx_hub``.
 
     HF-first is the clean default: machines that don't have the model
     checkpoint can build engines without ever touching torch's model
@@ -175,22 +467,24 @@ def _ensure_onnx(
                 paths[key] = old_path
 
     # Build the list of (component, fetch_kwargs) pairs that the caller
-    # actually needs and that aren't yet on disk.
+    # actually needs and that aren't yet on disk. With --force-onnx, all
+    # requested components are included so the checkpoint exporter overwrites
+    # stale or suspect ONNX files.
     requested: list[tuple[str, dict]] = []
     if need_vae:
-        if not os.path.exists(paths["vae_encode"]):
+        if force_onnx or not os.path.exists(paths["vae_encode"]):
             requested.append(("vae_encode", {}))
         else:
             logger.info("Reusing existing VAE encoder ONNX: {}", paths["vae_encode"])
-        if not os.path.exists(paths["vae_decode"]):
+        if force_onnx or not os.path.exists(paths["vae_decode"]):
             requested.append(("vae_decode", {}))
         else:
             logger.info("Reusing existing VAE decoder ONNX: {}", paths["vae_decode"])
-    if need_decoder_std and not os.path.exists(paths["decoder"]):
+    if need_decoder_std and (force_onnx or not os.path.exists(paths["decoder"])):
         requested.append(("decoder", {"checkpoint": checkpoint}))
     elif need_decoder_std:
         logger.info("Reusing existing decoder ONNX: {}", paths["decoder"])
-    if need_decoder_refit and not os.path.exists(paths["decoder_refit"]):
+    if need_decoder_refit and (force_onnx or not os.path.exists(paths["decoder_refit"])):
         requested.append(("decoder_refit", {"checkpoint": checkpoint}))
     elif need_decoder_refit:
         logger.info("Reusing existing decoder ONNX (refit): {}", paths["decoder_refit"])
@@ -199,7 +493,10 @@ def _ensure_onnx(
     if skip_onnx:
         if requested:
             for comp, _ in requested:
-                logger.error("Missing ONNX file (refusing to fetch/export with --skip-onnx): {}", paths[comp])
+                logger.error(
+                    "Missing ONNX file (refusing to fetch/export with --skip-onnx): {}",
+                    paths[comp],
+                )
             sys.exit(1)
         logger.info("All ONNX exports found, --skip-onnx satisfied.")
         return paths
@@ -211,7 +508,7 @@ def _ensure_onnx(
     # HF-first path. Each fetch lands the file at the same local path
     # the local exporter would write, so the rest of the pipeline
     # downstream doesn't care about the source.
-    if not export_locally:
+    if not export_locally and not force_onnx:
         local_root = os.path.dirname(onnx_dir)  # the trt_engines dir
         try:
             for comp, kw in requested:
@@ -232,12 +529,13 @@ def _ensure_onnx(
             )
             sys.exit(1)
 
-    # --export-locally path: load the model and re-export from weights.
+    # --export-locally / --force-onnx path: load the model and export from weights.
     export_vae = any(c.startswith("vae_") for c, _ in requested)
     export_decoder_refit = any(c == "decoder_refit" for c, _ in requested)
     export_decoder_std = any(c == "decoder" for c, _ in requested)
 
-    logger.info("Loading model from checkpoints/{} (--export-locally)...", checkpoint)
+    mode = "--force-onnx" if force_onnx else "--export-locally"
+    logger.info("Loading model from checkpoints/{} ({})...", checkpoint, mode)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
     from acestep.engine.model_context import ModelContext
@@ -276,28 +574,44 @@ def _ensure_onnx(
 
     if export_decoder_refit or export_decoder_std:
         from .export import OnnxExportConfig, export_decoder_onnx
+
+        def decoder_export_config(*, for_refit: bool) -> OnnxExportConfig:
+            if decoder_precision == "fp16_mixed":
+                return OnnxExportConfig(mixed_precision=True, for_refit=for_refit)
+            return OnnxExportConfig(
+                precision=decoder_precision,
+                mixed_precision=False,
+                for_refit=for_refit,
+            )
+
         with handler._load_model_context("model"):
             if export_decoder_refit:
                 logger.info("=" * 60)
-                logger.info("DECODER ONNX EXPORT (refit-enabled)")
+                logger.info(
+                    "DECODER ONNX EXPORT (refit-enabled, precision={})",
+                    decoder_precision,
+                )
                 logger.info("=" * 60)
                 t0 = time.time()
                 export_decoder_onnx(
                     handler.model, paths["decoder_refit"], device=device,
-                    config=OnnxExportConfig(mixed_precision=decoder_mixed, for_refit=True),
+                    config=decoder_export_config(for_refit=True),
                 )
-                logger.info("Decoder ONNX (refit) exported in %.1fs", time.time() - t0)
+                logger.info("Decoder ONNX (refit) exported in {:.1f}s", time.time() - t0)
 
             if export_decoder_std:
                 logger.info("=" * 60)
-                logger.info("DECODER ONNX EXPORT (standard)")
+                logger.info(
+                    "DECODER ONNX EXPORT (standard, precision={})",
+                    decoder_precision,
+                )
                 logger.info("=" * 60)
                 t0 = time.time()
                 export_decoder_onnx(
                     handler.model, paths["decoder"], device=device,
-                    config=OnnxExportConfig(mixed_precision=decoder_mixed, for_refit=False),
+                    config=decoder_export_config(for_refit=False),
                 )
-                logger.info("Decoder ONNX (standard) exported in %.1fs", time.time() - t0)
+                logger.info("Decoder ONNX (standard) exported in {:.1f}s", time.time() - t0)
 
     # Free model memory before TRT builds
     del handler
@@ -316,6 +630,7 @@ def _build_vae_engines(
     onnx_paths: dict[str, str],
     duration: int,
     workspace_gb: float,
+    env: dict,
     force_rebuild: bool = False,
 ) -> list[tuple[str, str, float, str]]:
     """Build VAE encode + decode TRT engines for one duration.
@@ -343,12 +658,21 @@ def _build_vae_engines(
         engine_path = os.path.join(engine_dir, f"{name}.engine")
 
         label = f"VAE {component.split('_')[1]} {duration}s"
+        expected_metadata = _expected_metadata(
+            component=component,
+            onnx_path=onnx_paths[component],
+            config=config,
+            env=env,
+        )
 
         if not force_rebuild and os.path.exists(engine_path):
-            size_mb = os.path.getsize(engine_path) / 1e6
-            logger.info("SKIP {} ({:.0f} MB)", name, size_mb)
-            results.append((label, engine_path, 0.0, "SKIPPED"))
-            continue
+            matches, reason = _metadata_matches(engine_path, expected_metadata)
+            if matches:
+                size_mb = os.path.getsize(engine_path) / 1e6
+                logger.info("SKIP {} ({:.0f} MB, {})", name, size_mb, reason)
+                results.append((label, engine_path, 0.0, "SKIPPED"))
+                continue
+            logger.info("REBUILD {} ({})", name, reason)
 
         logger.info("=" * 60)
         logger.info("VAE TRT BUILD: {} (max_duration={}s)", name, duration)
@@ -356,6 +680,7 @@ def _build_vae_engines(
 
         t0 = time.time()
         builder(onnx_paths[component], engine_path, config=config)
+        _write_metadata(engine_path=engine_path, expected=expected_metadata, env=env)
         elapsed = time.time() - t0
         logger.info("Built in {:.0f}s", elapsed)
         results.append((label, engine_path, elapsed, "OK"))
@@ -439,8 +764,13 @@ def _build_decoder_engine(
     refit: bool,
     workspace_gb: float,
     batch_max: int,
+    env: dict,
+    batch_opt: int | None = None,
+    builder_optimization_level: int | None = None,
     force_rebuild: bool = False,
     checkpoint: str = "acestep-v15-turbo",
+    decoder_precision: str = "fp16_mixed",
+    strongly_typed: bool = True,
 ) -> tuple[str, str, float, str]:
     """Build one decoder TRT engine.
 
@@ -452,13 +782,19 @@ def _build_decoder_engine(
     variant = _checkpoint_to_variant(checkpoint)
     config = TRTBuildConfig(
         fp16=True,
-        strongly_typed=mixed,
+        strongly_typed=strongly_typed,
         refit=refit,
         workspace_gb=workspace_gb,
         batch_max=batch_max,
+        seq_opt=min(duration * 25, 1500),
         seq_max=duration * 25,
         variant=variant,
+        onnx_precision=decoder_precision,
     )
+    if batch_opt is not None:
+        config.batch_opt = batch_opt
+    if builder_optimization_level is not None:
+        config.builder_optimization_level = builder_optimization_level
 
     name = config.engine_filename().replace(".engine", "")
     engine_dir = os.path.join(output_dir, name)
@@ -467,19 +803,31 @@ def _build_decoder_engine(
     onnx_key = "decoder_refit" if refit else "decoder"
     refit_label = "refit" if refit else "no-refit"
     label = f"Decoder {variant} {duration}s, {refit_label}"
+    expected_metadata = _expected_metadata(
+        component=onnx_key,
+        onnx_path=onnx_paths[onnx_key],
+        config=config,
+        env=env,
+    )
 
     if not force_rebuild and os.path.exists(engine_path):
-        size_mb = os.path.getsize(engine_path) / 1e6
-        logger.info("SKIP {} ({:.0f} MB)", name, size_mb)
-        return (label, engine_path, 0.0, "SKIPPED")
+        matches, reason = _metadata_matches(engine_path, expected_metadata)
+        if matches:
+            size_mb = os.path.getsize(engine_path) / 1e6
+            logger.info("SKIP {} ({:.0f} MB, {})", name, size_mb, reason)
+            return (label, engine_path, 0.0, "SKIPPED")
+        logger.info("REBUILD {} ({})", name, reason)
 
     logger.info("=" * 60)
-    logger.info("DECODER TRT BUILD (refit={}, mixed={}) -> {}",
-                refit, mixed, engine_path)
+    logger.info(
+        "DECODER TRT BUILD (refit={}, mixed={}, precision={}) -> {}",
+        refit, mixed, decoder_precision, engine_path,
+    )
     logger.info("=" * 60)
 
     t0 = time.time()
     build_trt_engine(onnx_paths[onnx_key], engine_path, config=config)
+    _write_metadata(engine_path=engine_path, expected=expected_metadata, env=env)
     elapsed = time.time() - t0
     logger.info("Built in {:.0f}s", elapsed)
 
@@ -640,6 +988,10 @@ def main():
     single.add_argument("--skip-onnx", action="store_true",
                         help="Don't fetch or export ONNX. Error if any "
                              "needed ONNX file is missing locally.")
+    single.add_argument("--force-onnx", action="store_true",
+                        help="Re-export ONNX files from the model checkpoint "
+                             "even if matching files already exist. Implies "
+                             "--export-locally.")
     single.add_argument("--export-locally", action="store_true",
                         help="Re-export ONNX from the model checkpoint "
                              "instead of fetching from HuggingFace. The "
@@ -655,18 +1007,45 @@ def main():
                         help="Build decoder engine(s)")
     single.add_argument("--decoder-mixed", action="store_true",
                         help="Use mixed precision for decoder")
+    single.add_argument("--decoder-precision",
+                        choices=_DECODER_PRECISION_CHOICES,
+                        default="auto",
+                        help="Decoder ONNX export precision recipe. "
+                             "'auto' keeps the legacy fp16_mixed recipe for "
+                             "2B mixed builds and uses bf16_mixed for XL "
+                             "checkpoints.")
     single.add_argument("--decoder-refit",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="Build refit-enabled decoder for LoRA "
                              "(default: True, use --no-decoder-refit)")
     single.add_argument("--batch-max", type=int, default=8,
                         help="Max batch size for decoder (default: 8)")
+    single.add_argument("--batch-opt", type=int, default=None,
+                        help="Optimal batch size for decoder TRT profile "
+                             "(default: TRTBuildConfig default)")
+    single.add_argument("--builder-optimization-level", type=int, default=None,
+                        help="TensorRT builder optimization level, 0-5 "
+                             "(default: TRTBuildConfig default)")
     single.add_argument("--skip-vae", action="store_true",
                         help="Skip VAE engine build")
 
     args = parser.parse_args()
+    if args.skip_onnx and args.force_onnx:
+        parser.error("--skip-onnx and --force-onnx are mutually exclusive")
+    if args.batch_opt is not None and args.batch_opt < 1:
+        parser.error("--batch-opt must be >= 1")
+    if args.batch_opt is not None and args.batch_opt > args.batch_max:
+        parser.error("--batch-opt must be <= --batch-max")
+    if (
+        args.builder_optimization_level is not None
+        and not 0 <= args.builder_optimization_level <= 5
+    ):
+        parser.error("--builder-optimization-level must be between 0 and 5")
+    if args.force_onnx:
+        args.export_locally = True
 
     checkpoints_root = _default_checkpoints_dir()
+    env = None if args.dry_run else _preflight(args.device)
 
     os.makedirs(args.output_dir, exist_ok=True)
     # ONNX directory is checkpoint-specific for decoder (different weights)
@@ -675,14 +1054,22 @@ def main():
     os.makedirs(onnx_dir, exist_ok=True)
 
     if args.all:
-        _run_all(args, checkpoints_root, onnx_dir)
+        _run_all(args, checkpoints_root, onnx_dir, env)
     else:
-        _run_single(args, checkpoints_root, onnx_dir)
+        _run_single(args, checkpoints_root, onnx_dir, env)
 
 
-def _run_all(args, project_root, onnx_dir):
+def _run_all(args, project_root, onnx_dir, env):
     """Build the full engine matrix."""
     durations = tuple(args.duration) if args.duration else (60, 120, 240)
+    decoder_precision = _resolve_decoder_precision(
+        checkpoint=args.checkpoint,
+        requested=args.decoder_precision,
+        decoder_mixed=True,
+    )
+    decoder_strongly_typed = _decoder_precision_is_strongly_typed(
+        decoder_precision, decoder_mixed=True,
+    )
     # --dreamvae-only is shorthand for "skip standard VAE/decoder, only
     # build dreamvae". --with-dreamvae adds dreamvae on top of the
     # standard build. Both forms enable the dreamvae build.
@@ -715,9 +1102,19 @@ def _run_all(args, project_root, onnx_dir):
             need_vae=build_vae,
             need_decoder_std=False,
             need_decoder_refit=build_decoder,
-            decoder_mixed=True,
+            decoder_precision=decoder_precision,
             skip_onnx=args.skip_onnx,
+            force_onnx=args.force_onnx,
             export_locally=args.export_locally,
+        )
+        onnx_paths = _patch_decoder_onnx_for_dynamic_batch(
+            onnx_paths,
+            need_decoder_std=False,
+            need_decoder_refit=build_decoder,
+            checkpoint=args.checkpoint,
+            decoder_precision=decoder_precision,
+            batch_max=args.batch_max,
+            force=args.force_onnx,
         )
     else:
         onnx_paths = {}
@@ -731,6 +1128,7 @@ def _run_all(args, project_root, onnx_dir):
                 onnx_paths=onnx_paths,
                 duration=dur,
                 workspace_gb=args.workspace_gb,
+                env=env,
                 force_rebuild=args.force_rebuild,
             ))
         if build_decoder:
@@ -742,8 +1140,13 @@ def _run_all(args, project_root, onnx_dir):
                 refit=True,
                 workspace_gb=args.workspace_gb,
                 batch_max=args.batch_max,
+                batch_opt=args.batch_opt,
+                builder_optimization_level=args.builder_optimization_level,
+                env=env,
                 force_rebuild=args.force_rebuild,
                 checkpoint=args.checkpoint,
+                decoder_precision=decoder_precision,
+                strongly_typed=decoder_strongly_typed,
             ))
 
     # Windowed VAE decode (single 3-30s profile, duration-independent).
@@ -785,10 +1188,18 @@ def _run_all(args, project_root, onnx_dir):
         sys.exit(1)
 
 
-def _run_single(args, project_root, onnx_dir):
+def _run_single(args, project_root, onnx_dir, env):
     """Build a single engine configuration."""
     build_vae = not args.skip_vae
     build_decoder = args.decoder
+    decoder_precision = _resolve_decoder_precision(
+        checkpoint=args.checkpoint,
+        requested=args.decoder_precision,
+        decoder_mixed=args.decoder_mixed,
+    )
+    decoder_strongly_typed = _decoder_precision_is_strongly_typed(
+        decoder_precision, decoder_mixed=args.decoder_mixed,
+    )
 
     # ONNX phase
     onnx_paths = _ensure_onnx(
@@ -799,9 +1210,19 @@ def _run_single(args, project_root, onnx_dir):
         need_vae=build_vae,
         need_decoder_std=build_decoder and not args.decoder_refit,
         need_decoder_refit=build_decoder and args.decoder_refit,
-        decoder_mixed=args.decoder_mixed,
+        decoder_precision=decoder_precision,
         skip_onnx=args.skip_onnx,
+        force_onnx=args.force_onnx,
         export_locally=args.export_locally,
+    )
+    onnx_paths = _patch_decoder_onnx_for_dynamic_batch(
+        onnx_paths,
+        need_decoder_std=build_decoder and not args.decoder_refit,
+        need_decoder_refit=build_decoder and args.decoder_refit,
+        checkpoint=args.checkpoint,
+        decoder_precision=decoder_precision,
+        batch_max=args.batch_max,
+        force=args.force_onnx,
     )
 
     # Engine phase
@@ -813,6 +1234,8 @@ def _run_single(args, project_root, onnx_dir):
             onnx_paths=onnx_paths,
             duration=args.max_duration,
             workspace_gb=args.workspace_gb,
+            env=env,
+            force_rebuild=args.force_rebuild,
         )
         for label, path, elapsed, status in results:
             if status == "OK":
@@ -827,7 +1250,13 @@ def _run_single(args, project_root, onnx_dir):
             refit=args.decoder_refit,
             workspace_gb=args.workspace_gb,
             batch_max=args.batch_max,
+            batch_opt=args.batch_opt,
+            builder_optimization_level=args.builder_optimization_level,
+            env=env,
+            force_rebuild=args.force_rebuild,
             checkpoint=args.checkpoint,
+            decoder_precision=decoder_precision,
+            strongly_typed=decoder_strongly_typed,
         )
         label, path, elapsed, status = result
         if status == "OK":

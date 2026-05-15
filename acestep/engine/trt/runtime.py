@@ -123,12 +123,19 @@ class TRTDecoder:
         }
 
         for name, buf in bufs.items():
-            ctx.set_input_shape(name, tuple(buf.shape))
-            ctx.set_tensor_address(name, buf.data_ptr())
+            if not ctx.set_input_shape(name, tuple(buf.shape)):
+                raise RuntimeError(f"TRT decoder rejected input shape for {name}: {tuple(buf.shape)}")
+            if not ctx.set_tensor_address(name, buf.data_ptr()):
+                raise RuntimeError(f"TRT decoder rejected input address for {name}")
+
+        missing = ctx.infer_shapes()
+        if missing:
+            raise RuntimeError(f"TRT decoder shapes are insufficiently specified: {missing}")
 
         out_shape = tuple(ctx.get_tensor_shape(self.OUTPUT_NAME))
         out_buf = torch.empty(out_shape, dtype=self._output_dtype, device=dev)
-        ctx.set_tensor_address(self.OUTPUT_NAME, out_buf.data_ptr())
+        if not ctx.set_tensor_address(self.OUTPUT_NAME, out_buf.data_ptr()):
+            raise RuntimeError(f"TRT decoder rejected output address for {self.OUTPUT_NAME}")
 
         entry = {"bufs": bufs, "output": out_buf}
         self._buf_cache[key] = entry
@@ -175,12 +182,15 @@ class TRTDecoder:
         # Bind addresses
         ctx = self.context
         for name, buf in bufs.items():
-            ctx.set_tensor_address(name, buf.data_ptr())
-        ctx.set_tensor_address(self.OUTPUT_NAME, entry["output"].data_ptr())
+            if not ctx.set_tensor_address(name, buf.data_ptr()):
+                raise RuntimeError(f"TRT decoder rejected input address for {name}")
+        if not ctx.set_tensor_address(self.OUTPUT_NAME, entry["output"].data_ptr()):
+            raise RuntimeError(f"TRT decoder rejected output address for {self.OUTPUT_NAME}")
 
         # Execute on shared polygraphy stream.
         stream = self._stream
-        ctx.execute_async_v3(stream.ptr)
+        if not ctx.execute_async_v3(stream.ptr):
+            raise RuntimeError("TRT decoder execution failed")
         stream.synchronize()
 
         output = entry["output"]
