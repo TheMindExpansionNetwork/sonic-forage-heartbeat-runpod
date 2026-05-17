@@ -135,6 +135,12 @@ export interface SwapReadyMessage {
   type: "swap_ready";
   duration: number;
   channels: number;
+  /** Server-resolved BPM for the new source (sidecar value on a hit,
+   *  live librosa value otherwise). The client must mirror this into
+   *  the perf store so the swap-target's tempo replaces the previous
+   *  track's — otherwise the Detected: readout keeps showing the old
+   *  BPM after the swap completes. */
+  bpm?: number | null;
   key?: string;
   time_signature?: string;
   /** Server echoes the requested source label (fixture name for known

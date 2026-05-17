@@ -60,6 +60,7 @@ export function useFixtureSwap() {
           const detail = (e as CustomEvent<{
             interleaved: Float32Array;
             channels: number;
+            bpm?: number | null;
             key?: string;
             time_signature?: string;
           }>).detail;
@@ -72,18 +73,20 @@ export function useFixtureSwap() {
           if (getConfig().restart_song_on_swap) {
             session.player?.seek(0);
           }
-          // Always update detectedKey / detectedTimeSignature so the
-          // advanced strip's "Detected: …" readout reflects what the
-          // server actually resolved — even when the user overrode it
-          // below.
+          // Always update detectedBpm / detectedKey / detectedTimeSignature
+          // so the advanced strip's "Detected: …" readout reflects what
+          // the server actually resolved — even when the user overrode
+          // it below.
           const perf = usePerformanceStore.getState();
           const rawTs = detail.time_signature;
           const detectedTs = rawTs != null && isTimeSignature(rawTs)
             ? rawTs
             : null;
-          if (detail.key || detectedTs) {
+          const detectedBpm =
+            typeof detail.bpm === "number" ? detail.bpm : perf.detectedBpm;
+          if (detail.bpm != null || detail.key || detectedTs) {
             perf.setDetected(
-              perf.detectedBpm,
+              detectedBpm,
               detail.key ?? perf.detectedKey,
               detectedTs ?? perf.detectedTimeSignature,
             );

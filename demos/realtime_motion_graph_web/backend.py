@@ -68,7 +68,7 @@ from . import session_registry
 # ---------------------------------------------------------------------------
 
 def _try_load_sidecar(
-    fixture_name: str | None, *, checkpoint: str, samples: int,
+    fixture_name: str | None, *, samples: int,
 ) -> FixtureSidecar | None:
     """Look up a fixture sidecar; return None on miss / mismatch.
 
@@ -76,11 +76,15 @@ def _try_load_sidecar(
     what the sidecar was precomputed for (e.g. a smaller TRT profile
     cap kicking in). The caller falls back to live computation in that
     case so cached tensor shapes can't poison the streaming pipeline.
+
+    Sidecars are not checkpoint-gated; the VAE and semantic
+    tokenizer/detokenizer that produce the cached tensors are shared
+    across the ACE-Step v1.5 family.
     """
     if not fixture_name:
         return None
     try:
-        sc = fixture_sidecar(fixture_name, checkpoint=checkpoint)
+        sc = fixture_sidecar(fixture_name)
     except Exception as e:
         print(f"[Server] sidecar lookup failed for {fixture_name!r}: {e}")
         return None
@@ -137,17 +141,16 @@ def _resolve_bpm_key_source(
     audio_in: Audio,
     fixture_name: str | None,
     samples: int,
-    checkpoint: str,
     key_override: str | None = None,
     time_signature_override: str | None = None,
 ) -> tuple[PreparedSource, int, str, str]:
     """Resolve (source, bpm, key, time_signature) for a (fixture, audio) pair.
 
     For known fixtures with a sidecar present (JSON+safetensors in the
-    dataset or local staging dir, matching checkpoint and audio length),
-    returns the cached source latent + context_latent and reads BPM,
-    key, and time_signature from the sidecar JSON. Skips librosa beat
-    tracking, CNN key detection, and ``Session.prepare_source`` — the
+    dataset or local staging dir, matching audio length), returns the
+    cached source latent + context_latent and reads BPM, key, and
+    time_signature from the sidecar JSON. Skips librosa beat tracking,
+    CNN key detection, and ``Session.prepare_source`` — the
     prompt-independent half of the per-connect work.
 
     Conditioning is *not* cached (see fixtures.py). Callers run
@@ -157,7 +160,6 @@ def _resolve_bpm_key_source(
     Falls through to live librosa + detect_key + prepare_source when:
       - ``fixture_name`` is None / unknown
       - sidecar files aren't in the dataset yet
-      - checkpoint mismatch (tensors are tied to a specific build)
       - audio-length truncation mismatch (e.g. operator's TRT profile
         cap is smaller than the natural fixture length)
 
@@ -170,7 +172,7 @@ def _resolve_bpm_key_source(
     the swap, post-hoc dropdown edits flow through ``mtype == "prompt"``
     instead, where overrides do apply.
     """
-    sc = _try_load_sidecar(fixture_name, checkpoint=checkpoint, samples=samples)
+    sc = _try_load_sidecar(fixture_name, samples=samples)
 
     if sc is not None:
         device = session.handler.device
@@ -297,6 +299,39 @@ class VirtualMidiKnobs:
 
     def release(self):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Pipeline depth bounds
+# ---------------------------------------------------------------------------
+
+# Hard floor for the StreamPipeline ring buffer. <1 makes the buffer empty
+# and nothing ticks. The TRT cap is read from the loaded engine; the eager
+# / compile cap is fixed.
+MIN_PIPELINE_DEPTH = 1
+EAGER_MAX_PIPELINE_DEPTH = 4
+
+
+def _compute_max_pipeline_depth(diffusion_engine) -> int:
+    """Largest ``pipeline_depth`` the loaded backend can serve.
+
+    For TRT decoders this is the ``hidden_states`` batch dim's max bound
+    on optimization profile 0 (the canonical / only profile we build).
+    For eager / compile decoders the runtime has no fixed cap, so we
+    return ``EAGER_MAX_PIPELINE_DEPTH`` to match the docs and the demo's
+    knob ceiling.
+    """
+    trt_engine = getattr(diffusion_engine, "_trt_engine", None)
+    if trt_engine is None:
+        return EAGER_MAX_PIPELINE_DEPTH
+    try:
+        _, _, max_shape = trt_engine.get_tensor_profile_shape(
+            "hidden_states", 0,
+        )
+        return max(MIN_PIPELINE_DEPTH, int(max_shape[0]))
+    except Exception as exc:
+        print(f"[Server] couldn't read TRT batch cap: {exc!r}; using {EAGER_MAX_PIPELINE_DEPTH}")
+        return EAGER_MAX_PIPELINE_DEPTH
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +582,13 @@ def handle_client(
         print("[Server] WARNING: LoRA engine unavailable on this decoder")
         use_lora = False
 
+    max_pipeline_depth = _compute_max_pipeline_depth(engine_obj)
+    depth = max(MIN_PIPELINE_DEPTH, min(int(depth), max_pipeline_depth))
+    print(
+        f"[Server] pipeline_depth={depth} (max={max_pipeline_depth}, "
+        f"backend={'trt' if engine_obj._trt_engine is not None else 'eager'})"
+    )
+
     initial_enable_ids: list[str] = []
     if use_lora:
         # Resolve any explicit enable-by-id requests (these must already
@@ -588,7 +630,6 @@ def handle_client(
             audio_in=audio_in,
             fixture_name=fixture_name,
             samples=int(waveform.shape[1]),
-            checkpoint=checkpoint,
         )
     )
 
@@ -736,6 +777,12 @@ def handle_client(
         # don't accidentally hide every LoRA.
         "checkpoint": checkpoint,
         "checkpoint_scale": checkpoint_scale(checkpoint),
+        # Active ring-buffer depth + the runtime-imposed ceiling
+        # (TRT engine's hidden_states batch_max, or 4 for eager / compile).
+        # The client clamps its depth control to [1, max_pipeline_depth]
+        # and ships ``set_depth`` messages to retune live.
+        "pipeline_depth": depth,
+        "max_pipeline_depth": max_pipeline_depth,
     }))
     ws.send(src_np.astype(np.float16).tobytes())
     print(f"[Server] Sent initial buffer ({len(src_np) / SAMPLE_RATE:.1f}s)")
@@ -845,7 +892,6 @@ def handle_client(
         sc = (
             _try_load_sidecar(
                 struct_name_ref[0],
-                checkpoint=checkpoint,
                 samples=int(wf.shape[-1]),
             )
             if struct_name_ref[0] else None
@@ -933,8 +979,7 @@ def handle_client(
                 raise ValueError("timbre clip too short")
             clip_s = t_wf.shape[-1] / SAMPLE_RATE
             sc = _try_load_sidecar(
-                name, checkpoint=checkpoint,
-                samples=int(t_wf.shape[-1]),
+                name, samples=int(t_wf.shape[-1]),
             )
             if sc is not None:
                 device = session.handler.device
@@ -1032,6 +1077,15 @@ def handle_client(
     pending_enable: list[tuple[str, float | None]] = []
     pending_disable: list[str] = []
     pending_lock = threading.Lock()
+
+    # Live pipeline_depth retune. The StreamPipeline ring buffer can be
+    # resized between ticks; doing it from the recv thread would race the
+    # ongoing tick (slots may be mid-step), so we stash the target depth
+    # here and the runner thread applies it inside before_tick. A single
+    # slot is enough — a fresh value just replaces any unapplied one.
+    pending_depth_ref: list[int | None] = [None]
+    pending_depth_lock = threading.Lock()
+    current_depth_ref: list[int] = [int(depth)]
 
     def _send_catalog_update():
         try:
@@ -1313,6 +1367,14 @@ def handle_client(
             else:
                 prompt_blend_ref[0] = v
                 _refresh_conditioning()
+        elif mtype == "set_depth":
+            try:
+                v = int(data.get("value"))
+            except (TypeError, ValueError):
+                return
+            v = max(MIN_PIPELINE_DEPTH, min(v, max_pipeline_depth))
+            with pending_depth_lock:
+                pending_depth_ref[0] = v
         elif mtype == "enable_lora":
             lid = data.get("id")
             s = data.get("strength")
@@ -1594,7 +1656,6 @@ def handle_client(
                     audio_in=new_audio_in,
                     fixture_name=new_fixture_name,
                     samples=int(new_wf.shape[1]),
-                    checkpoint=checkpoint,
                     key_override=requested_key,
                     time_signature_override=requested_time_sig,
                 )
@@ -1707,6 +1768,38 @@ def handle_client(
             except Exception:
                 pass
 
+    def apply_depth_pending():
+        with pending_depth_lock:
+            target = pending_depth_ref[0]
+            pending_depth_ref[0] = None
+        if target is None or target == current_depth_ref[0]:
+            return
+        pipe = stream.pipeline
+        if pipe is None:
+            # First tick hasn't built the pipeline yet — re-queue and try
+            # again next iteration. set_depth on a missing pipeline would
+            # silently no-op.
+            with pending_depth_lock:
+                if pending_depth_ref[0] is None:
+                    pending_depth_ref[0] = target
+            return
+        try:
+            pipe.set_depth(target)
+            current_depth_ref[0] = pipe.depth
+        except Exception as exc:
+            print(f"[Server] set_depth({target}) failed: {exc}")
+            return
+        try:
+            with send_lock:
+                ws.send(json.dumps({
+                    "type": "depth_applied",
+                    "value": current_depth_ref[0],
+                }))
+        except ConnectionClosed:
+            running[0] = False
+        except Exception:
+            pass
+
     # Combined before_tick callback.  Both kinds of cross-thread
     # mutation (LoRA enable/disable refits and source swaps) are GPU-
     # bound and must run on the runner thread between ticks.  Drain
@@ -1714,6 +1807,7 @@ def handle_client(
     def apply_pending():
         apply_lora_pending()
         apply_swap_if_pending()
+        apply_depth_pending()
 
     # --- PipelineRunner: the SAME code as local ---
     runner = PipelineRunner(
