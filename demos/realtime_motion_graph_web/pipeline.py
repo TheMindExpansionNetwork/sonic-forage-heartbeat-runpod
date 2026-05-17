@@ -17,6 +17,13 @@ from acestep.nodes.vae_nodes import EmptyLatent, LatentBlend
 from .knobs import CHANNEL_GROUPS, KEYSTONE_CHANNELS
 from .protocol import SAMPLE_RATE, T
 
+# Largest tap index the feedback delay can address. Matches the
+# ``feedback_depth`` knob's ``max_val`` (knobs.py) and the SLIDER_META
+# max in web/types/engine.ts; the three must stay in sync. depth=1
+# reproduces the original behavior (blend with the most recent
+# finished latent).
+MAX_FEEDBACK_DEPTH = 8
+
 
 def _build_dcw_advanced(raw: dict) -> "DCWAdvanced | None":
     """Translate the client's three DCW fader values into a
@@ -246,6 +253,13 @@ class PipelineRunner:
 
     def run(self):
         last_latent = None
+        # Ring of past finished latents for the feedback delay-tap.
+        # latent_history[0] is the most recent generation (== last_latent
+        # when set), latent_history[1] is one tick older, etc. Capped at
+        # MAX_FEEDBACK_DEPTH because longer history would just sit unused
+        # — the knob can't reach past that anyway.
+        from collections import deque
+        latent_history: deque = deque(maxlen=MAX_FEEDBACK_DEPTH)
         last_wav = None
         last_decode_pos = None
         last_hint_str = 1.0
@@ -328,6 +342,7 @@ class PipelineRunner:
                 or chunk_changed
             ):
                 last_latent = None
+                latent_history.clear()
                 last_wav = None
                 last_decode_pos = None
                 prev_src_id = cur_src_id
@@ -342,7 +357,13 @@ class PipelineRunner:
             else:
                 with self.motion_lock:
                     m = self.motion_val[0]
-                raw = {self.k1_name: m, "seed": 0.0, "feedback": 0.0, "shift": 0.5}
+                raw = {
+                    self.k1_name: m,
+                    "seed": 0.0,
+                    "feedback": 0.0,
+                    "feedback_depth": 1.0,
+                    "shift": 0.5,
+                }
                 if self.use_sde:
                     raw["periodicity"] = 0.0
 
@@ -432,10 +453,28 @@ class PipelineRunner:
                     last_hint_str = hint_str
                     self._update_hint_strength(hint_str)
 
+            # Resolve the feedback tap. depth=1 is the legacy behavior
+            # (most recent latent); depth>1 walks back through history.
+            # If history is shorter than the requested depth (early
+            # ticks, post-swap reset), fall back to the oldest available
+            # tap rather than disabling feedback — the operator's intent
+            # is "use feedback," and the oldest tap is still musically
+            # in-bounds while history fills.
+            try:
+                fb_depth_raw = float(raw.get("feedback_depth", 1.0))
+            except (TypeError, ValueError):
+                fb_depth_raw = 1.0
+            fb_depth = max(1, min(MAX_FEEDBACK_DEPTH, int(round(fb_depth_raw))))
+
+            fb_latent = None
+            if feedback > 0.0 and latent_history:
+                tap_idx = min(fb_depth - 1, len(latent_history) - 1)
+                fb_latent = latent_history[tap_idx]
+
             source_lat = None
-            if feedback > 0.0 and last_latent is not None:
+            if fb_latent is not None:
                 src_tensor = live_src_lat.tensor
-                source_lat = (1.0 - feedback) * src_tensor + feedback * last_latent
+                source_lat = (1.0 - feedback) * src_tensor + feedback * fb_latent
 
             sde_curve = None
             if self.use_sde:
@@ -456,11 +495,6 @@ class PipelineRunner:
             else:
                 denoise = k1
                 self.sde_curve_display[0] = None
-
-            ode_curve = _curve_from_spec(raw.get("ode_noise_curve"), src_T)
-            if ode_curve is None:
-                ode_noise_val = self.midi_knobs.get_param("ode_noise") if self.use_midi else 0.0
-                ode_curve = torch.full((1, src_T, 1), ode_noise_val) if ode_noise_val > 0.01 else None
 
             # Source lock: x0_target_curve from client overrides the
             # scalar x0_target_strength knob. The latent is attached
@@ -498,7 +532,6 @@ class PipelineRunner:
             pipe = self.stream.pipeline
             if pipe is not None:
                 pipe.set_shared_curve("sde_denoise_curve", sde_curve)
-                pipe.set_shared_curve("ode_noise_curve", ode_curve)
                 pipe.set_shared_curve("velocity_scale", velocity_curve)
                 pipe.set_shared_curve("x0_target_strength", x0_str)
 
@@ -582,6 +615,9 @@ class PipelineRunner:
                             skipped = True
 
                 last_latent = result.clone()
+                # appendleft so latent_history[0] is the most recent;
+                # tap_idx = depth-1 reads "N ticks back."
+                latent_history.appendleft(last_latent)
 
                 if not skipped:
                     t1 = time.perf_counter()
@@ -700,6 +736,7 @@ class PipelineRunner:
                 self.params[self.k1_name] = round(k1, 2)
                 self.params["seed"] = seed
                 self.params["feedback"] = round(feedback, 2)
+                self.params["feedback_depth"] = fb_depth
                 self.params["shift"] = round(shift_val, 2)
                 if self.use_lora and self.engine_obj is not None:
                     for desc in self.engine_obj.list_loras():
@@ -710,7 +747,6 @@ class PipelineRunner:
                 if self.use_sde:
                     self.params["periodicity"] = round(raw.get("periodicity", 0.0), 2)
                 self.params["hint_strength"] = round(hint_str, 2)
-                self.params["ode_noise"] = round(ode_noise_val, 2)
                 for name, _, _ in CHANNEL_GROUPS:
                     self.params[name] = round(raw.get(name, 1.0), 2)
                 for name, _ in KEYSTONE_CHANNELS:

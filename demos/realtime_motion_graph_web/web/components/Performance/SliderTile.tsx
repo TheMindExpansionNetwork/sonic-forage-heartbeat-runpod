@@ -19,7 +19,7 @@ interface Props {
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
-  ode_noise: "ode",
+  feedback_depth: "fb depth",
   hint_strength: "structure strength",
   dcw_scaler: "DCW low",
   dcw_high_scaler: "DCW high",
@@ -44,10 +44,10 @@ const PARAM_TOOLTIPS: Record<string, string> = {
   // ── Engine internals ──
   feedback:
     "How similar each new generation is to the previous one. Low values give you variety on every refresh; higher values give you a continuous evolution where each generation flows into the next. 0.3–0.5 is the sweet spot for smooth continuity without everything sounding the same.",
+  feedback_depth:
+    "How far back in time the Feedback knob reaches. 1 (default) blends with the most recent generation. Higher values reach back several ticks for an echo / ghost effect — a faint repeat of an earlier moment surfaces in the current output. Lets you get distant feedback without cranking Feedback all the way up.",
   shift:
     "Advanced: changes where the model concentrates its work across denoising. The default is tuned for the turbo engine and works well in most cases — leave it alone unless you're chasing a specific feel.",
-  ode_noise:
-    "Adds a touch of randomness during generation. Bump it up if the model feels too deterministic — small values add subtle variation, higher values produce surprising bursts of creativity. Zero keeps generation fully predictable.",
   guidance_scale:
     "CFG strength. Only takes effect when the RCFG mode dropdown below is NOT 'off'. Higher values push the output further toward the prompt at the cost of more artifacts. Turbo is CFG-distilled, so the useful range is narrower than a base SD model — try 3–8.",
   cfg_rescale:
@@ -98,8 +98,8 @@ const KBD_FOR_PARAM: Record<string, string> = {
   hint_strength: "G + ▲▼",
   timbre_strength: "C + ▲▼",
   feedback: "E + ▲▼",
+  feedback_depth: "D + ▲▼",
   shift: "H + ▲▼",
-  ode_noise: "D + ▲▼",
   ch_g0: "0 + ▲▼",
   ch_g1: "1 + ▲▼",
   ch_g2: "2 + ▲▼",

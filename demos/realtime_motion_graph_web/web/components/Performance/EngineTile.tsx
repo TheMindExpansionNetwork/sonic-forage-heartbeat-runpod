@@ -7,10 +7,11 @@ import { RCFG_MODES, type RcfgMode } from "@/types/engine";
 import { SliderGroup } from "./SliderGroup";
 import { defaultLabelFor, kbdHintFor } from "./SliderTile";
 
-// Engine tile. Engine-internal scalars on the top (feedback, shift,
-// ode_noise), plus a conditional CFG cluster (guidance_scale,
-// cfg_rescale) when RCFG is not off, plus the RCFG mode dropdown in
-// the bottom strip mirroring DcwTile's layout.
+// Engine tile. Engine-internal scalars on the top (feedback +
+// feedback_depth, shift), plus a conditional CFG cluster
+// (guidance_scale, cfg_rescale) when RCFG is not off, plus the RCFG
+// mode dropdown and the live pipeline-depth picker in the bottom
+// strip mirroring DcwTile's layout.
 //
 // The CFG sliders only appear when ``rcfgMode != "off"`` — keeping
 // them visible when guidance is disabled is just visual noise (the
@@ -20,8 +21,8 @@ import { defaultLabelFor, kbdHintFor } from "./SliderTile";
 
 const ALWAYS_SLIDERS = [
   "feedback",
+  "feedback_depth",
   "shift",
-  "ode_noise",
 ];
 
 export function EngineTile() {

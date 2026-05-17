@@ -26,8 +26,13 @@ export const SLIDER_META: Record<string, SliderMeta> = {
   prompt_blend: { max: 1.0, step: 0.05 },
 
   feedback: { max: 1.0, step: 0.1, pro: true },
+  // Delay-tap depth for `feedback`. 1 == blend with the most recent
+  // finished latent (current behavior). N>1 reaches N ticks back, so
+  // feedback can produce echo / ghost effects without needing to crank
+  // the blend coefficient near 1.0 (which is the only way to reach
+  // distant past via the implicit recursion).
+  feedback_depth: { max: 8, step: 1, pro: true },
   shift: { max: 1.0, step: 0.1, pro: true },
-  ode_noise: { max: 0.5, step: 0.05, pro: true },
   // RCFG guidance scale. Only takes effect when rcfg_mode != "off". The
   // turbo model is CFG-distilled (trained to operate at scale=1 with
   // conditioning baked in); driving guidance past ~10 on turbo tends

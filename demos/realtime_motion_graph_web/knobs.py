@@ -59,6 +59,15 @@ def build_banks(sde: bool, loras=None) -> list:
         core["denoise"] = KnobDef(cc=cc, sensitivity=2.0); cc += 1
     core["seed"] = KnobDef(cc=cc, sensitivity=0.5); cc += 1
     core["feedback"] = KnobDef(cc=cc, sensitivity=2.0); cc += 1
+    # Delay-tap depth for the feedback knob. 1 == blend with the most
+    # recent finished latent (current behavior); N>1 reaches N ticks
+    # back for an echo / ghost effect that the scalar feedback alone
+    # can't reach without dominating the source. Integer-valued; capped
+    # at 8 to match the StreamPipeline ring buffer ceiling and the
+    # operator's mental tick budget.
+    core["feedback_depth"] = KnobDef(
+        cc=cc, default=1.0, sensitivity=4.0, max_val=8.0,
+    ); cc += 1
     core["shift"] = KnobDef(cc=cc, default=0.5, sensitivity=1.0); cc += 1
     if sde:
         core["periodicity"] = KnobDef(cc=cc, sensitivity=2.0, max_val=12.5); cc += 1
@@ -68,7 +77,6 @@ def build_banks(sde: bool, loras=None) -> list:
         )
         cc += 1
     core["hint_strength"] = KnobDef(cc=cc, default=1.0, sensitivity=2.0); cc += 1
-    core["ode_noise"] = KnobDef(cc=cc, default=0.0, sensitivity=2.0, max_val=0.5); cc += 1
 
     channels = {}
     for i, (name, _start, _end) in enumerate(CHANNEL_GROUPS):

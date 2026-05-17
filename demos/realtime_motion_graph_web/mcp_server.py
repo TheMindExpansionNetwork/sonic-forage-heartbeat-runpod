@@ -214,8 +214,8 @@ def _build_knob_catalog(sde: bool, enabled_lora_ids: list[str]) -> dict[str, dic
         }
     out["hint_strength"] = {"default": 1.0, "max": 1.0, "group": "core",
                             "description": "Structure (semantic hint) blend strength"}
-    out["ode_noise"] = {"default": 0.0, "max": 0.5, "group": "core",
-                        "description": "ODE noise injection amount"}
+    out["feedback_depth"] = {"default": 1.0, "max": 8.0, "group": "core",
+                             "description": "Feedback delay-tap depth in ticks (1 = last, N = N ticks back)"}
     for name in _GROUP_NAMES:
         out[name] = {"default": 1.0, "max": 3.0, "group": "groups",
                      "description": f"Channel-group amplifier {name}"}

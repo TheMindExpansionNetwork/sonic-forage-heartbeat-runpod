@@ -187,8 +187,8 @@ export interface RtmgConfigCurve {
 
 /** Per-param schedule curves the user (or an operator-supplied config)
  *  draws against the track timeline. Keyed by param name — the fixed
- *  six (denoise, hint_strength, feedback, shift, noise_share, ode_noise)
- *  plus dynamic LoRA strength curves (lora_str_<id>). */
+ *  set (denoise, hint_strength, feedback, shift, noise_share) plus
+ *  dynamic LoRA strength curves (lora_str_<id>). */
 export interface RtmgConfigCurves {
   /** Master enable. When false, no curve drives any param regardless
    *  of per-curve enabled flags. */
@@ -247,8 +247,8 @@ export const DEFAULT_CONFIG: RtmgConfig = {
     denoise: 0.7,
     hint_strength: 1.4,
     feedback: 0.0,
+    feedback_depth: 1,
     shift: 0.5,
-    ode_noise: 0.0,
     ch_g0: 1.0,
     ch_g1: 1.0,
     ch_g2: 1.0,

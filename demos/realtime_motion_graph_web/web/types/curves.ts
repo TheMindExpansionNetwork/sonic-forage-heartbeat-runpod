@@ -36,7 +36,6 @@ export const SCHEDULEABLE_PARAMS = [
   "hint_strength",
   "feedback",
   "shift",
-  "ode_noise",
 ] as const;
 
 export type ScheduleableParam = (typeof SCHEDULEABLE_PARAMS)[number];
@@ -62,7 +61,6 @@ export const SCHEDULEABLE_PARAM_LABEL: Record<ScheduleableParam, string> = {
   hint_strength: "Structure strength",
   feedback: "Feedback",
   shift: "Shift",
-  ode_noise: "ODE noise",
 };
 
 /** Default curve: a flat line at midrange. Two points, both `smooth`. */
