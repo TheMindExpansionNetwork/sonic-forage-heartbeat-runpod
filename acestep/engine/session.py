@@ -202,6 +202,37 @@ class Session:
             from acestep.paths import checkpoints_dir
             project_root = str(checkpoints_dir())
 
+        # Kick off disk-bound preloads in background threads while
+        # ModelContext loads the DiT shards. Both are pure I/O (no CUDA,
+        # no torch ops that contend with the main thread) and release
+        # the GIL during file reads.
+        #
+        # - trt_decoder_bytes_future: pre-reads the TRT engine file (~1–2 GB)
+        #   so engine_from_bytes on the main thread can skip the disk read.
+        # - lora_discovery_future: pre-walks the LoRA roots (rglob +
+        #   .resolve() per file is several seconds on Windows for ~37 LoRAs
+        #   across the primary library + ACESTEP_EXTRA_LORA_DIRS).
+        from concurrent.futures import ThreadPoolExecutor
+        _preload_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="boot-preload",
+        )
+        trt_decoder_bytes_future = None
+        if decoder_backend == "tensorrt":
+            from polygraphy.backend.common import bytes_from_path
+            trt_decoder_bytes_future = _preload_pool.submit(
+                bytes_from_path, str(trt_engines["decoder"]),
+            )
+
+        def _discover_loras_safely():
+            try:
+                from acestep.paths import discover_all_loras
+                return discover_all_loras()
+            except Exception:
+                return None
+        lora_discovery_future = _preload_pool.submit(_discover_loras_safely)
+        # Pool dies after both futures complete; no need to keep the handle.
+        _preload_pool.shutdown(wait=False)
+
         ctx_flags = backends_to_model_context_flags(
             decoder_backend=decoder_backend, vae_backend=vae_backend
         )
@@ -276,6 +307,8 @@ class Session:
             vae_backend=vae_backend,
             trt_engines=trt_engines,
             device=device,
+            trt_decoder_bytes_future=trt_decoder_bytes_future,
+            lora_discovery_future=lora_discovery_future,
         )
 
     @property

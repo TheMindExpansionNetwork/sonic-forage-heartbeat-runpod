@@ -61,6 +61,8 @@ def apply_trt_backends(
     vae_backend: str,
     trt_engines: dict[str, str],
     device: str,
+    trt_decoder_bytes_future=None,
+    lora_discovery_future=None,
 ) -> None:
     """Wire TRT engines into a freshly constructed ModelContext.
 
@@ -79,11 +81,23 @@ def apply_trt_backends(
     from acestep.engine.diffusion import DiffusionEngine
 
     if decoder_backend == "tensorrt":
+        # Hand the stashed real decoder (CPU tensors) to DiffusionEngine
+        # so TRTLoRAManager reads base weights from memory instead of
+        # re-opening the checkpoint shards. ModelContext sets this when
+        # built with skip_decoder=True; it's None otherwise.
+        pending = getattr(ctx, "_pending_decoder", None)
         ctx._diffusion_engine = DiffusionEngine(
             ctx.model,
             trt_engine_path=trt_engines["decoder"],
             compile_loops=False,  # TRT decoder, no need to compile loops
+            pending_decoder=pending,
+            trt_decoder_bytes_future=trt_decoder_bytes_future,
+            lora_discovery_future=lora_discovery_future,
         )
+        # TRTLoRAManager has captured what it needs; let the ~6 GB CPU
+        # buffer go.
+        ctx._pending_decoder = None
+        del pending
     elif ctx.model is not None:
         # Eager / compile: same wrapper, no TRT engine path. The
         # ``compile_loops`` flag governs the ODE/SDE inner-step

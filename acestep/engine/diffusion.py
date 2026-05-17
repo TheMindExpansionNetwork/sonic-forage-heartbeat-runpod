@@ -70,7 +70,16 @@ class DiffusionEngine:
     sharing the timestep-schedule helper with ``StreamPipeline``.
     """
 
-    def __init__(self, model, trt_engine_path=None, compile_loops: bool = True):
+    def __init__(
+        self,
+        model,
+        trt_engine_path=None,
+        compile_loops: bool = True,
+        *,
+        pending_decoder=None,
+        trt_decoder_bytes_future=None,
+        lora_discovery_future=None,
+    ):
         """
         Args:
             model: AceStepConditionGenerationModel instance.
@@ -84,9 +93,25 @@ class DiffusionEngine:
                 are wrapped with ``torch.compile`` on first use. Set to
                 False to skip the compile and run the loops eagerly,
                 avoiding the autotune warmup.
+            pending_decoder: Real decoder module retained on CPU when
+                ``ModelContext`` ran with ``skip_decoder=True``. Hands
+                live base weights to ``TRTLoRAManager`` so it doesn't
+                re-read the checkpoint shards. Dropped after the manager
+                is built.
+            trt_decoder_bytes_future: Optional Future[bytes] that has been
+                pre-reading the TRT engine file from disk in the background
+                during ModelContext init. When provided, load_trt_engine
+                skips its own bytes_from_path call.
+            lora_discovery_future: Optional Future[list[Path]] that has been
+                walking the LoRA roots in the background. When provided,
+                register_library uses the pre-discovered file list instead
+                of re-walking the filesystem.
         """
         self.model = model
         self.decoder = model.decoder
+        self._pending_decoder = pending_decoder
+        self._trt_decoder_bytes_future = trt_decoder_bytes_future
+        self._lora_discovery_future = lora_discovery_future
         self._compile_loops = compile_loops
 
         # TRT state (owned directly, no wrapper class).
@@ -137,7 +162,27 @@ class DiffusionEngine:
             raise FileNotFoundError(f"TRT engine not found: {engine_path}")
 
         logger.info("Loading TRT decoder engine from {} ...", engine_path)
-        self._trt_engine = engine_from_bytes(bytes_from_path(str(engine_path)))
+        # Prefer the pre-read bytes from the background preloader (started
+        # at Session.__init__) — by now the file is already in RAM and the
+        # disk read overlapped DiT shard loading. Fall back to a fresh
+        # bytes_from_path on direct DiffusionEngine callers (tests, etc.)
+        # or if the preload errored out.
+        engine_bytes = None
+        preload_future = self._trt_decoder_bytes_future
+        if preload_future is not None:
+            try:
+                engine_bytes = preload_future.result()
+            except Exception as exc:
+                logger.warning(
+                    "TRT bytes preload failed ({}); re-reading from disk.", exc,
+                )
+            self._trt_decoder_bytes_future = None
+        if engine_bytes is None:
+            engine_bytes = bytes_from_path(str(engine_path))
+        self._trt_engine = engine_from_bytes(engine_bytes)
+        # Drop the local bytes reference so the GB-scale buffer can be
+        # freed; engine_from_bytes has consumed it.
+        del engine_bytes
         self._trt_ctx = self._trt_engine.create_execution_context()
         self._trt_stream = _get_trt_stream()
         self._trt_buf_cache = {}
@@ -190,20 +235,61 @@ class DiffusionEngine:
                 if ckpt_dir and os.path.isdir(ckpt_dir):
                     ckpt_path = ckpt_dir
 
+            # Prefer the stashed real decoder (CPU tensors retained by
+            # ModelContext when skip_decoder=True) over the empty stub
+            # sitting on self.decoder. Falls back to the checkpoint
+            # disk read only when neither is available.
+            lora_decoder = self._pending_decoder if self._pending_decoder is not None else self.decoder
             self._lora_manager = TRTLoRAManager(
                 engine=self._trt_engine,
-                decoder=self.decoder,
+                decoder=lora_decoder,
                 device=torch.device("cuda"),
                 trt_weight_prefix="decoder.",
                 checkpoint_path=ckpt_path,
                 engine_path=str(engine_path),
             )
+            # Drop the temporary reference — the manager has pinned its
+            # own copies of the base weights. Holding it would pin ~6 GB
+            # of CPU RAM for the life of the engine.
+            self._pending_decoder = None
             # Pre-register the on-disk library (MODELS_DIR/loras).  This
             # is the catalog backing the "infinite library" workflow:
             # register every .safetensors as REGISTERED (zero RAM cost),
             # callers materialize on demand via enable_lora.
             try:
-                self._lora_manager.register_library()
+                # Consume the pre-discovered file list if Session preloaded
+                # it in a background thread. Falls back to a fresh scan
+                # when there's no future (direct DiffusionEngine callers)
+                # or when the preload errored out.
+                discovered = None
+                lora_future = self._lora_discovery_future
+                if lora_future is not None:
+                    try:
+                        discovered = lora_future.result()
+                    except Exception as exc:
+                        logger.warning(
+                            "LoRA discovery preload failed ({}); re-scanning.",
+                            exc,
+                        )
+                    self._lora_discovery_future = None
+                if discovered is not None:
+                    # register_library(directory=...) would re-walk one root.
+                    # We already have the union across primary + extra dirs,
+                    # so iterate register_lora directly and emit the same
+                    # summary line for log parity.
+                    ids: list[str] = []
+                    for p in discovered:
+                        try:
+                            ids.append(self._lora_manager.register_lora(str(p)))
+                        except Exception as exc:
+                            logger.warning("Failed to register {}: {}", p, exc)
+                    if discovered:
+                        logger.info(
+                            "Registered library: {} LoRAs across all "
+                            "configured root(s)", len(ids),
+                        )
+                else:
+                    self._lora_manager.register_library()
             except Exception as e:
                 logger.warning("Failed to scan LoRA library: {}", e)
         except RuntimeError as e:
