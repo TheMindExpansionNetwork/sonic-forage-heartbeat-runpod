@@ -68,6 +68,7 @@ export interface SessionConfig {
   time_signature?: string;
   enabled_loras?: string[];
   prompt?: string;
+  prompt_b?: string;
   lora_strengths?: Record<string, number>;
   // Allow extras — pyproject's config object is permissive.
   [k: string]: unknown;

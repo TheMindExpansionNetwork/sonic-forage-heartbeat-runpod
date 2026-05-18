@@ -408,6 +408,7 @@ def handle_client(
     depth = config.get("depth", 4)
     steps = config.get("steps", 8)
     prompt = config.get("prompt", "instrumental music")
+    prompt_b = config.get("prompt_b", prompt)
     fast_vae = config.get("fast_vae", False)
     # Walk-window mode: route long sources through the 60s DiT engine by
     # sliding a fixed-T window across the song each tick (avoids the
@@ -685,6 +686,16 @@ def handle_client(
         prompt, source.latent, detected_bpm, audio_duration_s,
         detected_key, detected_time_signature,
     )
+    # Encode prompt B at session start so the blend slider works
+    # immediately without forcing the operator to click Send Tags.
+    # When B matches A, reuse the pair (no second encoder pass).
+    if prompt_b and prompt_b != prompt:
+        cond_silence_b, cond_full_b = _encode_cond_pair(
+            prompt_b, source.latent, detected_bpm, audio_duration_s,
+            detected_key, detected_time_signature,
+        )
+    else:
+        cond_silence_b, cond_full_b = cond_silence, cond_full
     conditioning = cond_full  # default strength=1.0 == cond_full
 
     # Negative conditioning for the RCFG path (Residual CFG). Empty-prompt
@@ -825,12 +836,13 @@ def handle_client(
     # swap_source, and set/clear_timbre_source.
     timbre_strength_ref = [1.0]
     cond_pair_ref = [(cond_silence, cond_full)]
-    # Prompt A/B blend. B starts mirroring A so the slider is a no-op
-    # until the client sends a real promptB via the ``prompt`` message
-    # (Send Prompt). Then this pair is encoded against the same source
-    # + timbre as A, and set_prompt_blend lerps between them per tick.
-    cond_pair_b_ref = [(cond_silence, cond_full)]
-    prompt_text_b = [prompt]
+    # Prompt A/B blend. B is encoded at session start from config.prompt_b
+    # (falls back to A when missing/equal, in which case the slider is a
+    # no-op until the operator edits B and hits Send Tags). The pair is
+    # encoded against the same source + timbre as A, and set_prompt_blend
+    # lerps between them per tick.
+    cond_pair_b_ref = [(cond_silence_b, cond_full_b)]
+    prompt_text_b = [prompt_b]
     prompt_blend_ref = [0.0]
     # Optional uploaded timbre-track latent. None == use the playback
     # source's own latent (self-timbre, current default).

@@ -71,6 +71,7 @@ function buildConfig(fixtureName: string): SessionConfig {
     walk_window_s: cfg.walk_window_s ?? 60,
     enabled_loras: enabledLoras,
     prompt: perf.promptA,
+    prompt_b: perf.promptB,
     lora_strengths: loraStrengths,
     // Lets the server look up a precomputed sidecar (BPM, key, source
     // latent, context_latent). Absent / unknown name -> live path.
