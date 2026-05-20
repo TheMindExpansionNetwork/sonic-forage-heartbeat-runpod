@@ -15,12 +15,29 @@ import {
 type MirrorListener = () => void;
 type StemOverlayKind = "vocals" | "instruments";
 
+// Stem overlays (vocals / instruments) are mixed *inside* the audio worklet
+// (or _spProcess in the ScriptProcessor fallback) so they share the main
+// buffer's playhead and seam-crossfade loop point. The previous design used
+// standalone AudioBufferSourceNodes on the main thread; their hard-loop
+// didn't match the worklet's seam fade and the two clocks ran free, so the
+// overlay drifted out of phase with the inference output after the first
+// wrap. The main thread now just holds the buffer + smoothing state for
+// the SP fallback path and forwards everything to the worklet otherwise.
 interface StemOverlayState {
-  buffer: AudioBuffer | null;
-  gain: GainNode | null;
-  source: AudioBufferSourceNode | null;
+  interleaved: Float32Array | null;
+  channels: number;
+  frameCount: number;
+  /** UI-set target. Worklet smooths to this; SP fallback smooths via
+   *  `volume` below using the same time constant. */
+  targetVolume: number;
+  /** Live smoothed value. Only used by the SP fallback path (the worklet
+   *  owns its own smoothing). */
   volume: number;
 }
+
+// 25 ms single-pole IIR for overlay volume smoothing in the SP fallback.
+// Matches the worklet's _volRampAlpha so both code paths feel the same.
+const SP_OVERLAY_VOL_RAMP_S = 0.025;
 
 // –1 dBTP ceiling, expressed as linear amplitude (10 ** (-1/20)).
 const LUFS_PEAK_CEILING = 0.891;
@@ -91,9 +108,10 @@ export class AudioPlayer {
   private _recordDest: MediaStreamAudioDestinationNode | null = null;
   private _masterOut: GainNode | null = null;
   private _stemOverlays: Record<StemOverlayKind, StemOverlayState> = {
-    vocals: { buffer: null, gain: null, source: null, volume: 0 },
-    instruments: { buffer: null, gain: null, source: null, volume: 0 },
+    vocals: { interleaved: null, channels: 2, frameCount: 0, targetVolume: 0, volume: 0 },
+    instruments: { interleaved: null, channels: 2, frameCount: 0, targetVolume: 0, volume: 0 },
   };
+  private _spOverlayVolAlpha = 0;
 
   // Loop + seek state. The worklet path owns its own copy of `loop` (set
   // via postMessage); these fields are the main-thread mirror so the SP
@@ -166,9 +184,10 @@ export class AudioPlayer {
     if (this._useWorklet) {
       // Stable URL — worklet ships from public/ so AudioContext can resolve it.
       // Cache-busting query bumped manually when the worklet message
-      // surface changes (e.g. v2 added setLoopBand). The browser caches
-      // worklet bytes per-URL and hard refresh doesn't always invalidate.
-      await this.ctx.audioWorklet.addModule("/audio-worklet.js?v=2");
+      // surface changes (v2 = setLoopBand, v3 = stem overlays inside the
+      // worklet). The browser caches worklet bytes per-URL and hard
+      // refresh doesn't always invalidate.
+      await this.ctx.audioWorklet.addModule("/audio-worklet.js?v=3");
 
       const node = new AudioWorkletNode(this.ctx, "realtime-buffer", {
         numberOfInputs: 0,
@@ -210,6 +229,12 @@ export class AudioPlayer {
       this.node = sp;
       sp.onaudioprocess = (e: AudioProcessingEvent) => this._spProcess(e);
     }
+
+    // Per-frame IIR coefficient for SP-fallback overlay volume smoothing.
+    // Computed against the live AudioContext sample rate so it matches the
+    // worklet's _volRampAlpha (same 25 ms time constant).
+    this._spOverlayVolAlpha =
+      1 - Math.exp(-1 / (this.ctx.sampleRate * SP_OVERLAY_VOL_RAMP_S));
 
     this._masterOut = this.ctx.createGain();
     this._masterOut.gain.value = 1.0;
@@ -290,40 +315,66 @@ export class AudioPlayer {
   ): void {
     if (!this.ctx) return;
     const state = this._stemOverlays[kind];
-    this._stopStemOverlay(kind);
-    state.buffer = this._audioBufferFromInterleaved(interleaved, channels);
-    if (!state.gain) {
-      state.gain = this.ctx.createGain();
-      state.gain.gain.value = state.volume;
-      state.gain.connect(this._masterOut ?? this.ctx.destination);
+    // Keep an own copy: postMessage with a transfer would zero the
+    // caller's buffer (useStemOverlaySync hands us a Float32Array it
+    // doesn't own a duplicate of), and the SP fallback also needs the
+    // buffer to stay live on the main thread.
+    state.interleaved = interleaved.slice();
+    state.channels = channels;
+    state.frameCount = (interleaved.length / channels) | 0;
+    if (this._useWorklet && this.node) {
+      const send = interleaved.slice();
+      const node = this.node as AudioWorkletNode;
+      node.port.postMessage(
+        { type: "setOverlayBuffer", kind, buffer: send, channels },
+        [send.buffer],
+      );
+      // Re-assert target volume so a buffer arriving after a clear
+      // (e.g. song swap → new stem_assets) picks the user's level back
+      // up instead of staying silent until they touch the slider.
+      // setOverlayBuffer's volume seed comes from the previous entry,
+      // which clearOverlayBuffer just deleted.
+      if (state.targetVolume > 0) {
+        node.port.postMessage({
+          type: "setOverlayVolume",
+          kind,
+          volume: state.targetVolume,
+        });
+      }
     }
-    if (state.volume > 0) this._startStemOverlay(kind, this.positionSec);
   }
 
   clearStemOverlays(): void {
     (Object.keys(this._stemOverlays) as StemOverlayKind[]).forEach((kind) => {
-      this._stopStemOverlay(kind);
-      this._stemOverlays[kind].buffer = null;
+      const state = this._stemOverlays[kind];
+      state.interleaved = null;
+      state.frameCount = 0;
+      state.volume = 0;
+      // targetVolume is intentionally preserved across a clear: the
+      // user's slider position outlives a song swap, and setStemOverlay
+      // re-asserts it to the worklet when the next buffer lands.
+      if (this._useWorklet && this.node) {
+        (this.node as AudioWorkletNode).port.postMessage({
+          type: "clearOverlayBuffer",
+          kind,
+        });
+      }
     });
   }
 
   setStemOverlayVolume(kind: StemOverlayKind, volume: number): void {
     const state = this._stemOverlays[kind];
-    state.volume = Math.max(0, Math.min(1.5, volume));
-    if (!this.ctx) return;
-    if (!state.gain) {
-      state.gain = this.ctx.createGain();
-      state.gain.gain.value = state.volume;
-      state.gain.connect(this._masterOut ?? this.ctx.destination);
+    const v = Math.max(0, Math.min(1.5, volume));
+    state.targetVolume = v;
+    if (this._useWorklet && this.node) {
+      (this.node as AudioWorkletNode).port.postMessage({
+        type: "setOverlayVolume",
+        kind,
+        volume: v,
+      });
     }
-    const t = this.ctx.currentTime;
-    state.gain.gain.cancelScheduledValues(t);
-    state.gain.gain.setTargetAtTime(state.volume, t, 0.025);
-    if (state.volume > 0 && state.buffer && !state.source) {
-      this._startStemOverlay(kind, this.positionSec);
-    } else if (state.volume <= 0) {
-      this._stopStemOverlay(kind);
-    }
+    // SP fallback uses state.volume which is smoothed inside _spProcess
+    // against state.targetVolume, so no immediate write is needed here.
   }
 
   /** Read-only view of the current buffer (for waveform rendering). */
@@ -391,9 +442,9 @@ export class AudioPlayer {
   setLoop(enabled: boolean): void {
     this._loop = enabled;
     this._spEndSignaled = false;
-    for (const state of Object.values(this._stemOverlays)) {
-      if (state.source) state.source.loop = enabled;
-    }
+    // Overlays follow the main playhead inside the worklet / _spProcess,
+    // so toggling loop here doesn't need to be propagated to them
+    // separately — they share the wrap logic.
     if (this._useWorklet && this.node) {
       (this.node as AudioWorkletNode).port.postMessage({
         type: "setLoop",
@@ -411,10 +462,9 @@ export class AudioPlayer {
     );
     this.positionSec = target / SAMPLE_RATE;
     this._spEndSignaled = false;
-    (Object.keys(this._stemOverlays) as StemOverlayKind[]).forEach((kind) => {
-      const state = this._stemOverlays[kind];
-      if (state.buffer && state.volume > 0) this._startStemOverlay(kind, this.positionSec);
-    });
+    // Overlays follow the main playhead inside the worklet / _spProcess —
+    // a seek is automatically reflected at sample boundary on the next
+    // process tick, no overlay restart needed.
     if (this._useWorklet && this.node) {
       (this.node as AudioWorkletNode).port.postMessage({
         type: "seek",
@@ -489,67 +539,6 @@ export class AudioPlayer {
   }
 
   // ── internals ────────────────────────────────────────────────────────
-
-  private _audioBufferFromInterleaved(
-    interleaved: Float32Array,
-    channels: number,
-  ): AudioBuffer {
-    if (!this.ctx) {
-      throw new Error("Audio context is not initialized");
-    }
-    const frameCount = Math.floor(interleaved.length / channels);
-    const buffer = this.ctx.createBuffer(channels, frameCount, SAMPLE_RATE);
-    for (let c = 0; c < channels; c++) {
-      const dst = buffer.getChannelData(c);
-      for (let i = 0; i < frameCount; i++) {
-        dst[i] = interleaved[i * channels + c] ?? 0;
-      }
-    }
-    return buffer;
-  }
-
-  private _startStemOverlay(kind: StemOverlayKind, offsetSec: number): void {
-    if (!this.ctx) return;
-    const state = this._stemOverlays[kind];
-    const buffer = state.buffer;
-    if (!buffer) return;
-    this._stopStemOverlay(kind);
-    if (!state.gain) {
-      state.gain = this.ctx.createGain();
-      state.gain.gain.value = state.volume;
-      state.gain.connect(this._masterOut ?? this.ctx.destination);
-    }
-    const source = this.ctx.createBufferSource();
-    source.buffer = buffer;
-    source.loop = this._loop;
-    source.connect(state.gain);
-    source.onended = () => {
-      if (state.source === source) state.source = null;
-    };
-    const duration = Math.max(0.001, buffer.duration);
-    const offset = this._loop
-      ? ((offsetSec % duration) + duration) % duration
-      : Math.min(offsetSec, Math.max(0, duration - 0.001));
-    state.source = source;
-    try {
-      source.start(this.ctx.currentTime, offset);
-    } catch {
-      state.source = null;
-    }
-  }
-
-  private _stopStemOverlay(kind: StemOverlayKind): void {
-    const state = this._stemOverlays[kind];
-    if (!state.source) return;
-    try {
-      state.source.onended = null;
-      state.source.stop();
-    } catch {}
-    try {
-      state.source.disconnect();
-    } catch {}
-    state.source = null;
-  }
 
   private _startMetering(): void {
     if (this._meterIntervalId !== null) return;
@@ -811,6 +800,20 @@ export class AudioPlayer {
     for (let c = 0; c < output.numberOfChannels; c++) {
       outChs.push(output.getChannelData(c));
     }
+    // Stem overlays — snapshot the active ones so we don't pay an
+    // object iterator per frame. Mirrors the worklet's mix logic so
+    // the SP fallback behaves identically (same seam fade, same phase
+    // lock to the main playhead).
+    const overlays: StemOverlayState[] = [];
+    {
+      const ov = this._stemOverlays.vocals;
+      if (ov.interleaved && ov.frameCount > 0) overlays.push(ov);
+    }
+    {
+      const ov = this._stemOverlays.instruments;
+      if (ov.interleaved && ov.frameCount > 0) overlays.push(ov);
+    }
+    const volAlpha = this._spOverlayVolAlpha;
     let pos = this._spPosition;
     for (let i = 0; i < frames; i++) {
       if (!this._loop && pos >= nFrames - 1) {
@@ -821,20 +824,45 @@ export class AudioPlayer {
         }
         continue;
       }
-      if (this._loop && seam > 0 && nFrames - pos <= seam) {
-        const distFromEnd = nFrames - pos;
-        const t = (seam - distFromEnd) / seam;
-        const headPos = seam - distFromEnd;
+      const inSeam = this._loop && seam > 0 && nFrames - pos <= seam;
+      const distFromEnd = inSeam ? nFrames - pos : 0;
+      const seamT = inSeam ? (seam - distFromEnd) / seam : 0;
+      const headPos = inSeam ? seam - distFromEnd : 0;
+      if (inSeam) {
         for (let c = 0; c < outChs.length; c++) {
           const cc = Math.min(c, ch - 1);
           const sTail = buf[pos * ch + cc];
           const sHead = buf[headPos * ch + cc];
-          outChs[c][i] = sTail * (1 - t) + sHead * t;
+          outChs[c][i] = sTail * (1 - seamT) + sHead * seamT;
         }
       } else {
         for (let c = 0; c < outChs.length; c++) {
           const cc = Math.min(c, ch - 1);
           outChs[c][i] = buf[pos * ch + cc];
+        }
+      }
+      // Overlay mix — same per-frame IIR smoothing as the worklet, same
+      // seam handling, no fading branch (overlays are cleared on swap).
+      for (let oi = 0; oi < overlays.length; oi++) {
+        const ov = overlays[oi];
+        ov.volume += (ov.targetVolume - ov.volume) * volAlpha;
+        const ovBuf = ov.interleaved!;
+        if (ov.volume < 1e-4) continue;
+        if (pos >= ov.frameCount) continue;
+        const ovCh = ov.channels;
+        const ovVol = ov.volume;
+        if (inSeam && headPos < ov.frameCount) {
+          for (let c = 0; c < outChs.length; c++) {
+            const cc = Math.min(c, ovCh - 1);
+            const sTail = ovBuf[pos * ovCh + cc];
+            const sHead = ovBuf[headPos * ovCh + cc];
+            outChs[c][i] += (sTail * (1 - seamT) + sHead * seamT) * ovVol;
+          }
+        } else {
+          for (let c = 0; c < outChs.length; c++) {
+            const cc = Math.min(c, ovCh - 1);
+            outChs[c][i] += ovBuf[pos * ovCh + cc] * ovVol;
+          }
         }
       }
       pos++;
