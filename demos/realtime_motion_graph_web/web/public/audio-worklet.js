@@ -11,6 +11,14 @@
 //   {type:'seek',     positionFrames:int}                      // jump playhead
 //   {type:'setLoopBand', startFrames:int, endFrames:int}       // wrap at end→start
 //   {type:'clearLoopBand'}                                     // disable band loop
+//   {type:'setOverlayBuffer',   kind:string, buffer:Float32Array, channels:int}
+//   {type:'clearOverlayBuffer', kind:string}
+//   {type:'setOverlayVolume',   kind:string, volume:float}
+//
+// Stem overlays (vocals / instruments) live in the worklet so they share
+// the main buffer's playhead and seam-crossfade loop point — playing them
+// as standalone AudioBufferSourceNodes on the main thread drifted because
+// their hard-loop didn't match the seam fade and the two clocks ran free.
 //
 // Messages to main thread:
 //   {type:'position',    positionSec:float, swapCount:int, kick:float}
@@ -71,6 +79,21 @@ class RealtimeBufferProcessor extends AudioWorkletProcessor {
     this.loopBandEnd = -1;
 
     this._framesSinceReport = 0;
+
+    // Stem overlays. Each entry holds the interleaved PCM, channel count,
+    // a target volume from the UI, and a per-frame-smoothed live volume
+    // so toggles/sliders don't zipper. Mixed in process() using the same
+    // playhead the main buffer reads from, so the seam crossfade keeps
+    // them phase-locked to the main loop instead of free-running on the
+    // AudioContext clock. _overlayList is the hot-loop iterable, kept in
+    // sync with the keyed object by every setter (avoids `for...in` in
+    // the per-frame inner loop).
+    this.overlays = Object.create(null);
+    this._overlayList = [];
+    // 25 ms single-pole IIR for volume smoothing. ~75 ms to 95% of a
+    // step at 48 kHz — fast enough to feel instant, slow enough to kill
+    // zipper noise on slider drags.
+    this._volRampAlpha = 1 - Math.exp(-1 / (sampleRate * 0.025));
 
     // Kick state: ring of squared frame energies, running sum.
     this._kickRing = new Float32Array(KICK_WINDOW);
@@ -150,6 +173,53 @@ class RealtimeBufferProcessor extends AudioWorkletProcessor {
       this.loopBandEnd = -1;
       return;
     }
+    if (type === "setOverlayBuffer") {
+      const kind = String(msg.kind || "");
+      if (!kind) return;
+      const channels = msg.channels || 2;
+      const buffer = msg.buffer;
+      const frameCount = buffer ? (buffer.length / channels) | 0 : 0;
+      const prev = this.overlays[kind];
+      this.overlays[kind] = {
+        buffer,
+        channels,
+        frameCount,
+        targetVolume: prev ? prev.targetVolume : 0,
+        // Start at the previous live volume so a buffer swap (e.g. song
+        // swap) doesn't pop — the smoothing then resolves to whatever
+        // targetVolume the UI has set.
+        volume: prev ? prev.volume : 0,
+      };
+      this._refreshOverlayList();
+      return;
+    }
+    if (type === "clearOverlayBuffer") {
+      const kind = String(msg.kind || "");
+      if (!kind) return;
+      delete this.overlays[kind];
+      this._refreshOverlayList();
+      return;
+    }
+    if (type === "setOverlayVolume") {
+      const kind = String(msg.kind || "");
+      if (!kind) return;
+      const v = Math.max(0, Math.min(1.5, Number(msg.volume) || 0));
+      if (!this.overlays[kind]) {
+        // Volume can land before the buffer (UI default volumes are set
+        // up-front). Stash it so the buffer-arrival handler picks it up.
+        this.overlays[kind] = {
+          buffer: null,
+          channels: 2,
+          frameCount: 0,
+          targetVolume: v,
+          volume: 0,
+        };
+        this._refreshOverlayList();
+        return;
+      }
+      this.overlays[kind].targetVolume = v;
+      return;
+    }
     if (type === "patch" || type === "add") {
       if (!this.current) return;
       const start = msg.start | 0;
@@ -174,6 +244,12 @@ class RealtimeBufferProcessor extends AudioWorkletProcessor {
       }
       return;
     }
+  }
+
+  _refreshOverlayList() {
+    const list = [];
+    for (const k in this.overlays) list.push(this.overlays[k]);
+    this._overlayList = list;
   }
 
   process(_inputs, outputs) {
@@ -239,6 +315,50 @@ class RealtimeBufferProcessor extends AudioWorkletProcessor {
         for (let c = 0; c < outChannels; c++) {
           const cc = Math.min(c, ch - 1);
           output[c][i] = this.current[pos * ch + cc];
+        }
+      }
+
+      // Stem overlay mix. Reads each overlay at the SAME `pos` the main
+      // buffer just read from, applying the same seam crossfade when the
+      // playhead is in the loop-wrap zone — that's what keeps overlays
+      // phase-locked instead of free-running on a separate clock.
+      // Volume is smoothed per frame with a single-pole IIR (see
+      // _volRampAlpha) so UI slider drags don't zipper. The fading
+      // (old→new main buffer) branch above has no overlay analogue
+      // because AudioPlayer.swap clears overlays before the new main
+      // buffer arrives — the brief overlap (~25 ms) plays no overlay.
+      const overlays = this._overlayList;
+      const volAlpha = this._volRampAlpha;
+      for (let oi = 0; oi < overlays.length; oi++) {
+        const ov = overlays[oi];
+        ov.volume += (ov.targetVolume - ov.volume) * volAlpha;
+        const buf = ov.buffer;
+        if (!buf || ov.volume < 1e-4) continue;
+        if (pos >= ov.frameCount) continue;
+        const ovCh = ov.channels;
+        const ovVol = ov.volume;
+        if (this.loop && seam > 0 && (nCur - pos) <= seam) {
+          const distFromEnd = nCur - pos;
+          const t = (seam - distFromEnd) / seam;
+          const headPos = seam - distFromEnd;
+          if (headPos < ov.frameCount) {
+            for (let c = 0; c < outChannels; c++) {
+              const cc = Math.min(c, ovCh - 1);
+              const sTail = buf[pos * ovCh + cc];
+              const sHead = buf[headPos * ovCh + cc];
+              output[c][i] += (sTail * (1 - t) + sHead * t) * ovVol;
+            }
+          } else {
+            for (let c = 0; c < outChannels; c++) {
+              const cc = Math.min(c, ovCh - 1);
+              output[c][i] += buf[pos * ovCh + cc] * ovVol;
+            }
+          }
+        } else {
+          for (let c = 0; c < outChannels; c++) {
+            const cc = Math.min(c, ovCh - 1);
+            output[c][i] += buf[pos * ovCh + cc] * ovVol;
+          }
         }
       }
 
