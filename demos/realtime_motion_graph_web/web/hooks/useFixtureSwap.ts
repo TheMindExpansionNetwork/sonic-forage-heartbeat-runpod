@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 
 import { loadFixtureAudio } from "@/engine/audio/loadFixture";
 import { getConfig } from "@/lib/config";
+import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
 import { isTimeSignature } from "@/types/engine";
@@ -129,13 +130,25 @@ export function useFixtureSwap() {
         const onFail = (e: Event) => {
           remote.removeEventListener("swap_ready", onReady);
           remote.removeEventListener("swap_failed", onFail);
-          console.warn("[fixture-swap] server swap_failed:", (e as CustomEvent).detail);
+          const error = (e as CustomEvent).detail;
+          console.warn("[fixture-swap] server swap_failed:", error);
+          if (useCustomTracksStore.getState().resolveSourceMode(name)) {
+            useCustomTracksStore
+              .getState()
+              .setStemStatus(name, "failed", String(error || "Swap failed"));
+          }
           resolve(false);
         };
         remote.addEventListener("swap_ready", onReady);
         remote.addEventListener("swap_failed", onFail);
 
         const perf = usePerformanceStore.getState();
+        const sourceMode = useCustomTracksStore
+          .getState()
+          .resolveSourceMode(name);
+        if (sourceMode) {
+          useCustomTracksStore.getState().setStemStatus(name, "processing");
+        }
         // Key is intentionally NOT sent: the server resolves via the
         // new fixture's sidecar (or CNN-detects on a miss) and echoes
         // the result in `swap_ready.key`, which we write into the
@@ -152,6 +165,8 @@ export function useFixtureSwap() {
           perf.promptA,
           undefined,
           name,
+          undefined,
+          sourceMode,
         );
         if (!sent) {
           remote.removeEventListener("swap_ready", onReady);

@@ -7,6 +7,7 @@ import {
   listFixtures,
   pickDefaultFixture,
   type DecodedFixture,
+  type StemSourceMode,
 } from "@/engine/audio/loadFixture";
 import { LOCAL_MODE } from "@/lib/runtime";
 import { useCustomTracksStore } from "@/store/useCustomTracksStore";
@@ -168,10 +169,11 @@ export function AudioSourceCrate() {
   function commitPending(
     keyOverride: string | null,
     timeSignatureOverride: TimeSignature | null,
+    sourceMode: StemSourceMode,
   ) {
     if (!pending) return;
     const { decoded, fileName, originalFile } = pending;
-    addCustomTrack(fileName, decoded, originalFile);
+    addCustomTrack(fileName, decoded, originalFile, sourceMode);
     const perf = usePerformanceStore.getState();
     if (keyOverride) {
       perf.setPendingKeyOverride(keyOverride);
@@ -335,8 +337,8 @@ export function AudioSourceCrate() {
           defaultTimeSignature={
             usePerformanceStore.getState().activeTimeSignature
           }
-          onContinue={({ keyOverride, timeSignatureOverride }) =>
-            commitPending(keyOverride, timeSignatureOverride)
+          onContinue={({ keyOverride, timeSignatureOverride, sourceMode }) =>
+            commitPending(keyOverride, timeSignatureOverride, sourceMode)
           }
           onPickAnother={() => {
             setPending(null);

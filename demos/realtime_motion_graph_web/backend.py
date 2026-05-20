@@ -16,7 +16,6 @@ import os
 import queue
 import socket
 import struct
-import sys
 import threading
 import time
 from pathlib import Path
@@ -53,6 +52,11 @@ from acestep.paths import (
 
 from .audio_engine import AudioEngine
 from .knobs import build_banks, CHANNEL_GROUPS, KEYSTONE_CHANNELS
+from .melband_reformer import (
+    extract_upload_stems,
+    normalize_stem_source_mode,
+    resolve_upload_stem_source_mode,
+)
 from .protocol import (
     SAMPLE_RATE,
     SLICE_FLAG_DELTA,
@@ -164,6 +168,68 @@ def _normalize_time_signature(value: object) -> str | None:
         s = value.strip()
         return s if s in _VALID_TIME_SIG_STRS else None
     return None
+
+
+def _send_stem_payload(
+    ws,
+    *,
+    fixture_name: str | None,
+    source_mode: str | None,
+    stems: dict[str, torch.Tensor],
+) -> None:
+    order = ["vocals", "instruments"]
+    first = stems[order[0]]
+    frames = int(first.shape[-1])
+    channels = int(first.shape[0])
+    ws.send(json.dumps({
+        "type": "stem_assets",
+        "fixture_name": fixture_name or "",
+        "sample_rate": SAMPLE_RATE,
+        "channels": channels,
+        "frames": frames,
+        "stems": order,
+        "source_mode": source_mode or "full",
+    }))
+    for name in order:
+        arr = stems[name].detach().cpu().numpy().T.astype(np.float16)
+        ws.send(arr.tobytes())
+
+
+def _extract_and_select_upload_stem(
+    waveform: torch.Tensor,
+    *,
+    session: Session,
+    source: PreparedSource,
+    source_mode: str | None,
+    log_context: str = "",
+) -> tuple[dict[str, torch.Tensor] | None, str | None, PreparedSource, torch.Tensor]:
+    if source_mode is None:
+        return None, None, source, waveform
+
+    log_prefix = f"{log_context}: " if log_context else ""
+    rip_verb = "ripping" if log_context else "Ripping"
+    prepare_verb = "preparing" if log_context else "Preparing"
+    print(
+        f"[Server] {log_prefix}{rip_verb} upload stems via Mel-Band RoFormer "
+        f"(source_mode={source_mode})..."
+    )
+    try:
+        upload_stems = extract_upload_stems(
+            waveform=waveform,
+            device=session.handler.device,
+            backend_sample_rate=SAMPLE_RATE,
+        )
+        if source_mode == "full":
+            return upload_stems, None, source, waveform
+
+        selected_wf = upload_stems[source_mode]
+        selected_audio = Audio(waveform=selected_wf, sample_rate=SAMPLE_RATE)
+        print(f"[Server] {log_prefix}{prepare_verb} {source_mode} stem as source...")
+        selected_source = session.prepare_source(selected_audio)
+        return upload_stems, None, selected_source, selected_wf
+    except Exception as exc:
+        print(f"[Server] {log_prefix}stem extraction failed: {exc}")
+        return None, str(exc), source, waveform
 
 
 def _resolve_bpm_key_source(
@@ -494,6 +560,11 @@ def handle_client(
     # key, source latent, conditioning). Absent / unknown name -> fully
     # live path; same behavior as before sidecars existed.
     fixture_name = config.get("fixture_name")
+    stem_source_mode = resolve_upload_stem_source_mode(
+        fixture_name,
+        normalize_stem_source_mode(config.get("stem_source_mode")),
+        known_fixtures=KNOWN_FIXTURES,
+    )
 
     # LoRA selection.  ``enabled_loras`` is the new id-keyed protocol;
     # ``lora_paths`` / ``lora_path`` are interpreted as filesystem paths
@@ -707,6 +778,26 @@ def handle_client(
             samples=int(waveform.shape[1]),
         )
     )
+    upload_stems: dict[str, torch.Tensor] | None = None
+    stem_error: str | None = None
+    upload_stems, stem_error, source, waveform = _extract_and_select_upload_stem(
+        waveform,
+        session=session,
+        source=source,
+        source_mode=stem_source_mode,
+    )
+    if stem_error is not None and stem_source_mode != "full":
+        try:
+            ws.send(json.dumps({
+                "type": "error",
+                "code": "stem_extract_failed",
+                "message": f"Stem extraction failed: {stem_error}",
+            }))
+        except Exception:
+            pass
+        ws.close(1011, "stem extraction failed")
+        return
+
     _ms("resolve_source_done")
 
     # Two-conditioning cache for the live timbre-strength slider.
@@ -874,6 +965,19 @@ def handle_client(
         "max_pipeline_depth": max_pipeline_depth,
     }))
     ws.send(src_np.astype(np.float16).tobytes())
+    if upload_stems is not None:
+        _send_stem_payload(
+            ws,
+            fixture_name=fixture_name,
+            source_mode=stem_source_mode,
+            stems=upload_stems,
+        )
+    elif stem_error is not None:
+        ws.send(json.dumps({
+            "type": "stem_failed",
+            "fixture_name": fixture_name or "",
+            "error": stem_error,
+        }))
     print(f"[Server] Sent initial buffer ({len(src_np) / SAMPLE_RATE:.1f}s)")
     _ms("initial_buffer_sent")
 
@@ -1629,6 +1733,11 @@ def handle_client(
                     )
                 )
                 swap_pending["fixture_name"] = data.get("fixture_name")
+                swap_pending["stem_source_mode"] = (
+                    normalize_stem_source_mode(
+                        data.get("stem_source_mode")
+                    )
+                )
         else:
             # Unknown mtype — log but don't crash; lets future protocol
             # additions degrade gracefully on older servers.
@@ -1722,6 +1831,11 @@ def handle_client(
             requested_key = swap_pending.get("key")
             requested_time_sig = swap_pending.get("time_signature")
             new_fixture_name = swap_pending.get("fixture_name")
+            new_stem_source_mode = resolve_upload_stem_source_mode(
+                new_fixture_name,
+                swap_pending.get("stem_source_mode"),
+                known_fixtures=KNOWN_FIXTURES,
+            )
             if audio_msg is None:
                 return
             swap_pending["bytes"] = None
@@ -1729,6 +1843,7 @@ def handle_client(
             swap_pending["key"] = None
             swap_pending["time_signature"] = None
             swap_pending["fixture_name"] = None
+            swap_pending["stem_source_mode"] = None
         try:
             new_wf = _decode_audio_msg(audio_msg)
             # Cap at the same ceiling the initial upload used so swaps
@@ -1786,6 +1901,24 @@ def handle_client(
                     time_signature_override=requested_time_sig,
                 )
             )
+            new_upload_stems: dict[str, torch.Tensor] | None = None
+            new_stem_error: str | None = None
+            new_upload_stems, new_stem_error, new_source, new_wf = (
+                _extract_and_select_upload_stem(
+                    new_wf,
+                    session=session,
+                    source=new_source,
+                    source_mode=new_stem_source_mode,
+                    log_context="swap",
+                )
+            )
+            if new_stem_error is not None and new_stem_source_mode != "full":
+                with send_lock:
+                    ws.send(json.dumps({
+                        "type": "swap_failed",
+                        "error": f"Stem extraction failed: {new_stem_error}",
+                    }))
+                return
             # Use the active timbre reference if one is uploaded; otherwise
             # the new playback source's own latent. Override persists
             # across source swaps.
@@ -1878,6 +2011,19 @@ def handle_client(
                     "fixture_name": new_fixture_name,
                 }))
                 ws.send(new_src_np.astype(np.float16).tobytes())
+                if new_upload_stems is not None:
+                    _send_stem_payload(
+                        ws,
+                        fixture_name=new_fixture_name,
+                        source_mode=new_stem_source_mode,
+                        stems=new_upload_stems,
+                    )
+                elif new_stem_error is not None:
+                    ws.send(json.dumps({
+                        "type": "stem_failed",
+                        "fixture_name": new_fixture_name or "",
+                        "error": new_stem_error,
+                    }))
             print(f"[Server] Source swap complete ({len(new_src_np) / SAMPLE_RATE:.1f}s)")
         except ConnectionClosed:
             running[0] = False

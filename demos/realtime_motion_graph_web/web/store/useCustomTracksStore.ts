@@ -2,55 +2,114 @@
 
 import { create } from "zustand";
 
-import type { DecodedFixture } from "@/engine/audio/loadFixture";
+import type {
+  DecodedFixture,
+  DecodedStemAssets,
+  StemSourceMode,
+} from "@/engine/audio/loadFixture";
 
-// In-memory cache for user-uploaded tracks. The decoded PCM lives in a
-// non-reactive Map (Float32Array doesn't survive JSON / localStorage), and
-// the names are mirrored into a reactive list so the fixture dropdown
-// re-renders when an upload completes. Cleared on page reload — uploads
-// are session-scoped, matching how the pod treats fixtures (it only ever
-// sees the decoded PCM, never the file).
-//
-// `originalFiles` keeps the original encoded File alongside the decoded
-// buffer so downstream consumers (e.g. demon-public-demo's saved-sessions
-// feature, which uploads the original to a bucket on session save) can
-// recover the bytes without having to re-prompt the user. It's a Map of
-// name → File and lives next to `decoded` so adds stay atomic. Like
-// `decoded`, it's non-reactive and read via getState().
+// In-memory cache for user-uploaded tracks. The decoded PCM and related upload
+// metadata live in one non-persistent Map (Float32Array and File don't survive
+// JSON / localStorage), and the names are mirrored into a reactive list so the
+// fixture dropdown re-renders when an upload completes. Cleared on page reload
+// — uploads are session-scoped, matching how the pod treats fixtures.
+
+export type StemStatus = "idle" | "processing" | "ready" | "failed";
+
+export interface CustomTrack {
+  decoded: DecodedFixture;
+  /** Original encoded upload, when available from the file-picker path. */
+  originalFile?: File;
+  /** Which version of the uploaded track should feed model inference. */
+  sourceMode: StemSourceMode;
+  /** Model-ripped stems returned by the backend. */
+  stems?: DecodedStemAssets;
+  stemStatus: StemStatus;
+  stemError?: string;
+}
 
 interface CustomTracksState {
   /** Names in upload order. Reactive — components subscribe to this. */
   names: string[];
-  /** Decoded buffers keyed by name. Read directly via getState() from
-   *  non-React code (loadFixtureAudio); updates don't re-render. */
-  decoded: Map<string, DecodedFixture>;
-  /** Original encoded File keyed by name. Populated when add() is called
-   *  with a File argument (the AudioSourceCrate upload path). May be
-   *  empty for tracks added via other paths. */
-  originalFiles: Map<string, File>;
+  /** Upload records keyed by name. Read via getState() from non-React code. */
+  tracks: Map<string, CustomTrack>;
 
-  add: (name: string, decoded: DecodedFixture, file?: File) => void;
+  add: (
+    name: string,
+    decoded: DecodedFixture,
+    file?: File,
+    sourceMode?: StemSourceMode,
+  ) => void;
+  setStemStatus: (
+    name: string,
+    status: StemStatus,
+    error?: string,
+  ) => void;
+  setSourceMode: (name: string, sourceMode: StemSourceMode) => void;
+  setStems: (name: string, stems: DecodedStemAssets) => void;
+  resolveSourceMode: (name: string) => StemSourceMode | undefined;
   has: (name: string) => boolean;
 }
 
 export const useCustomTracksStore = create<CustomTracksState>((set, get) => ({
   names: [],
-  decoded: new Map(),
-  originalFiles: new Map(),
+  tracks: new Map(),
 
-  add: (name, decoded, file) =>
+  add: (name, decoded, file, sourceMode = "full") =>
     set((s) => {
-      const nextDecoded = new Map(s.decoded);
-      nextDecoded.set(name, decoded);
-      const nextOriginalFiles = new Map(s.originalFiles);
-      if (file) nextOriginalFiles.set(name, file);
+      const nextTracks = new Map(s.tracks);
+      nextTracks.set(name, {
+        decoded,
+        ...(file ? { originalFile: file } : {}),
+        sourceMode,
+        stemStatus: "idle",
+      });
       const nextNames = s.names.includes(name) ? s.names : [...s.names, name];
       return {
         names: nextNames,
-        decoded: nextDecoded,
-        originalFiles: nextOriginalFiles,
+        tracks: nextTracks,
       };
     }),
 
-  has: (name) => get().decoded.has(name),
+  setStemStatus: (name, status, error) =>
+    set((s) => {
+      const track = s.tracks.get(name);
+      if (!track) return {};
+      const nextTracks = new Map(s.tracks);
+      nextTracks.set(name, {
+        ...track,
+        stemStatus: status,
+        ...(error ? { stemError: error } : { stemError: undefined }),
+      });
+      return { tracks: nextTracks };
+    }),
+
+  setSourceMode: (name, sourceMode) =>
+    set((s) => {
+      const track = s.tracks.get(name);
+      if (!track) return {};
+      const nextTracks = new Map(s.tracks);
+      nextTracks.set(name, { ...track, sourceMode });
+      return { tracks: nextTracks };
+    }),
+
+  setStems: (name, stems) =>
+    set((s) => {
+      const track = s.tracks.get(name);
+      if (!track) return {};
+      const nextTracks = new Map(s.tracks);
+      nextTracks.set(name, {
+        ...track,
+        stems,
+        stemStatus: "ready",
+        stemError: undefined,
+      });
+      return { tracks: nextTracks };
+    }),
+
+  resolveSourceMode: (name) => {
+    return get().tracks.get(name)?.sourceMode;
+  },
+
+  has: (name) => get().tracks.has(name),
 }));

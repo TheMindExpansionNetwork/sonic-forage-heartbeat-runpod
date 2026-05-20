@@ -19,6 +19,14 @@ export interface DecodedFixture {
   sampleRate: number;
 }
 
+export type StemSourceMode = "full" | "vocals" | "instruments";
+export type StemOverlayKind = "vocals" | "instruments";
+
+export interface DecodedStemAssets {
+  vocals: DecodedFixture;
+  instruments: DecodedFixture;
+}
+
 // Server-side latent pool size (1920 * 5 = 9600 samples = 0.2 s at
 // 48 kHz). backend.py and the sidecar precompute both align to this;
 // trimming the decoded fixture to the same boundary keeps the runtime
@@ -104,7 +112,7 @@ export async function loadFixtureAudio(name: string): Promise<DecodedFixture> {
   // Custom uploads short-circuit the pod fetch — they live in memory only.
   // Imported lazily to avoid a Zustand cycle at module load.
   const { useCustomTracksStore } = await import("@/store/useCustomTracksStore");
-  const cached = useCustomTracksStore.getState().decoded.get(name);
+  const cached = useCustomTracksStore.getState().tracks.get(name)?.decoded;
   if (cached) return cached;
 
   const url = podHttp(`/fixtures/${encodeURIComponent(name)}`);

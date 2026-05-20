@@ -19,6 +19,7 @@ import { useRenderLoop } from "@/hooks/useRenderLoop";
 import { useScheduledCurves } from "@/hooks/useScheduledCurves";
 import { useRefSourceAcks } from "@/hooks/useRefSourceAcks";
 import { useStartSession } from "@/hooks/useStartSession";
+import { useStemOverlaySync } from "@/hooks/useStemOverlaySync";
 import { useTimbreSync } from "@/hooks/useTimbreSync";
 import { useVideoLayer } from "@/hooks/useVideoLayer";
 import { useConfig } from "@/lib/config";
@@ -46,6 +47,7 @@ import { PortraitLockOverlay } from "./PortraitLockOverlay";
 import { RecordingPreview } from "./RecordingPreview";
 import { StartOverlay } from "./StartOverlay";
 import { StatusBar } from "./StatusBar";
+import { StemOverlayPanel } from "./StemOverlayPanel";
 import { WaveformScrubBox } from "./WaveformScrubBox";
 
 // Demo shell — wires the package's hooks + components into a working app.
@@ -74,6 +76,7 @@ export function PerformanceShell() {
   useEdgeLoraBinding();
   useTimbreSync();
   usePromptBlendSync();
+  useStemOverlaySync();
   useRefSourceAcks("timbre");
   useRefSourceAcks("structure");
   useMcpMirror();
@@ -106,6 +109,7 @@ export function PerformanceShell() {
     <>
     <div id="performance" className="screen">
       {status === "ready" && <AudioSourceCrate />}
+      {status === "ready" && <StemOverlayPanel />}
       {/* Permanent 3-knob row above the drawer handle — performance
           palette (DENOISE / STRUCTURE / FEEDBACK / SEED). The component
           handles its own visibility internally; mount it unconditionally

@@ -70,6 +70,12 @@ export interface SessionConfig {
   prompt?: string;
   prompt_b?: string;
   lora_strengths?: Record<string, number>;
+  /** For uploaded tracks, asks the server to model-rip stems and choose
+   *  which source should feed inference. Built-in fixtures omit this. */
+  stem_source_mode?: "full" | "vocals" | "instruments";
+  /** When true, the backend loads a known fixture from its own cache and
+   *  the client skips sending the audio frame. Capability-probed first. */
+  use_server_fixture?: boolean;
   // Allow extras — pyproject's config object is permissive.
   [k: string]: unknown;
 }
@@ -169,6 +175,22 @@ export interface SwapReadyMessage {
   fixture_name?: string;
 }
 
+export interface StemAssetsMessage {
+  type: "stem_assets";
+  fixture_name: string;
+  sample_rate: number;
+  channels: number;
+  frames: number;
+  stems: ("vocals" | "instruments")[];
+  source_mode?: "full" | "vocals" | "instruments";
+}
+
+export interface StemFailedMessage {
+  type: "stem_failed";
+  fixture_name?: string;
+  error?: string;
+}
+
 export interface SwapFailedMessage {
   type: "swap_failed";
   error?: string;
@@ -184,6 +206,8 @@ export type ServerJsonMessage =
   | LoraCatalogMessage
   | SwapReadyMessage
   | SwapFailedMessage
+  | StemAssetsMessage
+  | StemFailedMessage
   | DepthAppliedMessage
   | { type: string; [k: string]: unknown };
 

@@ -19,6 +19,7 @@ import {
   type AudioSlice,
   type LoraCatalogEntry,
   type SessionConfig,
+  type StemAssetsMessage,
   type SwapReadyMessage,
 } from "@/types/protocol";
 
@@ -111,6 +112,8 @@ export class RemoteBackend extends EventTarget {
 
   private _pending: PendingPayload | null;
   private _pendingSwap: SwapReadyMessage | null = null;
+  private _pendingStemAssets: StemAssetsMessage | null = null;
+  private _pendingStemBuffers: Partial<Record<"vocals" | "instruments", Float32Array>> = {};
   // Slice decoder runs in a worker so fzstd.decompress + float16→float32
   // never block the render loop or input handling. Worker is single-threaded
   // and postMessage is FIFO, so audio slices stay in order.
@@ -302,6 +305,37 @@ export class RemoteBackend extends EventTarget {
           return;
         }
 
+        // Stem assets are sent as a JSON header followed by one float16
+        // binary buffer per listed stem. Consume them before the generic
+        // audio-slice path so overlay buffers never get parsed as slices.
+        if (this._pendingStemAssets && ev.data instanceof ArrayBuffer) {
+          const meta = this._pendingStemAssets;
+          const stem = meta.stems[
+            Object.keys(this._pendingStemBuffers).length
+          ];
+          if (stem) {
+            const u16 = new Uint16Array(ev.data);
+            this._pendingStemBuffers[stem] = float16ArrayToFloat32(u16);
+          }
+          const complete = meta.stems.every(
+            (name) => this._pendingStemBuffers[name],
+          );
+          if (complete) {
+            const buffers = this._pendingStemBuffers as Record<
+              "vocals" | "instruments",
+              Float32Array
+            >;
+            this._pendingStemAssets = null;
+            this._pendingStemBuffers = {};
+            this.dispatchEvent(
+              new CustomEvent("stem_assets", {
+                detail: { ...meta, buffers },
+              }),
+            );
+          }
+          return;
+        }
+
         if (typeof ev.data === "string") {
           let msg: { type: string; [k: string]: unknown };
           try {
@@ -344,6 +378,15 @@ export class RemoteBackend extends EventTarget {
           } else if (msg.type === "swap_failed") {
             this.dispatchEvent(
               new CustomEvent("swap_failed", { detail: msg.error }),
+            );
+          } else if (msg.type === "stem_assets") {
+            this._pendingStemAssets = msg as unknown as StemAssetsMessage;
+            this._pendingStemBuffers = {};
+          } else if (msg.type === "stem_failed") {
+            this._pendingStemAssets = null;
+            this._pendingStemBuffers = {};
+            this.dispatchEvent(
+              new CustomEvent("stem_failed", { detail: msg }),
             );
           } else if (msg.type === "timbre_set") {
             this.dispatchEvent(
@@ -727,6 +770,7 @@ export class RemoteBackend extends EventTarget {
     key?: string,
     fixtureName?: string,
     timeSignature?: string,
+    stemSourceMode?: "full" | "vocals" | "instruments",
   ): boolean {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
     try {
@@ -736,6 +780,7 @@ export class RemoteBackend extends EventTarget {
         key?: string;
         fixture_name?: string;
         time_signature?: string;
+        stem_source_mode?: "full" | "vocals" | "instruments";
       } = {
         type: "swap_source",
       };
@@ -743,6 +788,7 @@ export class RemoteBackend extends EventTarget {
       if (key) msg.key = key;
       if (fixtureName) msg.fixture_name = fixtureName;
       if (timeSignature) msg.time_signature = timeSignature;
+      if (stemSourceMode) msg.stem_source_mode = stemSourceMode;
       this.ws.send(JSON.stringify(msg));
       const samples = interleaved.length / channels;
       const hdr = new ArrayBuffer(8);
