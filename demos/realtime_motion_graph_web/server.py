@@ -50,7 +50,19 @@ _ACCEL = "tensorrt"
 # idle settings reset) and the initial display mode can be CLI-driven.
 _KIOSK = False
 _DEFAULT_MODE = "graph"
+# Set by main() once CLI args are parsed; the HTTP /api/loras and
+# /api/* meta endpoints read it so the UI can label the active
+# checkpoint scale (2B / 5B) without waiting for the WS ready frame.
+# Initialized to the default acestep-v15-turbo (2B) to keep the
+# endpoint sane in --no-backend mode where main() may exit early.
+_CHECKPOINT: str = "acestep-v15-turbo"
 _VALID_MODES = ("graph", "video")
+
+# Short aliases for --checkpoint. Map directly to the canonical
+# checkpoint directory name under <MODELS_DIR>/checkpoints/.
+_CHECKPOINT_ALIASES = {
+    "xl": "acestep-v15-xl-turbo",
+}
 
 _NO_CACHE_HEADERS = [
     ("Cache-Control", "no-store, must-revalidate"),
@@ -105,10 +117,24 @@ def _process_request(connection, request):
 
     # API: server-info — lets the client know whether the backend is up.
     if path_only == "/api/server-info":
+        # Surface startup-warmup state so the pool can gate "free" on a
+        # warmed engine. Read only if backend is already imported — don't
+        # force the heavy import in --no-backend mode.
+        _warm = None
+        _be = sys.modules.get("demos.realtime_motion_graph_web.backend")
+        if _be is not None:
+            _warm = getattr(_be, "WARMUP_STATE", None)
         body = json.dumps({
             "no_backend": _NO_BACKEND,
             "kiosk": _KIOSK,
             "default_mode": _DEFAULT_MODE,
+            "warmup": _warm,
+            # Fixtures the pod can load server-side: the client may send
+            # {use_server_fixture:true, fixture_name:<one of these>} and
+            # skip the ~20 MB PCM upload entirely. Advertised here so the
+            # UI only opts in against a backend that supports it (the UI
+            # ships via Vercel instantly; the backend via bake, lagged).
+            "server_side_fixtures": sorted(KNOWN_FIXTURES),
         }).encode()
         _log_http(remote, 200, "GET", url)
         return Response(
@@ -116,6 +142,14 @@ def _process_request(connection, request):
             Headers([
                 ("Content-Type", "application/json; charset=utf-8"),
                 ("Content-Length", str(len(body))),
+                # Public, read-only capability probe. The webapp UI
+                # (served from a different origin than the pod tunnel)
+                # fetches this before the WS handshake to decide whether
+                # the pod supports server-side fixture load. Simple GET,
+                # no credentials/custom headers → no preflight; a single
+                # ACAO:* on the response is sufficient and safe (nothing
+                # sensitive here).
+                ("Access-Control-Allow-Origin", "*"),
                 *_NO_CACHE_HEADERS,
             ]),
             body,
@@ -127,32 +161,55 @@ def _process_request(connection, request):
     # resolution the WebSocket pipeline uses, so everyone agrees on
     # what's in the catalog.
     if path_only == "/api/loras":
-        from acestep.paths import discover_loras, lora_trigger, loras_dir
+        from acestep.lora_metadata import load_lora_metadata
+        from acestep.paths import (
+            checkpoint_scale,
+            discover_all_loras,
+            extra_lora_dirs,
+            loras_dir,
+        )
         try:
-            d = loras_dir()
-            # Per-entry ``trigger`` is read from a sidecar
-            # ``<stem>.trigger.txt`` next to each .safetensors (managed
-            # by demon-public-demo's download_loras.sh + the lora-train
-            # convert step). Field is always present in the response —
-            # empty string when no sidecar — so the client can do
-            # ``entry.trigger || null`` without an existence check. The
-            # engine consults the same sidecar at encode time and
-            # prepends the trigger to the user's caption when the LoRA
-            # is enabled.
-            entries = [
-                {
-                    "id": p.stem, "name": p.stem, "path": str(p),
-                    "trigger": lora_trigger(p),
-                    "state": "registered", "strength": 0.0,
+            # Recursive across the primary library AND every directory
+            # in ACESTEP_EXTRA_LORA_DIRS, matching the engine's own
+            # register_library() scan so the HTTP catalog and the
+            # engine-side catalog stay in lockstep.
+            entries = []
+            seen_ids: set[str] = set()
+            for p in discover_all_loras():
+                # Same-stem dedup mirrors LoRAManager.register_lora's
+                # first-wins behavior so the UI can't see a phantom id
+                # the engine refused to register.
+                if p.stem in seen_ids:
+                    continue
+                seen_ids.add(p.stem)
+                md = load_lora_metadata(p).to_wire()
+                entries.append({
+                    "id": p.stem,
+                    "name": md.get("name") or p.stem,
+                    "path": str(p),
+                    "state": "registered",
+                    "strength": 0.0,
                     "materialized_bytes": 0,
-                }
-                for p in discover_loras(d)
-            ]
+                    "metadata": md,
+                })
         except Exception as e:
             entries = []
             sys.stdout.write(f"[HTTP] /api/loras error: {e}\n")
             sys.stdout.flush()
-        body = json.dumps({"dir": str(loras_dir()), "loras": entries}).encode()
+        # ``dir`` stays as the primary library root for back-compat
+        # (existing clients display it as "LoRA directory").
+        # ``extra_dirs`` surfaces extra LoRA dirs from acestep.local.json
+        # so the operator can see which training dirs the scan picked up.
+        # ``checkpoint`` + ``checkpoint_scale`` let the UI hide LoRAs
+        # whose ``metadata.base_model_scale`` doesn't match the active
+        # checkpoint without waiting for the WS ready frame.
+        body = json.dumps({
+            "dir": str(loras_dir()),
+            "extra_dirs": [str(p) for p in extra_lora_dirs()],
+            "checkpoint": _CHECKPOINT,
+            "checkpoint_scale": checkpoint_scale(_CHECKPOINT),
+            "loras": entries,
+        }).encode()
         _log_http(remote, 200, "GET", url)
         return Response(
             200, "OK",
@@ -305,6 +362,11 @@ def _stub_handle_client(ws):
 def main():
     host = "0.0.0.0"
     port = 1318  # single port: serves both HTTP and WebSocket
+    # Control bus: a tiny HTTP server the demo's onboard MCP server hits
+    # to drive an already-running session. Bound to localhost-only by
+    # default; override with --control-host / --control-port.
+    control_host = "127.0.0.1"
+    control_port = 1319
     accel = "tensorrt"  # decoder + vae backend; overridden by --accel
     checkpoint = "acestep-v15-turbo"  # DiT variant; overridden by --checkpoint
 
@@ -355,6 +417,14 @@ def main():
     if "--checkpoint" in args:
         idx = args.index("--checkpoint")
         checkpoint = args[idx + 1]
+        checkpoint = _CHECKPOINT_ALIASES.get(checkpoint, checkpoint)
+    if "--control-host" in args:
+        idx = args.index("--control-host")
+        control_host = args[idx + 1]
+    if "--control-port" in args:
+        idx = args.index("--control-port")
+        control_port = int(args[idx + 1])
+    control_disabled = "--no-control" in args
 
     kiosk = "--kiosk" in args
     default_mode = "graph"
@@ -366,11 +436,12 @@ def main():
             f"[Server] --mode must be one of {_VALID_MODES}, got {default_mode!r}"
         )
 
-    global _NO_BACKEND, _ACCEL, _KIOSK, _DEFAULT_MODE
+    global _NO_BACKEND, _ACCEL, _KIOSK, _DEFAULT_MODE, _CHECKPOINT
     _NO_BACKEND = no_backend
     _ACCEL = accel
     _KIOSK = kiosk
     _DEFAULT_MODE = default_mode
+    _CHECKPOINT = checkpoint
 
     if no_backend:
         ws_handler = _stub_handle_client
@@ -388,6 +459,40 @@ def main():
                 vae_backend=vae_accel,
                 checkpoint=checkpoint,
                 offload_text_encoder=offload_text_encoder,
+            )
+
+        # Pay the one-time cold-start cost (TRT decoder-engine load,
+        # LoRA-refit manager, ModelContext / conditioning, first-tick
+        # pipeline build) once at boot, BEFORE accepting real traffic,
+        # so every real "begin" gets the ~5s warm path instead of ~40s.
+        # Synchronous on purpose: the heartbeat sidecar only advertises
+        # this pod to the pool after main() proceeds, so the pod isn't
+        # routed real users until it's warm. Disable with
+        # DEMON_STARTUP_WARMUP=0.
+        if os.environ.get("DEMON_STARTUP_WARMUP", "1") != "0":
+            from .backend import run_startup_warmup
+
+            run_startup_warmup(
+                decoder_backend=decoder_accel,
+                vae_backend=vae_accel,
+                checkpoint=checkpoint,
+                offload_text_encoder=offload_text_encoder,
+            )
+
+    # Start the MCP control bus FIRST so registry registrations from the
+    # WS handler land in an already-listening HTTP server. Skipped in
+    # --no-backend mode (no sessions to register) and on --no-control.
+    if not no_backend and not control_disabled:
+        from . import control_http
+        try:
+            control_http.start_control_server(control_host, control_port)
+            print(
+                f"[Server] MCP control bus on http://{control_host}:{control_port}",
+            )
+        except OSError as exc:
+            print(
+                f"[Server] WARNING: control bus failed to bind "
+                f"{control_host}:{control_port}: {exc}",
             )
 
     print(f"[Server] Starting HTTP+WS on :{port}")

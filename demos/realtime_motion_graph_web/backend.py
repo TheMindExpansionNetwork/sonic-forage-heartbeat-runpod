@@ -12,6 +12,8 @@ through :class:`.pipeline.PipelineRunner`, with:
 """
 
 import json
+import os
+import queue
 import socket
 import struct
 import threading
@@ -35,12 +37,13 @@ from acestep.fixtures import (
     FixtureSidecar, KNOWN_FIXTURES, audio_fixture, fixture_sidecar,
 )
 from acestep.nodes.types import Audio, Latent
+from acestep.lora_metadata import load_lora_metadata
 from acestep.paths import (
     EngineNotBuiltError,
     available_dreamvae_decode_engine,
+    checkpoint_scale,
     checkpoints_dir,
     dreamvae_decode_engine_name,
-    lora_trigger,
     loras_dir,
     max_profile_duration_s,
     smallest_fitting_profile_duration_s,
@@ -62,6 +65,7 @@ from .protocol import (
     T,
 )
 from .pipeline import PipelineRunner
+from . import session_registry
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +73,7 @@ from .pipeline import PipelineRunner
 # ---------------------------------------------------------------------------
 
 def _try_load_sidecar(
-    fixture_name: str | None, *, checkpoint: str, samples: int,
+    fixture_name: str | None, *, samples: int,
 ) -> FixtureSidecar | None:
     """Look up a fixture sidecar; return None on miss / mismatch.
 
@@ -77,11 +81,15 @@ def _try_load_sidecar(
     what the sidecar was precomputed for (e.g. a smaller TRT profile
     cap kicking in). The caller falls back to live computation in that
     case so cached tensor shapes can't poison the streaming pipeline.
+
+    Sidecars are not checkpoint-gated; the VAE and semantic
+    tokenizer/detokenizer that produce the cached tensors are shared
+    across the ACE-Step v1.5 family.
     """
     if not fixture_name:
         return None
     try:
-        sc = fixture_sidecar(fixture_name, checkpoint=checkpoint)
+        sc = fixture_sidecar(fixture_name)
     except Exception as e:
         print(f"[Server] sidecar lookup failed for {fixture_name!r}: {e}")
         return None
@@ -109,6 +117,36 @@ def _decode_audio_msg(audio_msg: bytes) -> torch.Tensor:
     ch, n = struct.unpack("<II", audio_msg[:8])
     arr = np.frombuffer(audio_msg[8:], dtype=np.float32).reshape(n, ch)
     return torch.from_numpy(arr.T.copy())[:2]
+
+
+def _load_known_fixture_waveform(name: str) -> torch.Tensor:
+    """Load a known fixture's audio from the pod's own fixture cache and
+    return it in the exact shape ``_decode_audio_msg`` produces
+    (``[≤2, N]`` float32 at ``SAMPLE_RATE``).
+
+    The pod already serves this file at ``/fixtures/<name>``; for known
+    fixtures the browser shouldn't have to download → decode → re-upload
+    ~20 MB of PCM over the WebSocket (~11 s on the measured cold path).
+    Same uniform-path output as the upload route, so every downstream
+    consumer (sidecar resolve, echoed initial buffer, prepare_source
+    fallback) is unchanged.
+    """
+    path = str(audio_fixture(name))  # resolves to the on-disk cache
+    try:
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float32", always_2d=True)  # (n, ch)
+    except Exception:
+        import librosa
+        mono, sr = librosa.load(path, sr=None, mono=True)
+        data = np.stack([mono, mono], axis=1).astype(np.float32)
+    if sr != SAMPLE_RATE:
+        import librosa
+        data = librosa.resample(
+            data.T, orig_sr=sr, target_sr=SAMPLE_RATE
+        ).T.astype(np.float32)
+    if data.ndim == 1:
+        data = data[:, None]
+    return torch.from_numpy(np.ascontiguousarray(data.T, dtype=np.float32))[:2]
 
 
 _VALID_TIME_SIG_STRS = frozenset(str(s) for s in VALID_TIME_SIGNATURES)
@@ -163,17 +201,16 @@ def _resolve_bpm_key_source(
     audio_in: Audio,
     fixture_name: str | None,
     samples: int,
-    checkpoint: str,
     key_override: str | None = None,
     time_signature_override: str | None = None,
 ) -> tuple[PreparedSource, int, str, str]:
     """Resolve (source, bpm, key, time_signature) for a (fixture, audio) pair.
 
     For known fixtures with a sidecar present (JSON+safetensors in the
-    dataset or local staging dir, matching checkpoint and audio length),
-    returns the cached source latent + context_latent and reads BPM,
-    key, and time_signature from the sidecar JSON. Skips librosa beat
-    tracking, CNN key detection, and ``Session.prepare_source`` — the
+    dataset or local staging dir, matching audio length), returns the
+    cached source latent + context_latent and reads BPM, key, and
+    time_signature from the sidecar JSON. Skips librosa beat tracking,
+    CNN key detection, and ``Session.prepare_source`` — the
     prompt-independent half of the per-connect work.
 
     Conditioning is *not* cached (see fixtures.py). Callers run
@@ -183,7 +220,6 @@ def _resolve_bpm_key_source(
     Falls through to live librosa + detect_key + prepare_source when:
       - ``fixture_name`` is None / unknown
       - sidecar files aren't in the dataset yet
-      - checkpoint mismatch (tensors are tied to a specific build)
       - audio-length truncation mismatch (e.g. operator's TRT profile
         cap is smaller than the natural fixture length)
 
@@ -196,7 +232,7 @@ def _resolve_bpm_key_source(
     the swap, post-hoc dropdown edits flow through ``mtype == "prompt"``
     instead, where overrides do apply.
     """
-    sc = _try_load_sidecar(fixture_name, checkpoint=checkpoint, samples=samples)
+    sc = _try_load_sidecar(fixture_name, samples=samples)
 
     if sc is not None:
         device = session.handler.device
@@ -326,6 +362,48 @@ class VirtualMidiKnobs:
 
 
 # ---------------------------------------------------------------------------
+# Pipeline depth bounds
+# ---------------------------------------------------------------------------
+
+# Hard floor for the StreamPipeline ring buffer. <1 makes the buffer empty
+# and nothing ticks. The TRT cap is read from the loaded engine; the eager
+# / compile cap is fixed.
+MIN_PIPELINE_DEPTH = 1
+EAGER_MAX_PIPELINE_DEPTH = 4
+
+# Idle GPU pause threshold. After this many seconds with no incoming WS
+# or control-bus message, the runner stops invoking the DiT each tick.
+# The audio engine keeps serving from its existing buffer (which the
+# walk_window LoRA designs to loop cleanly at walk_window_s), so audio
+# continues uninterrupted while the GPU idles. Any incoming message
+# resets the timer immediately; the next loop iteration resumes a normal
+# tick. Set to 0 to disable the pause entirely (always tick).
+IDLE_PAUSE_S = float(os.environ.get("DEMON_IDLE_PAUSE_S", "20"))
+
+
+def _compute_max_pipeline_depth(diffusion_engine) -> int:
+    """Largest ``pipeline_depth`` the loaded backend can serve.
+
+    For TRT decoders this is the ``hidden_states`` batch dim's max bound
+    on optimization profile 0 (the canonical / only profile we build).
+    For eager / compile decoders the runtime has no fixed cap, so we
+    return ``EAGER_MAX_PIPELINE_DEPTH`` to match the docs and the demo's
+    knob ceiling.
+    """
+    trt_engine = getattr(diffusion_engine, "_trt_engine", None)
+    if trt_engine is None:
+        return EAGER_MAX_PIPELINE_DEPTH
+    try:
+        _, _, max_shape = trt_engine.get_tensor_profile_shape(
+            "hidden_states", 0,
+        )
+        return max(MIN_PIPELINE_DEPTH, int(max_shape[0]))
+    except Exception as exc:
+        print(f"[Server] couldn't read TRT batch cap: {exc!r}; using {EAGER_MAX_PIPELINE_DEPTH}")
+        return EAGER_MAX_PIPELINE_DEPTH
+
+
+# ---------------------------------------------------------------------------
 # WebSocket handler
 # ---------------------------------------------------------------------------
 
@@ -358,8 +436,41 @@ def handle_client(
     config = json.loads(ws.recv())
     print(f"[Server] Config: {config}")
 
-    audio_bytes = ws.recv()
-    waveform = _decode_audio_msg(audio_bytes)
+    # Session-init timing instrumentation. t0 == config received; every
+    # milestone prints wall-seconds since t0 so the per-connect latency
+    # can be split into prepare / TRT-load / stream-build / first-gen
+    # without guessing from interleaved loguru lines.
+    _t0 = time.monotonic()
+    _first_slice = [False]
+
+    def _ms(stage: str) -> None:
+        print(f"[timing] {stage} +{time.monotonic() - _t0:.3f}s", flush=True)
+
+    # Server-side known-fixture load. When the client opts in via
+    # ``use_server_fixture`` AND names a known fixture, skip the
+    # download→decode→re-upload round-trip (~11 s of the measured cold
+    # path) and read the waveform straight from the pod's fixture cache.
+    # Old clients that don't send the flag take the unchanged upload
+    # path below, so this is safe across the Vercel(UI)/bake(backend)
+    # deploy skew.
+    _fix_name = config.get("fixture_name")
+    if config.get("use_server_fixture") and _fix_name in KNOWN_FIXTURES:
+        try:
+            waveform = _load_known_fixture_waveform(_fix_name)
+            _ms("audio_serverside_loaded")
+        except Exception as exc:
+            print(
+                f"[Server] server-side fixture load failed for "
+                f"{_fix_name!r} ({exc}); falling back to client upload",
+                flush=True,
+            )
+            audio_bytes = ws.recv()
+            waveform = _decode_audio_msg(audio_bytes)
+            _ms("audio_recv_decoded")
+    else:
+        audio_bytes = ws.recv()
+        waveform = _decode_audio_msg(audio_bytes)
+        _ms("audio_recv_decoded")
     use_trt = decoder_backend == "tensorrt" or vae_backend == "tensorrt"
     trt_profile_checkpoint = checkpoint if decoder_backend == "tensorrt" else "acestep-v15-turbo"
 
@@ -399,6 +510,7 @@ def handle_client(
     depth = config.get("depth", 4)
     steps = config.get("steps", 8)
     prompt = config.get("prompt", "instrumental music")
+    prompt_b = config.get("prompt_b", prompt)
     fast_vae = config.get("fast_vae", False)
     # Walk-window mode: route long sources through the 60s DiT engine by
     # sliding a fixed-T window across the song each tick (avoids the
@@ -578,6 +690,13 @@ def handle_client(
         print("[Server] WARNING: LoRA engine unavailable on this decoder")
         use_lora = False
 
+    max_pipeline_depth = _compute_max_pipeline_depth(engine_obj)
+    depth = max(MIN_PIPELINE_DEPTH, min(int(depth), max_pipeline_depth))
+    print(
+        f"[Server] pipeline_depth={depth} (max={max_pipeline_depth}, "
+        f"backend={'trt' if engine_obj._trt_engine is not None else 'eager'})"
+    )
+
     initial_enable_ids: list[str] = []
     if use_lora:
         # Resolve any explicit enable-by-id requests (these must already
@@ -613,13 +732,13 @@ def handle_client(
 
     audio_in = Audio(waveform=waveform, sample_rate=SAMPLE_RATE)
 
+    _ms("resolve_source_start")
     source, detected_bpm, detected_key, detected_time_signature = (
         _resolve_bpm_key_source(
             session,
             audio_in=audio_in,
             fixture_name=fixture_name,
             samples=int(waveform.shape[1]),
-            checkpoint=checkpoint,
         )
     )
     upload_stems: dict[str, torch.Tensor] | None = None
@@ -659,28 +778,7 @@ def handle_client(
                 ws.close(1011, "stem extraction failed")
                 return
 
-    def _active_trigger_prefix() -> str:
-        """Comma-separated activation tokens for every currently-ENABLED
-        LoRA that ships with a `<stem>.trigger.txt` sidecar.
-
-        Defined ABOVE `_encode_cond_pair` so the latter's free-variable
-        binding to this name is populated before any early text-encode
-        site runs (initial session start fires the first encode below,
-        well before the recv loop). Python's free-variable cell only
-        gets populated when the enclosing function executes the `def`
-        statement that creates the local — define-after-use across the
-        same scope NameErrors at call time.
-        """
-        if not lora_available:
-            return ""
-        parts: list[str] = []
-        for d in engine_obj.list_loras():
-            if d.state != "enabled":
-                continue
-            trig = lora_trigger(d.path)
-            if trig:
-                parts.append(trig)
-        return ", ".join(parts)
+    _ms("resolve_source_done")
 
     # Two-conditioning cache for the live timbre-strength slider.
     # cond_silence uses the model's silence latent (refer_latent=None);
@@ -693,31 +791,23 @@ def handle_client(
     # prompt crossfades. Recomputed on prompt change, on swap_source,
     # and on set_timbre_source / clear_timbre_source.
     def _encode_cond_pair(tags, refer_latent, bpm, duration, key, time_signature):
-        # Server-side LoRA trigger injection: every currently-ENABLED
-        # LoRA whose `<stem>.trigger.txt` sidecar is present contributes
-        # its activation word to a hidden prefix prepended to the user's
-        # caption. The user-visible promptA / promptB strings stay
-        # untouched in the UI — this prepend only happens here, just
-        # before the text encoder forward, so all five encode sites
-        # (session start, prompt change, timbre refresh, swap_source,
-        # LoRA enable/disable re-encode) inherit the same prefix from
-        # one place. Idempotent against re-encodes with the same LoRA
-        # state (the prefix is deterministic) so a noop re-encode is a
-        # noop. See `_active_trigger_prefix` for the lookup logic.
-        prefix = _active_trigger_prefix()
-        if prefix:
-            full_tags = f"{prefix}, {tags}" if tags else prefix
-        else:
-            full_tags = tags
+        # WYSIWYG: the encoder sees exactly the text the UI sent. LoRA
+        # trigger words land in `tags` via the client's visible-prepend
+        # logic (see web/store/useLoraStore + the auto_prepend_lora_triggers
+        # config flag) so the user can edit or remove them like any other
+        # prompt token. The server intentionally does NOT inject anything
+        # behind the user's back.
         cs = session.encode_text(
-            tags=full_tags,
+            tags=tags,
+            lyrics="[Instrumental]",
             instruction=TASK_INSTRUCTIONS["cover"],
             refer_latent=None,
             bpm=bpm, duration=duration, key=key,
             time_signature=time_signature,
         )
         cf = session.encode_text(
-            tags=full_tags,
+            tags=tags,
+            lyrics="[Instrumental]",
             instruction=TASK_INSTRUCTIONS["cover"],
             refer_latent=refer_latent,
             bpm=bpm, duration=duration, key=key,
@@ -742,6 +832,16 @@ def handle_client(
         prompt, source.latent, detected_bpm, audio_duration_s,
         detected_key, detected_time_signature,
     )
+    # Encode prompt B at session start so the blend slider works
+    # immediately without forcing the operator to click Send Tags.
+    # When B matches A, reuse the pair (no second encoder pass).
+    if prompt_b and prompt_b != prompt:
+        cond_silence_b, cond_full_b = _encode_cond_pair(
+            prompt_b, source.latent, detected_bpm, audio_duration_s,
+            detected_key, detected_time_signature,
+        )
+    else:
+        cond_silence_b, cond_full_b = cond_silence, cond_full
     conditioning = cond_full  # default strength=1.0 == cond_full
 
     # Negative conditioning for the RCFG path (Residual CFG). Empty-prompt
@@ -766,6 +866,7 @@ def handle_client(
         pipeline_depth=depth,
     )
     print("[Server] Stream handle ready (pipeline built on first tick)")
+    _ms("stream_handle_ready")
 
     # Initial buffer
     src_np = waveform.numpy().T
@@ -791,23 +892,26 @@ def handle_client(
     def _catalog_payload():
         if not lora_available:
             return []
-        return [
-            {
-                "id": d.id, "name": d.name, "path": d.path,
-                # `trigger` is the LoRA's activation word, read from a
-                # sibling `<stem>.trigger.txt` sidecar at the same path
-                # as the .safetensors. Empty string when the sidecar
-                # doesn't exist (LoRAs trained without a documented
-                # trigger). The engine reads the same sidecar at encode
-                # time and prepends to the user caption when this LoRA
-                # is in ENABLED state, so the UI doesn't need to act on
-                # this field — it's surfaced for transparency / tooltips.
-                "trigger": lora_trigger(d.path),
-                "state": d.state, "strength": d.strength,
+        out = []
+        for d in engine_obj.list_loras():
+            # `metadata` is the full normalized record from the LoRA's
+            # `<stem>.metadata.json` sidecar (falling back to a
+            # synthesized record from `.trigger.txt`, or a sparse one
+            # with id/name only when neither exists). The UI uses it for
+            # the library tooltip, search, right-click "copy trigger",
+            # and the visible-prepend logic. Cached by (path, mtime_ns)
+            # so a catalog refresh is cheap.
+            metadata = load_lora_metadata(d.path).to_wire()
+            out.append({
+                "id": d.id,
+                "name": metadata.get("name") or d.name,
+                "path": d.path,
+                "state": d.state,
+                "strength": d.strength,
                 "materialized_bytes": d.materialized_bytes,
-            }
-            for d in engine_obj.list_loras()
-        ]
+                "metadata": metadata,
+            })
+        return out
 
     # Send ready + initial buffer
     ws.send(json.dumps({
@@ -825,6 +929,20 @@ def handle_client(
         # ``"4"`` on the live path. Operator can change it post-init via
         # the prompt re-encode message (carries ``time_signature``).
         "time_signature": detected_time_signature,
+        # Active checkpoint identifier + its model-scale label ("2B" /
+        # "5B" / null). The UI compares ``checkpoint_scale`` against
+        # each LoRA's ``metadata.base_model_scale`` to hide LoRAs that
+        # weren't trained for this checkpoint. ``null`` (unknown
+        # checkpoint) disables filtering so undocumented checkpoints
+        # don't accidentally hide every LoRA.
+        "checkpoint": checkpoint,
+        "checkpoint_scale": checkpoint_scale(checkpoint),
+        # Active ring-buffer depth + the runtime-imposed ceiling
+        # (TRT engine's hidden_states batch_max, or 4 for eager / compile).
+        # The client clamps its depth control to [1, max_pipeline_depth]
+        # and ships ``set_depth`` messages to retune live.
+        "pipeline_depth": depth,
+        "max_pipeline_depth": max_pipeline_depth,
     }))
     ws.send(src_np.astype(np.float16).tobytes())
     if upload_stems is not None:
@@ -841,6 +959,7 @@ def handle_client(
             "error": stem_error,
         }))
     print(f"[Server] Sent initial buffer ({len(src_np) / SAMPLE_RATE:.1f}s)")
+    _ms("initial_buffer_sent")
 
     # ---- Phase 2: Streaming ----
 
@@ -878,12 +997,13 @@ def handle_client(
     # swap_source, and set/clear_timbre_source.
     timbre_strength_ref = [1.0]
     cond_pair_ref = [(cond_silence, cond_full)]
-    # Prompt A/B blend. B starts mirroring A so the slider is a no-op
-    # until the client sends a real promptB via the ``prompt`` message
-    # (Send Prompt). Then this pair is encoded against the same source
-    # + timbre as A, and set_prompt_blend lerps between them per tick.
-    cond_pair_b_ref = [(cond_silence, cond_full)]
-    prompt_text_b = [prompt]
+    # Prompt A/B blend. B is encoded at session start from config.prompt_b
+    # (falls back to A when missing/equal, in which case the slider is a
+    # no-op until the operator edits B and hits Send Tags). The pair is
+    # encoded against the same source + timbre as A, and set_prompt_blend
+    # lerps between them per tick.
+    cond_pair_b_ref = [(cond_silence_b, cond_full_b)]
+    prompt_text_b = [prompt_b]
     prompt_blend_ref = [0.0]
     # Optional uploaded timbre-track latent. None == use the playback
     # source's own latent (self-timbre, current default).
@@ -947,7 +1067,6 @@ def handle_client(
         sc = (
             _try_load_sidecar(
                 struct_name_ref[0],
-                checkpoint=checkpoint,
                 samples=int(wf.shape[-1]),
             )
             if struct_name_ref[0] else None
@@ -1035,8 +1154,7 @@ def handle_client(
                 raise ValueError("timbre clip too short")
             clip_s = t_wf.shape[-1] / SAMPLE_RATE
             sc = _try_load_sidecar(
-                name, checkpoint=checkpoint,
-                samples=int(t_wf.shape[-1]),
+                name, samples=int(t_wf.shape[-1]),
             )
             if sc is not None:
                 device = session.handler.device
@@ -1135,6 +1253,29 @@ def handle_client(
     pending_disable: list[str] = []
     pending_lock = threading.Lock()
 
+    # Live pipeline_depth retune. The StreamPipeline ring buffer can be
+    # resized between ticks; doing it from the recv thread would race the
+    # ongoing tick (slots may be mid-step), so we stash the target depth
+    # here and the runner thread applies it inside before_tick. A single
+    # slot is enough — a fresh value just replaces any unapplied one.
+    pending_depth_ref: list[int | None] = [None]
+    pending_depth_lock = threading.Lock()
+    current_depth_ref: list[int] = [int(depth)]
+
+    # Last meaningful-activity timestamp. Read by PipelineRunner to
+    # decide whether to skip the DiT tick this iteration. The web client
+    # resends a full ``params`` message every 8 ms via useParamSync
+    # (mirrors DEMON's _sendTick — the engine samples params at the
+    # start of each generation window, so the client floods them even
+    # when nothing changed). Treating that flood as "activity" defeats
+    # the pause entirely. Instead, ``params`` messages bump the timer
+    # only when their ``raw`` dict differs from the previous one;
+    # all other message types are discrete actions and always bump.
+    # Plain list-wrapped float / dict: atomic enough under the GIL for
+    # this single-slot rendezvous.
+    last_activity_ts: list[float] = [time.monotonic()]
+    _last_params_raw_ref: list = [None]
+
     def _send_catalog_update():
         try:
             with send_lock:
@@ -1182,33 +1323,13 @@ def handle_client(
             except Exception as e:
                 print(f"[Server] enable_lora({lid}) failed: {e}")
         _send_catalog_update()
-        # If the set of active triggers changed (enable adds, disable
-        # removes), re-encode the current prompt so the new prefix is
-        # baked into the conditioning. Without this the trigger only
-        # takes effect on the NEXT prompt change — toggling a LoRA in
-        # the library would visibly change the LoRA matrices but the
-        # audio wouldn't reflect the trigger's encoder-side bias until
-        # the user touched a prompt field. Cheap: one text-encode
-        # forward + a cond-blend. `_encode_cond_pair` queries the now-
-        # fresh state via `_active_trigger_prefix`.
-        try:
-            new_pair = _encode_cond_pair(
-                prompt_text[0],
-                _active_refer_latent(),
-                bpm_ref[0],
-                duration_ref[0],
-                key_ref[0],
-                time_sig_ref[0],
-            )
-            cond_pair_ref[0] = new_pair
-            stream.conditioning = _blend_for_strength(
-                new_pair[0], new_pair[1], timbre_strength_ref[0],
-            )
-        except Exception as e:
-            # Re-encode is best-effort — if it fails, the LoRA matrices
-            # still applied (engine_obj.enable/disable above succeeded);
-            # next prompt change will catch up. Log and move on.
-            print(f"[Server] re-encode after LoRA change failed: {e}")
+        # No automatic re-encode here. With WYSIWYG prompts, the trigger
+        # word lives in the visible promptA/promptB text. The client's
+        # visible-prepend logic (when `auto_prepend_lora_triggers` is on)
+        # mutates the prompt on toggle and sends a prompt-update message,
+        # which routes through the normal prompt-change path. If the flag
+        # is off, the user explicitly opted into not auto-injecting the
+        # trigger and we must not encode it behind their back.
 
     # --- on_audio_ready: delta-encode and send to client ---
     def on_audio_ready(wav_np, win_start=None, win_end=None):
@@ -1227,6 +1348,10 @@ def handle_client(
         se = min(se, len(client_mirror), len(wav_np))
         if se <= ss:
             return
+
+        if not _first_slice[0]:
+            _first_slice[0] = True
+            _ms("first_generated_slice")
 
         # Delta = what server has now minus what client has
         region = wav_np[ss:se]
@@ -1248,344 +1373,373 @@ def handle_client(
         except ConnectionClosed:
             running[0] = False
 
-    # --- recv loop: drain client messages ---
+    # --- Control bus ---
+    # External commands (from the demo's onboard MCP server) land in this
+    # queue and get dispatched through the same _dispatch_message handler
+    # as live WebSocket frames. The MCP holds an HTTP control channel to
+    # the server process, not a separate WebSocket, so the browser's WS
+    # stays the single audio/video stream owner and the front-end can
+    # mirror MCP-driven state via the same ack messages it already listens
+    # to (plus a new ``params_echo`` for raw knob changes).
+    control_queue: queue.Queue = queue.Queue()
+    session_id = session_registry.new_session_id()
+
+    def inject_control(data: dict, audio: bytes | None = None) -> None:
+        control_queue.put((data, audio))
+
+    def snapshot_session() -> dict:
+        return {
+            "id": session_id,
+            "prompt": prompt_text[0],
+            "prompt_b": prompt_text_b[0],
+            "prompt_blend": prompt_blend_ref[0],
+            "duration": duration_ref[0],
+            "bpm": bpm_ref[0],
+            "key": key_ref[0],
+            "time_signature": time_sig_ref[0],
+            "fixture_name": fixture_name,
+            "timbre_name": timbre_name_ref[0],
+            "timbre_strength": timbre_strength_ref[0],
+            "structure_name": struct_name_ref[0],
+            "lora_catalog": _catalog_payload(),
+            "knob_values": virtual_knobs.get_all_values(),
+            "channels": n_channels_ref[0],
+            "sample_rate": SAMPLE_RATE,
+        }
+
+    def _apply_ref(
+        kind: str,
+        name: str,
+        waveform_fn,
+        origin: str,
+    ) -> None:
+        """Shared load → apply → ack flow for the four
+        ``set_{timbre,structure}_{source,fixture}`` branches.
+
+        ``waveform_fn`` is the only thing that varies across them: a
+        thunk returning the decoded waveform tensor — either
+        ``_decode_audio_msg`` on a binary frame or
+        ``_load_fixture_waveform`` on a known fixture name. ``origin``
+        is just the log label distinguishing "source" (audio-over-wire)
+        vs "fixture" (server-side resolved) so the failure trace points
+        at the right WS verb.
+        """
+        set_msg = f"{kind}_set"
+        failed_msg = f"{kind}_failed"
+        try:
+            wf = waveform_fn()
+            if kind == "timbre":
+                clip_s = _apply_timbre_waveform(wf, name)
+                extra = f"({clip_s:.1f}s)"
+            else:
+                clip_s, target_s = _apply_structure_waveform(wf, name)
+                extra = f"({clip_s:.1f}s, fitted to {target_s:.1f}s)"
+            with send_lock:
+                ws.send(json.dumps({
+                    "type": set_msg,
+                    "name": name,
+                    "duration": clip_s,
+                }))
+            print(f"[Server] {kind} set: {name} {extra}")
+        except Exception as exc:
+            print(f"[Server] set_{kind}_{origin} failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            try:
+                with send_lock:
+                    ws.send(json.dumps({
+                        "type": failed_msg,
+                        "error": str(exc),
+                    }))
+            except Exception:
+                pass
+
+    def _dispatch_message(
+        data: dict,
+        recv_audio,
+        source: str,
+    ) -> None:
+        """Handle one parsed control message.
+
+        ``recv_audio`` returns the next binary audio frame. For
+        WebSocket-sourced messages it's ``ws.recv``; for control-bus
+        messages it's a thunk that returns the pre-loaded bytes the MCP
+        sent alongside the JSON.
+
+        ``source`` is ``"ws"`` for the browser's own WebSocket and
+        ``"control"`` for control-bus messages — used to gate
+        ``params_echo`` so the browser only sees echoes of external
+        changes (it owns its own params already).
+        """
+        mtype = data.get("type")
+        # Activity gating for the idle-pause runner. ``params`` is a
+        # client heartbeat (re-sent every 8 ms by useParamSync even
+        # when nothing changed), so we only count it as activity when
+        # ``raw`` actually differs from the previous one we saw —
+        # otherwise the pause would never engage. Every other message
+        # type represents a discrete action (LoRA toggle, source swap,
+        # prompt change, etc.) and always counts as activity.
+        # ``playback_pos`` on params messages advances every tick but
+        # is intentionally excluded from the diff: it's a clock, not
+        # user input.
+        if mtype == "params":
+            _new_raw = data.get("raw") or {}
+            if _new_raw != _last_params_raw_ref[0]:
+                last_activity_ts[0] = time.monotonic()
+                _last_params_raw_ref[0] = dict(_new_raw)
+        else:
+            last_activity_ts[0] = time.monotonic()
+        if mtype == "params":
+            raw = data.get("raw") or {}
+            if source == "control":
+                # Don't apply server-side: the browser owns the Smooth
+                # tween, and applying here would step virtual_knobs to
+                # the target immediately and then watch useParamSync
+                # send the tween back from the old value forward,
+                # producing a jump-then-rewind on the engine. Echo
+                # only; the browser tweens sliderValues toward this
+                # target and ships the smoothed sequence back over WS
+                # as a normal "params" message (source="ws") that
+                # lands in virtual_knobs the usual way.
+                try:
+                    with send_lock:
+                        ws.send(json.dumps({
+                            "type": "params_echo",
+                            "raw": dict(raw),
+                        }))
+                except ConnectionClosed:
+                    running[0] = False
+                except Exception:
+                    pass
+            else:
+                try:
+                    pp = float(data.get("playback_pos", 0.0))
+                except (TypeError, ValueError):
+                    pp = 0.0
+                virtual_knobs.update(raw)
+                try:
+                    audio_eng.position = int(pp * SAMPLE_RATE) % max(
+                        1, len(audio_eng.current)
+                    )
+                except Exception:
+                    pass
+        elif mtype == "prompt":
+            ts_override = _normalize_time_signature(data.get("time_signature"))
+            if ts_override is not None:
+                time_sig_ref[0] = ts_override
+            refer = _active_refer_latent()
+            key_used = data.get("key") or key_ref[0]
+            cond_pair_ref[0] = _encode_cond_pair(
+                data["tags"], refer, bpm_ref[0], duration_ref[0],
+                key_used, time_sig_ref[0],
+            )
+            prompt_text[0] = data["tags"]
+            tags_b = data.get("tags_b")
+            if tags_b and tags_b != data["tags"]:
+                cond_pair_b_ref[0] = _encode_cond_pair(
+                    tags_b, refer, bpm_ref[0], duration_ref[0],
+                    key_used, time_sig_ref[0],
+                )
+                prompt_text_b[0] = tags_b
+            else:
+                cond_pair_b_ref[0] = cond_pair_ref[0]
+                prompt_text_b[0] = data["tags"]
+            _refresh_conditioning()
+            try:
+                with send_lock:
+                    ws.send(json.dumps({
+                        "type": "prompt_applied",
+                        "tags": data["tags"],
+                    }))
+            except ConnectionClosed:
+                running[0] = False
+        elif mtype == "set_prompt_blend":
+            try:
+                v = float(data.get("value", 0.0))
+            except (TypeError, ValueError):
+                v = 0.0
+            v = max(0.0, min(1.0, v))
+            if source == "control":
+                # Same shape as the params echo path: the browser owns
+                # the smoothed prompt_blend slider, so just mirror the
+                # target back and let usePromptBlendSync ship the
+                # tweened sequence to the server.
+                try:
+                    with send_lock:
+                        ws.send(json.dumps({
+                            "type": "prompt_blend_echo",
+                            "value": v,
+                        }))
+                except ConnectionClosed:
+                    running[0] = False
+                except Exception:
+                    pass
+            else:
+                prompt_blend_ref[0] = v
+                _refresh_conditioning()
+        elif mtype == "set_depth":
+            try:
+                v = int(data.get("value"))
+            except (TypeError, ValueError):
+                return
+            v = max(MIN_PIPELINE_DEPTH, min(v, max_pipeline_depth))
+            with pending_depth_lock:
+                pending_depth_ref[0] = v
+        elif mtype == "enable_lora":
+            lid = data.get("id")
+            s = data.get("strength")
+            try:
+                strength = float(s) if s is not None else None
+            except (TypeError, ValueError):
+                strength = None
+            if lid:
+                with pending_lock:
+                    pending_enable.append((str(lid), strength))
+        elif mtype == "disable_lora":
+            lid = data.get("id")
+            if lid:
+                with pending_lock:
+                    pending_disable.append(str(lid))
+        elif mtype == "set_timbre_strength":
+            try:
+                v = float(data.get("value", 1.0))
+            except (TypeError, ValueError):
+                v = 1.0
+            v = max(0.0, min(1.0, v))
+            timbre_strength_ref[0] = v
+            _refresh_conditioning()
+        elif mtype == "set_timbre_source":
+            name = data.get("name") or "timbre"
+            print(
+                f"[Server] set_timbre_source ({source}): receiving "
+                f"audio for {name!r}..."
+            )
+            try:
+                audio_msg = recv_audio()
+            except ConnectionClosed:
+                running[0] = False
+                return
+            print(
+                f"[Server] set_timbre_source: got "
+                f"{len(audio_msg)} bytes"
+            )
+            _apply_ref(
+                "timbre", name,
+                lambda: _decode_audio_msg(audio_msg),
+                "source",
+            )
+        elif mtype == "set_timbre_fixture":
+            name = data.get("name", "")
+            print(f"[Server] set_timbre_fixture: {name!r}")
+            _apply_ref(
+                "timbre", name,
+                lambda: _load_fixture_waveform(name),
+                "fixture",
+            )
+        elif mtype == "clear_timbre_source":
+            timbre_latent_ref[0] = None
+            timbre_name_ref[0] = None
+            refer = source_ref[0].latent
+            cond_pair_ref[0] = _encode_cond_pair(
+                prompt_text[0], refer,
+                bpm_ref[0], duration_ref[0], key_ref[0],
+                time_sig_ref[0],
+            )
+            if prompt_text_b[0] != prompt_text[0]:
+                cond_pair_b_ref[0] = _encode_cond_pair(
+                    prompt_text_b[0], refer,
+                    bpm_ref[0], duration_ref[0], key_ref[0],
+                    time_sig_ref[0],
+                )
+            else:
+                cond_pair_b_ref[0] = cond_pair_ref[0]
+            _refresh_conditioning()
+            try:
+                with send_lock:
+                    ws.send(json.dumps({"type": "timbre_cleared"}))
+            except Exception:
+                pass
+            print("[Server] timbre cleared")
+        elif mtype == "set_structure_source":
+            name = data.get("name") or "structure"
+            print(
+                f"[Server] set_structure_source ({source}): receiving "
+                f"audio for {name!r}..."
+            )
+            try:
+                audio_msg = recv_audio()
+            except ConnectionClosed:
+                running[0] = False
+                return
+            print(
+                f"[Server] set_structure_source: got "
+                f"{len(audio_msg)} bytes"
+            )
+            _apply_ref(
+                "structure", name,
+                lambda: _decode_audio_msg(audio_msg),
+                "source",
+            )
+        elif mtype == "set_structure_fixture":
+            name = data.get("name", "")
+            print(f"[Server] set_structure_fixture: {name!r}")
+            _apply_ref(
+                "structure", name,
+                lambda: _load_fixture_waveform(name),
+                "fixture",
+            )
+        elif mtype == "clear_structure_source":
+            _clear_struct_override()
+            try:
+                with send_lock:
+                    ws.send(json.dumps({"type": "structure_cleared"}))
+            except Exception:
+                pass
+            print("[Server] structure cleared")
+        elif mtype == "swap_source":
+            tags = data.get("tags") or prompt_text[0]
+            try:
+                audio_msg = recv_audio()
+            except ConnectionClosed:
+                running[0] = False
+                return
+            with swap_lock:
+                swap_pending["bytes"] = audio_msg
+                swap_pending["tags"] = tags
+                swap_pending["key"] = data.get("key")
+                swap_pending["time_signature"] = (
+                    _normalize_time_signature(
+                        data.get("time_signature")
+                    )
+                )
+                swap_pending["fixture_name"] = data.get("fixture_name")
+                swap_pending["stem_source_mode"] = (
+                    normalize_stem_source_mode(
+                        data.get("stem_source_mode")
+                    )
+                )
+        else:
+            # Unknown mtype — log but don't crash; lets future protocol
+            # additions degrade gracefully on older servers.
+            print(f"[Server] unknown message type from {source}: {mtype!r}")
+
+    # --- recv loop: drain WS + control bus into _dispatch_message ---
     def recv_loop():
         while running[0]:
-            latest_raw = None
-            latest_pp = None
             try:
                 while True:
                     msg = ws.recv(timeout=0.001)
                     if isinstance(msg, str):
-                        data = json.loads(msg)
-                        mtype = data.get("type")
-                        if mtype == "params":
-                            latest_raw = data.get("raw", {})
-                            latest_pp = data.get("playback_pos", 0.0)
-                        elif mtype == "prompt":
-                            # Re-encode on server. Prefer the key sent by the
-                            # client (operator override); fall back to the
-                            # auto-detected key from the loaded source.
-                            # Time signature: same precedence — explicit
-                            # override wins, otherwise carry the current
-                            # value forward. Unknown / invalid values are
-                            # ignored (keep the active ref) rather than
-                            # poisoning the encoder with junk.
-                            ts_override = _normalize_time_signature(
-                                data.get("time_signature")
-                            )
-                            if ts_override is not None:
-                                time_sig_ref[0] = ts_override
-                            refer = _active_refer_latent()
-                            key_used = data.get("key") or key_ref[0]
-                            cond_pair_ref[0] = _encode_cond_pair(
-                                data["tags"],
-                                refer,
-                                bpm_ref[0],
-                                duration_ref[0],
-                                key_used,
-                                time_sig_ref[0],
-                            )
-                            prompt_text[0] = data["tags"]
-                            # Optional second prompt for A/B blending.
-                            # When absent (legacy clients) or identical
-                            # to A, mirror A's pair so the blend slider
-                            # stays a no-op without paying a second
-                            # text-encode pass.
-                            tags_b = data.get("tags_b")
-                            if tags_b and tags_b != data["tags"]:
-                                cond_pair_b_ref[0] = _encode_cond_pair(
-                                    tags_b,
-                                    refer,
-                                    bpm_ref[0],
-                                    duration_ref[0],
-                                    key_used,
-                                    time_sig_ref[0],
-                                )
-                                prompt_text_b[0] = tags_b
-                            else:
-                                cond_pair_b_ref[0] = cond_pair_ref[0]
-                                prompt_text_b[0] = data["tags"]
-                            _refresh_conditioning()
-                            try:
-                                with send_lock:
-                                    ws.send(json.dumps({
-                                        "type": "prompt_applied",
-                                        "tags": data["tags"],
-                                    }))
-                            except ConnectionClosed:
-                                running[0] = False
-                                break
-                        elif mtype == "set_prompt_blend":
-                            # Cheap per-tick lerp between the cached A and
-                            # B cond pairs. Same shape as set_timbre_
-                            # strength — clamp, store, recompose. Text
-                            # encoder is not touched here.
-                            try:
-                                v = float(data.get("value", 0.0))
-                            except (TypeError, ValueError):
-                                v = 0.0
-                            prompt_blend_ref[0] = max(0.0, min(1.0, v))
-                            _refresh_conditioning()
-                        elif mtype == "enable_lora":
-                            lid = data.get("id")
-                            # Optional strength carries the target value
-                            # the client wants the LoRA enabled at, so
-                            # the engine refit lands at that strength in
-                            # one shot instead of going through 0 first.
-                            s = data.get("strength")
-                            try:
-                                strength = float(s) if s is not None else None
-                            except (TypeError, ValueError):
-                                strength = None
-                            if lid:
-                                with pending_lock:
-                                    pending_enable.append((str(lid), strength))
-                        elif mtype == "disable_lora":
-                            lid = data.get("id")
-                            if lid:
-                                with pending_lock:
-                                    pending_disable.append(str(lid))
-                        elif mtype == "set_timbre_strength":
-                            try:
-                                v = float(data.get("value", 1.0))
-                            except (TypeError, ValueError):
-                                v = 1.0
-                            v = max(0.0, min(1.0, v))
-                            timbre_strength_ref[0] = v
-                            _refresh_conditioning()
-                        elif mtype == "set_timbre_source":
-                            # Followed by a binary audio frame (same wire
-                            # format as init / swap_source). _apply_timbre_
-                            # waveform handles cap / pool trim / sidecar
-                            # lookup / encode fallback / cond-pair refresh
-                            # / rollback. This block just shuttles bytes
-                            # off the wire and acks.
-                            name = data.get("name") or "timbre"
-                            print(
-                                f"[Server] set_timbre_source: receiving "
-                                f"audio for {name!r}..."
-                            )
-                            try:
-                                audio_msg = ws.recv()
-                            except ConnectionClosed:
-                                running[0] = False
-                                break
-                            print(
-                                f"[Server] set_timbre_source: got "
-                                f"{len(audio_msg)} bytes"
-                            )
-                            try:
-                                t_wf = _decode_audio_msg(audio_msg)
-                                clip_s = _apply_timbre_waveform(t_wf, name)
-                                with send_lock:
-                                    ws.send(json.dumps({
-                                        "type": "timbre_set",
-                                        "name": name,
-                                        "duration": clip_s,
-                                    }))
-                                print(
-                                    f"[Server] timbre set: {name} "
-                                    f"({clip_s:.1f}s)"
-                                )
-                            except Exception as exc:
-                                print(f"[Server] set_timbre_source failed: {exc}")
-                                import traceback
-                                traceback.print_exc()
-                                try:
-                                    with send_lock:
-                                        ws.send(json.dumps({
-                                            "type": "timbre_failed",
-                                            "error": str(exc),
-                                        }))
-                                except Exception:
-                                    pass
-                        elif mtype == "set_timbre_fixture":
-                            # Wire shortcut for Library picks: client
-                            # sends just {name}; server resolves the WAV
-                            # from the local HF cache via audio_fixture.
-                            # Avoids the browser fetching the WAV, decoding
-                            # it, and re-uploading the result as a ~10×
-                            # larger float32 PCM payload (the fixture is
-                            # already on this pod's disk).
-                            name = data.get("name", "")
-                            print(f"[Server] set_timbre_fixture: {name!r}")
-                            try:
-                                t_wf = _load_fixture_waveform(name)
-                                clip_s = _apply_timbre_waveform(t_wf, name)
-                                with send_lock:
-                                    ws.send(json.dumps({
-                                        "type": "timbre_set",
-                                        "name": name,
-                                        "duration": clip_s,
-                                    }))
-                                print(
-                                    f"[Server] timbre set: {name} "
-                                    f"({clip_s:.1f}s)"
-                                )
-                            except Exception as exc:
-                                print(f"[Server] set_timbre_fixture failed: {exc}")
-                                import traceback
-                                traceback.print_exc()
-                                try:
-                                    with send_lock:
-                                        ws.send(json.dumps({
-                                            "type": "timbre_failed",
-                                            "error": str(exc),
-                                        }))
-                                except Exception:
-                                    pass
-                        elif mtype == "clear_timbre_source":
-                            timbre_latent_ref[0] = None
-                            timbre_name_ref[0] = None
-                            refer = source_ref[0].latent
-                            cond_pair_ref[0] = _encode_cond_pair(
-                                prompt_text[0],
-                                refer,
-                                bpm_ref[0],
-                                duration_ref[0],
-                                key_ref[0],
-                                time_sig_ref[0],
-                            )
-                            if prompt_text_b[0] != prompt_text[0]:
-                                cond_pair_b_ref[0] = _encode_cond_pair(
-                                    prompt_text_b[0],
-                                    refer,
-                                    bpm_ref[0],
-                                    duration_ref[0],
-                                    key_ref[0],
-                                    time_sig_ref[0],
-                                )
-                            else:
-                                cond_pair_b_ref[0] = cond_pair_ref[0]
-                            _refresh_conditioning()
-                            try:
-                                with send_lock:
-                                    ws.send(json.dumps({
-                                        "type": "timbre_cleared",
-                                    }))
-                            except Exception:
-                                pass
-                            print("[Server] timbre cleared")
-                        elif mtype == "set_structure_source":
-                            # Followed by a binary audio frame. _apply_
-                            # structure_waveform handles pad/trim, sidecar
-                            # lookup or live prepare_source, and rollback.
-                            name = data.get("name") or "structure"
-                            print(
-                                f"[Server] set_structure_source: receiving "
-                                f"audio for {name!r}..."
-                            )
-                            try:
-                                audio_msg = ws.recv()
-                            except ConnectionClosed:
-                                running[0] = False
-                                break
-                            print(
-                                f"[Server] set_structure_source: got "
-                                f"{len(audio_msg)} bytes"
-                            )
-                            try:
-                                s_wf = _decode_audio_msg(audio_msg)
-                                clip_s, target_s = _apply_structure_waveform(
-                                    s_wf, name,
-                                )
-                                with send_lock:
-                                    ws.send(json.dumps({
-                                        "type": "structure_set",
-                                        "name": name,
-                                        "duration": clip_s,
-                                    }))
-                                print(
-                                    f"[Server] structure set: {name} "
-                                    f"({clip_s:.1f}s, fitted to "
-                                    f"{target_s:.1f}s)"
-                                )
-                            except Exception as exc:
-                                print(
-                                    f"[Server] set_structure_source "
-                                    f"failed: {exc}"
-                                )
-                                import traceback
-                                traceback.print_exc()
-                                try:
-                                    with send_lock:
-                                        ws.send(json.dumps({
-                                            "type": "structure_failed",
-                                            "error": str(exc),
-                                        }))
-                                except Exception:
-                                    pass
-                        elif mtype == "set_structure_fixture":
-                            # Wire shortcut for Library picks. Same
-                            # rationale as set_timbre_fixture.
-                            name = data.get("name", "")
-                            print(f"[Server] set_structure_fixture: {name!r}")
-                            try:
-                                s_wf = _load_fixture_waveform(name)
-                                clip_s, target_s = _apply_structure_waveform(
-                                    s_wf, name,
-                                )
-                                with send_lock:
-                                    ws.send(json.dumps({
-                                        "type": "structure_set",
-                                        "name": name,
-                                        "duration": clip_s,
-                                    }))
-                                print(
-                                    f"[Server] structure set: {name} "
-                                    f"({clip_s:.1f}s, fitted to "
-                                    f"{target_s:.1f}s)"
-                                )
-                            except Exception as exc:
-                                print(f"[Server] set_structure_fixture failed: {exc}")
-                                import traceback
-                                traceback.print_exc()
-                                try:
-                                    with send_lock:
-                                        ws.send(json.dumps({
-                                            "type": "structure_failed",
-                                            "error": str(exc),
-                                        }))
-                                except Exception:
-                                    pass
-                        elif mtype == "clear_structure_source":
-                            _clear_struct_override()
-                            try:
-                                with send_lock:
-                                    ws.send(json.dumps({
-                                        "type": "structure_cleared",
-                                    }))
-                            except Exception:
-                                pass
-                            print("[Server] structure cleared")
-                        elif mtype == "swap_source":
-                            # Followed by a binary audio frame in the same
-                            # format as the init handshake. Block on that
-                            # next message so we don't have to multiplex
-                            # halfway through; the client only sends one
-                            # swap_source at a time.
-                            tags = data.get("tags") or prompt_text[0]
-                            try:
-                                audio_msg = ws.recv()
-                            except ConnectionClosed:
-                                running[0] = False
-                                break
-                            with swap_lock:
-                                swap_pending["bytes"] = audio_msg
-                                swap_pending["tags"] = tags
-                                swap_pending["key"] = data.get("key")
-                                swap_pending["time_signature"] = (
-                                    _normalize_time_signature(
-                                        data.get("time_signature")
-                                    )
-                                )
-                                swap_pending["fixture_name"] = data.get("fixture_name")
-                                swap_pending["stem_source_mode"] = (
-                                    normalize_stem_source_mode(
-                                        data.get("stem_source_mode")
-                                    )
-                                )
+                        try:
+                            data = json.loads(msg)
+                        except Exception:
+                            continue
+                        try:
+                            _dispatch_message(data, ws.recv, "ws")
+                        except Exception as exc:
+                            print(f"[Server] WS dispatch error: {exc}")
+                    if not running[0]:
+                        break
             except TimeoutError:
                 pass
             except ConnectionClosed:
@@ -1596,10 +1750,23 @@ def handle_client(
                 running[0] = False
                 break
 
-            if latest_raw is not None:
-                virtual_knobs.update(latest_raw)
-            if latest_pp is not None:
-                audio_eng.position = int(latest_pp * SAMPLE_RATE) % max(1, len(audio_eng.current))
+            # Drain the MCP / external control bus. Audio bytes (if any)
+            # were stashed at injection time, so recv_audio is a thunk
+            # returning the pre-loaded buffer rather than a WS recv.
+            while True:
+                try:
+                    cdata, caudio = control_queue.get_nowait()
+                except queue.Empty:
+                    break
+                _audio_buf = caudio if caudio is not None else b""
+                try:
+                    _dispatch_message(
+                        cdata,
+                        lambda _b=_audio_buf: _b,
+                        "control",
+                    )
+                except Exception as exc:
+                    print(f"[Server] Control dispatch error: {exc}")
 
     # Forward decl so closures defined above (e.g. _apply_struct_override
     # via the recv thread) can resolve the cell without NameError before
@@ -1610,6 +1777,16 @@ def handle_client(
 
     recv_t = threading.Thread(target=recv_loop, daemon=True)
     recv_t.start()
+
+    # Register with the process-global session registry so the demo's
+    # onboard MCP server can drive this session via the HTTP control bus.
+    session_registry.register(session_registry.SessionHandle(
+        id=session_id,
+        started_at=time.time(),
+        inject=inject_control,
+        snapshot=snapshot_session,
+    ))
+    print(f"[Server] Session registered: id={session_id}")
 
     # Stage the initial enable set so they get applied on the runner
     # thread before the first tick.  Each entry carries its target
@@ -1666,9 +1843,23 @@ def handle_client(
             # profile that's currently loaded). Must run BEFORE
             # prepare_source: VAE-encode is the first GPU consumer and
             # needs the new vae_encode engine bound to its cache.
+            #
+            # Walk mode pins decoder + vae_decode at walk_window_s while
+            # sizing vae_encode to the full new source (same mix that
+            # the initial walk-mode wiring at session start uses). The
+            # plain ensure_profile call would swap to the source's
+            # natural profile and reload the larger decoder, which loses
+            # the bf16 hybrid fix and stalls the producer during the
+            # mid-playback engine swap.
             if profile_mgr is not None:
                 try:
-                    profile_mgr.ensure_profile(new_audio_duration_s)
+                    if walk_window:
+                        profile_mgr.ensure_walk_profile(
+                            walk_window_s=walk_window_s,
+                            source_duration_s=new_audio_duration_s,
+                        )
+                    else:
+                        profile_mgr.ensure_profile(new_audio_duration_s)
                 except EngineNotBuiltError as exc:
                     print(f"[Server] Swap aborted: {exc}")
                     with send_lock:
@@ -1686,7 +1877,6 @@ def handle_client(
                     audio_in=new_audio_in,
                     fixture_name=new_fixture_name,
                     samples=int(new_wf.shape[1]),
-                    checkpoint=checkpoint,
                     key_override=requested_key,
                     time_signature_override=requested_time_sig,
                 )
@@ -1808,6 +1998,12 @@ def handle_client(
                     "bpm": new_bpm,
                     "key": new_key,
                     "time_signature": new_time_sig,
+                    # Echo the requested fixture / upload label so the
+                    # client can mirror MCP-driven source swaps into the
+                    # fixture dropdown (useMcpMirror). Falls back to the
+                    # last-known fixture for swaps that didn't carry a
+                    # name (legacy clients).
+                    "fixture_name": new_fixture_name,
                 }))
                 ws.send(new_src_np.astype(np.float16).tobytes())
                 if new_upload_stems is not None:
@@ -1839,6 +2035,38 @@ def handle_client(
             except Exception:
                 pass
 
+    def apply_depth_pending():
+        with pending_depth_lock:
+            target = pending_depth_ref[0]
+            pending_depth_ref[0] = None
+        if target is None or target == current_depth_ref[0]:
+            return
+        pipe = stream.pipeline
+        if pipe is None:
+            # First tick hasn't built the pipeline yet — re-queue and try
+            # again next iteration. set_depth on a missing pipeline would
+            # silently no-op.
+            with pending_depth_lock:
+                if pending_depth_ref[0] is None:
+                    pending_depth_ref[0] = target
+            return
+        try:
+            pipe.set_depth(target)
+            current_depth_ref[0] = pipe.depth
+        except Exception as exc:
+            print(f"[Server] set_depth({target}) failed: {exc}")
+            return
+        try:
+            with send_lock:
+                ws.send(json.dumps({
+                    "type": "depth_applied",
+                    "value": current_depth_ref[0],
+                }))
+        except ConnectionClosed:
+            running[0] = False
+        except Exception:
+            pass
+
     # Combined before_tick callback.  Both kinds of cross-thread
     # mutation (LoRA enable/disable refits and source swaps) are GPU-
     # bound and must run on the runner thread between ticks.  Drain
@@ -1846,10 +2074,13 @@ def handle_client(
     def apply_pending():
         apply_lora_pending()
         apply_swap_if_pending()
+        apply_depth_pending()
 
     # --- PipelineRunner: the SAME code as local ---
     runner = PipelineRunner(
         session, stream, audio_eng,
+        last_activity_ts=last_activity_ts,
+        idle_threshold_s=IDLE_PAUSE_S,
         use_midi=True,  # always "MIDI" mode; VirtualMidiKnobs provides values
         use_sde=use_sde, use_lora=use_lora,
         midi_knobs=virtual_knobs,
@@ -1876,6 +2107,7 @@ def handle_client(
         traceback.print_exc()
     finally:
         running[0] = False
+        session_registry.unregister(session_id)
         recv_t.join(timeout=2)
         print(f"[Server] Client disconnected ({params.get('num_gens', 0)} generations)")
 
@@ -1891,3 +2123,140 @@ def handle_client(
             session.close()
         except Exception as exc:
             print(f"[Server] session.close() raised: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Startup self-warmup
+#
+# Measured 2026-05-18: a cold first session on a fresh engine takes ~40s to
+# `ready` (TRT decoder-engine load ~3s + LoRA-refit manager ~7s + Session /
+# ModelContext / conditioning ~10s + first-tick pipeline build), while the
+# *second* session on the same warm engine is ~5-6s. ~30s of the cold path is
+# one-time-after-engine-start state that persists in the process. Driving one
+# synthetic default-fixture session through `handle_client` at boot — before
+# the pod accepts real traffic — pays that once so every real "begin" gets the
+# warm path. Behaviour-neutral for real clients; the warmup session is fully
+# torn down (stream.close()+session.close()) by handle_client's own finally.
+# ---------------------------------------------------------------------------
+
+WARMUP_STATE: dict = {"done": False, "error": None, "seconds": None}
+
+_WARMUP_FIXTURE = "low_fi_Gm_loop_60s_gnm.wav"  # PREFERRED_DEFAULT_FIXTURE
+_WARMUP_PROMPT = "ambient electronic, warm pads"
+
+
+class _WarmupWS:
+    """In-process synthetic WebSocket that drives one default-fixture
+    session through handle_client to warm one-time engine state.
+
+    Scripts the Phase-1 handshake (config JSON, then the audio frame),
+    lets Phase-2 spin long enough to build the pipeline + run the first
+    generation tick, then raises ConnectionClosed so handle_client's
+    teardown path frees all per-session GPU state.
+    """
+
+    def __init__(self, config_json: str, audio_frame: bytes, budget_s: float = 35.0):
+        self._queue = [config_json, audio_frame]
+        self._t0 = time.monotonic()
+        self._budget_s = budget_s
+        self._initial_seen_at = None
+        self.closed = False
+
+    def recv(self, timeout=None):
+        if self._queue:
+            return self._queue.pop(0)
+        # Phase-2: spin until warm budget elapsed, then end the session.
+        # Mimic "no client message" via TimeoutError when the caller
+        # passed a timeout (the streaming loop polls that way); raise
+        # ConnectionClosed once warmed so every recv site unwinds into
+        # handle_client's finally (which closes the session).
+        now = time.monotonic()
+        warm_enough = (
+            now - self._t0 > self._budget_s
+            or (self._initial_seen_at is not None
+                and now - self._initial_seen_at > 10.0)
+        )
+        if warm_enough:
+            raise ConnectionClosed(None, None)
+        if timeout is not None:
+            time.sleep(min(timeout, 0.05))
+            raise TimeoutError
+        time.sleep(0.1)
+        raise TimeoutError
+
+    def send(self, msg):
+        # The initial buffer is a large binary frame (the echoed source);
+        # spotting it tells us Phase-1 finished so we can bound Phase-2.
+        if isinstance(msg, (bytes, bytearray)) and len(msg) > 1_000_000:
+            if self._initial_seen_at is None:
+                self._initial_seen_at = time.monotonic()
+
+    def close(self, *args, **kwargs):
+        self.closed = True
+
+
+def _load_warmup_audio_frame() -> bytes:
+    """Build the wire frame (<II channels,samples> + interleaved f32)
+    for the default fixture, matching the browser's upload format."""
+    from acestep.fixtures import audio_fixture
+
+    path = str(audio_fixture(_WARMUP_FIXTURE))
+    try:
+        import soundfile as sf
+        data, _sr = sf.read(path, dtype="float32", always_2d=True)  # (n, ch)
+    except Exception:
+        import librosa
+        mono, _sr = librosa.load(path, sr=None, mono=True)
+        data = np.stack([mono, mono], axis=1).astype(np.float32)
+    if data.ndim == 1:
+        data = np.stack([data, data], axis=1)
+    if data.shape[1] == 1:
+        data = np.repeat(data, 2, axis=1)
+    ch = int(data.shape[1])
+    samples = int(data.shape[0])
+    interleaved = np.ascontiguousarray(data, dtype=np.float32).reshape(-1)
+    return struct.pack("<II", ch, samples) + interleaved.tobytes()
+
+
+def run_startup_warmup(
+    *,
+    decoder_backend: str,
+    vae_backend: str,
+    checkpoint: str,
+    offload_text_encoder: bool,
+) -> None:
+    """Drive one synthetic default-fixture session at boot. Never raises
+    — a failed warmup must not stop the server from serving."""
+    t0 = time.monotonic()
+    print("[warmup] starting default-fixture session warmup...", flush=True)
+    try:
+        cfg = {
+            "fixture_name": _WARMUP_FIXTURE,
+            "prompt": _WARMUP_PROMPT,
+            "steps": 8,
+            "depth": 4,
+            "lora": False,
+            "enabled_loras": [],
+        }
+        frame = _load_warmup_audio_frame()
+        ws = _WarmupWS(json.dumps(cfg), frame)
+        handle_client(
+            ws,
+            decoder_backend=decoder_backend,
+            vae_backend=vae_backend,
+            checkpoint=checkpoint,
+            offload_text_encoder=offload_text_encoder,
+        )
+        WARMUP_STATE["done"] = True
+        WARMUP_STATE["seconds"] = round(time.monotonic() - t0, 1)
+        print(
+            f"[warmup] done in {WARMUP_STATE['seconds']}s — "
+            f"first real session will take the warm path",
+            flush=True,
+        )
+    except Exception as exc:
+        import traceback
+        WARMUP_STATE["error"] = repr(exc)
+        WARMUP_STATE["seconds"] = round(time.monotonic() - t0, 1)
+        print(f"[warmup] FAILED after {WARMUP_STATE['seconds']}s: {exc}", flush=True)
+        traceback.print_exc()

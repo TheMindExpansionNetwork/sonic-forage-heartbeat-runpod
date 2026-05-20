@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { useCurveStore } from "@/store/useCurveStore";
 import { useLoraStore } from "@/store/useLoraStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
+import { useSessionStore } from "@/store/useSessionStore";
 import {
   DCW_MODES,
   DCW_WAVELETS,
@@ -29,6 +30,13 @@ import {
 //      DEFAULT_CONFIG below, so first paint is correct even if the fetch
 //      is still in flight.
 
+/** One entry in `engine.enabled_loras`. Bare string = enable that LoRA
+ *  at its sidecar's recommended_strength (or controls.lora_default_strength
+ *  as fallback). Object form sets an inline strength override. `name`
+ *  may be the filename stem ("deep_house-v1") or the sidecar's display
+ *  name ("Deep House"); matching is case-insensitive. */
+export type EnabledLoraEntry = string | { name: string; strength?: number };
+
 export interface RtmgConfigEngine {
   sde: boolean;
   lora: boolean;
@@ -49,16 +57,43 @@ export interface RtmgConfigEngine {
    * sidecar hits, so this is purely a UI seed for the manual "Override"
    * control. Allowed values: "2" | "3" | "4" | "6". */
   time_signature: string;
-  /** Filename stems to auto-enable on first catalog load. Empty falls
-   * back to the count-rule in useLoraStore (first two from the sorted
-   * catalog, with name-fallback per slot). */
-  enabled_loras: string[];
+  /** LoRAs to auto-enable on first catalog load. Empty falls back to
+   * the count-rule in useLoraStore (first two from the sorted catalog,
+   * with name-fallback per slot). See `EnabledLoraEntry` for the shape
+   * of each element. */
+  enabled_loras: EnabledLoraEntry[];
+  /** When true, enabling a LoRA prepends its primary trigger word to
+   *  promptA and promptB so the user sees exactly what the encoder
+   *  sees. When false, the trigger never enters the prompt text unless
+   *  the user types it themselves — useful for prompt-driven workflows
+   *  that want to stay 100% manual. Disabling a LoRA best-effort
+   *  removes its trigger from the prompt when it's still at the head.
+   *  Defaults to true. */
+  auto_prepend_lora_triggers?: boolean;
+  /** When true, the LoRA library shows every entry regardless of
+   *  whether its trained ``base_model_scale`` matches the active
+   *  checkpoint. Useful for inspecting your full collection while
+   *  on a specific checkpoint. Default false (auto-hide). LoRAs with
+   *  no declared scale are shown either way — we don't hide what we
+   *  can't classify. */
+  show_incompatible_loras?: boolean;
+  /** XL (5B) variant overrides. When the active checkpoint scale is
+   *  "5B", these win over their base siblings at applyConfig time.
+   *  Absent / undefined falls through to the base field. Selection
+   *  happens once at boot in applyConfig() using the scale already
+   *  resolved by /api/loras. */
+  depth_xl?: number;
+  enabled_loras_xl?: EnabledLoraEntry[];
 }
 
 export interface RtmgConfigPrompts {
   a: string;
   b: string;
   blend: number;
+  /** XL (5B) variant overrides — same selection rule as engine.*_xl. */
+  a_xl?: string;
+  b_xl?: string;
+  blend_xl?: number;
 }
 
 export interface RtmgConfigEffects {
@@ -166,8 +201,8 @@ export interface RtmgConfigCurve {
 
 /** Per-param schedule curves the user (or an operator-supplied config)
  *  draws against the track timeline. Keyed by param name — the fixed
- *  six (denoise, hint_strength, feedback, shift, noise_share, ode_noise)
- *  plus dynamic LoRA strength curves (lora_str_<id>). */
+ *  set (denoise, hint_strength, feedback, shift, noise_share) plus
+ *  dynamic LoRA strength curves (lora_str_<id>). */
 export interface RtmgConfigCurves {
   /** Master enable. When false, no curve drives any param regardless
    *  of per-curve enabled flags. */
@@ -213,6 +248,8 @@ export const DEFAULT_CONFIG: RtmgConfig = {
     key: "G# minor",
     time_signature: DEFAULT_TIME_SIGNATURE,
     enabled_loras: [],
+    auto_prepend_lora_triggers: true,
+    show_incompatible_loras: false,
   },
   prompts: {
     a: "heavy dubstep, deathstep, afxdump, growl heavy bass distortion",
@@ -223,8 +260,8 @@ export const DEFAULT_CONFIG: RtmgConfig = {
     denoise: 0.7,
     hint_strength: 1.4,
     feedback: 0.0,
+    feedback_depth: 1,
     shift: 0.5,
-    ode_noise: 0.0,
     ch_g0: 1.0,
     ch_g1: 1.0,
     ch_g2: 1.0,
@@ -289,6 +326,7 @@ export const DEFAULT_CONFIG: RtmgConfig = {
 };
 
 let _activeConfig: RtmgConfig = DEFAULT_CONFIG;
+let _configApplied = false;
 const listeners = new Set<(c: RtmgConfig) => void>();
 
 /** Snapshot of the active config. Read at point-of-use by code paths
@@ -296,6 +334,16 @@ const listeners = new Set<(c: RtmgConfig) => void>();
  * runs once per Play click). For reactive reads, use useConfig(). */
 export function getConfig(): RtmgConfig {
   return _activeConfig;
+}
+
+/** Whether applyConfig() has been called at least once. Once-per-session
+ *  seed paths (useLoraStore.setCatalog → computeSeed) gate on this so a
+ *  catalog fetch that beats the config fetch doesn't seed against
+ *  DEFAULT_CONFIG. LibraryTile fires its own /api/loras in LOCAL_MODE
+ *  at mount, racing RTMGBoot's parallel fetches; without this gate the
+ *  loser-wins outcome is non-deterministic. */
+export function isConfigApplied(): boolean {
+  return _configApplied;
 }
 
 /** Subscribe to applyConfig() calls. Returns an unsubscribe. Used by
@@ -387,41 +435,79 @@ function isDcwWavelet(v: unknown): v is DcwWavelet {
   return typeof v === "string" && (DCW_WAVELETS as readonly string[]).includes(v);
 }
 
+/** Collapse the dual-variant config into a single applied config, picking
+ *  the XL (5B) sibling when the active checkpoint scale is "5B" and the
+ *  sibling is defined. Any other scale (null, "2B", unknown) keeps the
+ *  base values. Unspecified `_xl` siblings always fall through to base,
+ *  so existing single-variant config.json files keep working unchanged.
+ *
+ *  Result keeps the `_xl` fields on the engine/prompts objects so an
+ *  Import round-trip (mergeConfig over getConfig() then applyConfig)
+ *  doesn't lose them. */
+export function selectVariant(cfg: RtmgConfig, scale: string | null): RtmgConfig {
+  if (scale !== "5B") return cfg;
+  const e = cfg.engine;
+  const p = cfg.prompts;
+  return {
+    ...cfg,
+    engine: {
+      ...e,
+      depth: e.depth_xl ?? e.depth,
+      enabled_loras: e.enabled_loras_xl ?? e.enabled_loras,
+    },
+    prompts: {
+      ...p,
+      a: p.a_xl ?? p.a,
+      b: p.b_xl ?? p.b,
+      blend: typeof p.blend_xl === "number" ? p.blend_xl : p.blend,
+    },
+  };
+}
+
 /** Push the supplied config into stores + non-store subscribers. Idempotent;
  * safe to call multiple times. The only mid-session callers today are the
- * boot path; future "Reload config" affordances would call this too. */
+ * boot path; future "Reload config" affordances would call this too.
+ *
+ * Resolves the XL variant in-place using the current checkpoint scale —
+ * RTMGBoot awaits /api/loras before this runs at boot, so the scale is
+ * already known the first time we land here. Mid-session re-applies
+ * (Import) read whatever scale is currently set in useSessionStore. */
 export function applyConfig(c: RtmgConfig): void {
-  _activeConfig = c;
+  const scale = useSessionStore.getState().checkpointScale;
+  const resolved = selectVariant(c, scale);
+  _activeConfig = resolved;
+  _configApplied = true;
 
   // Numeric controls land on sliderValues + sliderTargets so the slider
   // UI and the param-sync tick agree. prompt_blend rides in here too —
   // it lives in the slider system alongside lora_blend.
   const sliderUpdates: Record<string, number> = {};
-  for (const [k, v] of Object.entries(c.controls)) {
+  for (const [k, v] of Object.entries(resolved.controls)) {
     if (typeof v === "number") sliderUpdates[k] = v;
   }
-  sliderUpdates.prompt_blend = c.prompts.blend;
+  sliderUpdates.prompt_blend = resolved.prompts.blend;
 
   usePerformanceStore.setState((s) => ({
+    sliderDefaults: { ...s.sliderDefaults, ...sliderUpdates },
     sliderValues: { ...s.sliderValues, ...sliderUpdates },
     sliderTargets: { ...s.sliderTargets, ...sliderUpdates },
-    promptA: c.prompts.a,
-    promptB: c.prompts.b,
-    activeKey: c.engine.key,
-    activeTimeSignature: isTimeSignature(c.engine.time_signature)
-      ? c.engine.time_signature
+    promptA: resolved.prompts.a,
+    promptB: resolved.prompts.b,
+    activeKey: resolved.engine.key,
+    activeTimeSignature: isTimeSignature(resolved.engine.time_signature)
+      ? resolved.engine.time_signature
       : DEFAULT_TIME_SIGNATURE,
-    seed: c.seed,
+    seed: resolved.seed,
     dcwEnabled:
-      typeof c.controls.dcw_enabled === "boolean"
-        ? c.controls.dcw_enabled
+      typeof resolved.controls.dcw_enabled === "boolean"
+        ? resolved.controls.dcw_enabled
         : s.dcwEnabled,
-    dcwMode: isDcwMode(c.controls.dcw_mode) ? c.controls.dcw_mode : s.dcwMode,
-    dcwWavelet: isDcwWavelet(c.controls.dcw_wavelet)
-      ? c.controls.dcw_wavelet
+    dcwMode: isDcwMode(resolved.controls.dcw_mode) ? resolved.controls.dcw_mode : s.dcwMode,
+    dcwWavelet: isDcwWavelet(resolved.controls.dcw_wavelet)
+      ? resolved.controls.dcw_wavelet
       : s.dcwWavelet,
-    rcfgMode: isRcfgMode(c.controls.rcfg_mode) ? c.controls.rcfg_mode : s.rcfgMode,
-    lufsOn: c.audio.lufs_enabled,
+    rcfgMode: isRcfgMode(resolved.controls.rcfg_mode) ? resolved.controls.rcfg_mode : s.rcfgMode,
+    lufsOn: resolved.audio.lufs_enabled,
   }));
 
   // Curves: when the config carries them, push the whole bag into
@@ -430,11 +516,11 @@ export function applyConfig(c: RtmgConfig): void {
   // own hydratePersistedCurves localStorage path. Deep-clone the
   // points so later edits in the store don't mutate the active
   // config snapshot.
-  if (c.curves) {
+  if (resolved.curves) {
     useCurveStore.setState({
-      scheduleEnabled: c.curves.scheduleEnabled,
+      scheduleEnabled: resolved.curves.scheduleEnabled,
       curves: Object.fromEntries(
-        Object.entries(c.curves.curves).map(([param, curve]) => [
+        Object.entries(resolved.curves.curves).map(([param, curve]) => [
           param,
           {
             enabled: curve.enabled,
@@ -445,7 +531,18 @@ export function applyConfig(c: RtmgConfig): void {
     });
   }
 
-  for (const fn of listeners) fn(c);
+  // If a setCatalog landed before applyConfig (LibraryTile's mount-time
+  // /api/loras winning the race against /config.json), the lora store
+  // stashed the catalog but skipped seeding because the config wasn't
+  // ready yet. Re-trigger setCatalog with the existing catalog so the
+  // store's own once-per-session gate (`seeded`) runs against the
+  // correct enabled_loras.
+  const lora = useLoraStore.getState();
+  if (!lora.seeded && lora.catalog.length > 0) {
+    lora.setCatalog(lora.catalog);
+  }
+
+  for (const fn of listeners) fn(resolved);
 }
 
 /**
@@ -483,7 +580,12 @@ export function captureRtmgConfig(): RtmgConfig {
       ...active.engine,
       key: perf.activeKey,
       time_signature: perf.activeTimeSignature ?? active.engine.time_signature,
-      enabled_loras: Array.from(lora.enabled),
+      enabled_loras: Array.from(lora.enabled).map((id) => {
+        const strength = lora.strengths[id];
+        return typeof strength === "number"
+          ? { name: id, strength }
+          : id;
+      }),
     },
     prompts: {
       a: perf.promptA,

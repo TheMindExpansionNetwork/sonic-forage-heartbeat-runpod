@@ -1,29 +1,36 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
-import { ChannelGainsTile } from "./ChannelGainsTile";
-import { ChannelsTile } from "./ChannelsTile";
-import { DcwTile } from "./DcwTile";
-import { EngineTile } from "./EngineTile";
+import { useScrollSyncedTabs } from "@/hooks/useScrollSyncedTabs";
+
+import { CoreTile } from "./CoreTile";
 import { LibraryTile } from "./LibraryTile";
-import { MainTile } from "./MainTile";
+import { ModTile } from "./ModTile";
 import { OperatorStrip } from "./OperatorStrip";
 import { PromptsTile } from "./PromptsTile";
-import { SeedTile } from "./SeedTile";
+import { VoiceTile } from "./VoiceTile";
 
-type Tab = "mix" | "sound" | "prompts" | "config";
+type Tab = "core" | "mod" | "voice" | "styles" | "saved" | "config";
 
 interface Props {
   open: boolean;
   onClose: () => void;
+  /** Slot for the Saved tab body, passed through from the host (the
+   *  demo passes <SessionsTile/>). Mirrors AdvancedDrawer's savedTab
+   *  prop so the desktop + mobile surfaces share the same component. */
+  savedTab?: ReactNode;
 }
 
+// Mirrors the desktop DrawerTabs IA: CORE / STYLES (prompts + LoRAs
+// together) / MOD / CHANNELS (key=voice) / SAVED / CONFIG.
 const TABS: { id: Tab; label: string }[] = [
-  { id: "mix", label: "Mix" },
-  { id: "sound", label: "Sound" },
-  { id: "prompts", label: "Prompts" },
+  { id: "core", label: "Core" },
+  { id: "styles", label: "Styles" },
+  { id: "mod", label: "Mod" },
+  { id: "voice", label: "Channels" },
+  { id: "saved", label: "Saved" },
   { id: "config", label: "Config" },
 ];
 
@@ -34,10 +41,15 @@ const TABS: { id: Tab; label: string }[] = [
 // is the single source of truth — taps scroll into view, the observer
 // updates `tab` from whatever's most visible. That way swipe and tap stay
 // in sync without setState fighting the scroller.
-export function MobileFullSheet({ open, onClose }: Props) {
-  const [tab, setTab] = useState<Tab>("mix");
+export function MobileFullSheet({ open, onClose, savedTab }: Props) {
   const [mounted, setMounted] = useState(false);
   const trackRef = useRef<HTMLDivElement | null>(null);
+  const tabIds = useMemo(() => TABS.map((t) => t.id), []);
+  const { activeTab: tab, gotoTab } = useScrollSyncedTabs<Tab>(
+    trackRef,
+    tabIds,
+    { attribute: "section", initial: "core", enabled: open },
+  );
 
   useEffect(() => setMounted(true), []);
 
@@ -49,40 +61,6 @@ export function MobileFullSheet({ open, onClose }: Props) {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose]);
-
-  // Watch which section is currently in view and sync the active tab.
-  useEffect(() => {
-    if (!open) return;
-    const root = trackRef.current;
-    if (!root) return;
-
-    const obs = new IntersectionObserver(
-      (entries) => {
-        let best: IntersectionObserverEntry | null = null;
-        for (const e of entries) {
-          if (!e.isIntersecting) continue;
-          if (!best || e.intersectionRatio > best.intersectionRatio) best = e;
-        }
-        if (!best) return;
-        const id = (best.target as HTMLElement).dataset.section as Tab | undefined;
-        if (id) setTab(id);
-      },
-      { root, threshold: [0.5, 0.75, 1] },
-    );
-    for (const t of TABS) {
-      const el = root.querySelector<HTMLElement>(`[data-section="${t.id}"]`);
-      if (el) obs.observe(el);
-    }
-    return () => obs.disconnect();
-  }, [open]);
-
-  function gotoTab(id: Tab) {
-    const root = trackRef.current;
-    if (!root) return;
-    const el = root.querySelector<HTMLElement>(`[data-section="${id}"]`);
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", inline: "start", block: "nearest" });
-  }
 
   if (!mounted || !open) return null;
 
@@ -104,19 +82,27 @@ export function MobileFullSheet({ open, onClose }: Props) {
       </header>
 
       <div ref={trackRef} className="mobile-sheet-track">
-        <section data-section="mix" className="mobile-sheet-section">
-          <MainTile />
+        <section data-section="core" className="mobile-sheet-section">
+          <CoreTile />
         </section>
-        <section data-section="sound" className="mobile-sheet-section">
-          <EngineTile />
-          <ChannelsTile />
-          <ChannelGainsTile />
-          <DcwTile />
-          <LibraryTile />
-          <SeedTile />
+        <section data-section="mod" className="mobile-sheet-section">
+          <ModTile />
         </section>
-        <section data-section="prompts" className="mobile-sheet-section">
-          <PromptsTile />
+        <section data-section="voice" className="mobile-sheet-section">
+          <VoiceTile />
+        </section>
+        <section data-section="styles" className="mobile-sheet-section">
+          <div className="styles-tab">
+            <PromptsTile />
+            <LibraryTile />
+          </div>
+        </section>
+        <section data-section="saved" className="mobile-sheet-section">
+          {savedTab ?? (
+            <div className="install-sheet-saved-placeholder">
+              Saved sessions are only available in the hosted app.
+            </div>
+          )}
         </section>
         <section data-section="config" className="mobile-sheet-section">
           <OperatorStrip />

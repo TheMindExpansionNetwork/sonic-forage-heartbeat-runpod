@@ -9,8 +9,8 @@ directory.  Existing ONNX files are auto-detected and reused; the model is
 only loaded when an ONNX export is actually needed.
 
 Usage:
-    # Build the canonical engine matrix (60s + 120s + 240s, VAE + decoder,
-    # refit + non-refit). Matches acestep.paths._TRT_ENGINE_PROFILES.
+    # Build the canonical engine matrix (60s + 120s + 240s, VAE + decoder
+    # refit-only). Matches acestep.paths._TRT_ENGINE_PROFILES.
     python -m acestep.engine.trt.build --all
 
     # Build a single duration (e.g. just 120s):
@@ -71,6 +71,7 @@ _DECODER_PRECISION_CHOICES = (
     "fp32",
     "fp16_mixed",
     "bf16_mixed",
+    "fp8_mixed",
 )
 
 
@@ -234,12 +235,21 @@ def _resolve_decoder_precision(
 
     ``decoder_mixed`` preserves the legacy 2B behavior: when callers ask
     for the old mixed path, ``auto`` maps to the fp16 mixed export recipe.
-    XL checkpoints need bf16 range, so their ``auto`` default is bf16_mixed.
+
+    XL ``auto`` resolves to ``fp8_mixed`` (W8A8). This is the production
+    target for the XL turbo decoder: bf16 is too slow for XL to be useful
+    in real-time streaming, so the canonical engine names in
+    ``acestep.paths`` (``decoder_xl-turbo_fp8_refit_b4_*``) are FP8. To
+    actually get W8A8 (vs the silent W8A16 fallback) the build must also
+    receive ``--activation-absmax-json`` pointing at a calibration JSON
+    from ``scripts/calibration/collect_activation_absmax.py``; without it the FP8
+    patch runs weight-only, which leaves the GEMM in bf16 with a free
+    dequant and gives back the latency the FP8 build was supposed to win.
     """
     if requested != "auto":
         return requested
     if _looks_like_xl_checkpoint(checkpoint):
-        return "bf16_mixed"
+        return "fp8_mixed"
     if decoder_mixed:
         return "fp16_mixed"
     return "fp32"
@@ -250,6 +260,8 @@ def _decoder_precision_is_strongly_typed(decoder_precision: str, decoder_mixed: 
         return True
     if decoder_precision == "bf16_mixed":
         return True
+    if decoder_precision == "fp8_mixed":
+        return True
     return decoder_mixed
 
 
@@ -259,10 +271,12 @@ def _decoder_onnx_needs_dynbatch_patch(
     decoder_precision: str,
     batch_max: int,
 ) -> bool:
+    # FP8 reuses the bf16 ONNX as its base; same dynbatch concern applies.
+    needs_bf16_base = decoder_precision in ("bf16_mixed", "fp8_mixed")
     return (
         batch_max > 1
         and _looks_like_xl_checkpoint(checkpoint)
-        and decoder_precision == "bf16_mixed"
+        and needs_bf16_base
     )
 
 
@@ -296,6 +310,77 @@ def _patch_decoder_onnx_for_dynamic_batch(
         patched[key] = str(
             patch_decoder_onnx_dynamic_batch_reshapes(
                 patched[key],
+                force=force,
+            )
+        )
+    return patched
+
+
+def _patch_decoder_onnx_for_fp8(
+    onnx_paths: dict[str, str],
+    *,
+    need_decoder_std: bool,
+    need_decoder_refit: bool,
+    decoder_precision: str,
+    calibration_npz: str,
+    activation_absmax_json: str | None,
+    activation_percentile: str,
+    activation_outlier_skip_ratio: float,
+    smoothquant_alpha: float,
+    force: bool,
+) -> dict[str, str]:
+    """Insert FP8 QDQ into decoder ONNX(es) when decoder_precision='fp8_mixed'.
+
+    Runs after the dynbatch reshape patch so the FP8 graph inherits the
+    dynamic-batch-safe reshapes. The patched ONNX is a sibling of the
+    source; this function rewrites the paths dict to point at it.
+
+    When ``activation_absmax_json`` is provided, the patch runs in W8A8
+    mode (activation Q->DQ inserted alongside weight DQ); otherwise it
+    runs in weight-only W8A16 mode.
+    """
+    if decoder_precision != "fp8_mixed":
+        return onnx_paths
+
+    cal_path = None
+    if calibration_npz:
+        cal_path = Path(calibration_npz)
+        if not cal_path.exists():
+            raise FileNotFoundError(f"Calibration .npz not found: {cal_path}")
+
+    amax_path = None
+    if activation_absmax_json:
+        amax_path = Path(activation_absmax_json)
+        if not amax_path.exists():
+            # Canonical XL FP8 calibrations live on HF; if the local
+            # file is missing but the path matches the standard layout
+            # (<root>/<component>/<profile>/activation_absmax.json),
+            # fetch and continue. Falls through to FileNotFoundError
+            # for non-canonical paths.
+            from .calibration_hub import resolve_or_fetch
+            fetched = resolve_or_fetch(amax_path)
+            if fetched is not None:
+                amax_path = fetched
+        if not amax_path.exists():
+            raise FileNotFoundError(f"Activation absmax JSON not found: {amax_path}")
+
+    from .fp8_onnx import patch_bf16_onnx_to_fp8
+
+    patched = dict(onnx_paths)
+    for key, needed in (
+        ("decoder", need_decoder_std),
+        ("decoder_refit", need_decoder_refit),
+    ):
+        if not needed:
+            continue
+        patched[key] = str(
+            patch_bf16_onnx_to_fp8(
+                bf16_onnx_path=patched[key],
+                calibration_npz_path=cal_path,
+                activation_absmax_json_path=amax_path,
+                activation_percentile=activation_percentile,
+                activation_outlier_skip_ratio=activation_outlier_skip_ratio,
+                smoothquant_alpha=smoothquant_alpha,
                 force=force,
             )
         )
@@ -575,11 +660,18 @@ def _ensure_onnx(
     if export_decoder_refit or export_decoder_std:
         from .export import OnnxExportConfig, export_decoder_onnx
 
+        # fp8_mixed reuses the bf16_mixed ONNX as its export base; the
+        # FP8 QDQ patch runs afterwards in a separate step.
+        underlying_precision = (
+            "bf16_mixed" if decoder_precision == "fp8_mixed"
+            else decoder_precision
+        )
+
         def decoder_export_config(*, for_refit: bool) -> OnnxExportConfig:
-            if decoder_precision == "fp16_mixed":
+            if underlying_precision == "fp16_mixed":
                 return OnnxExportConfig(mixed_precision=True, for_refit=for_refit)
             return OnnxExportConfig(
-                precision=decoder_precision,
+                precision=underlying_precision,
                 mixed_precision=False,
                 for_refit=for_refit,
             )
@@ -828,6 +920,20 @@ def _build_decoder_engine(
     t0 = time.time()
     build_trt_engine(onnx_paths[onnx_key], engine_path, config=config)
     _write_metadata(engine_path=engine_path, expected=expected_metadata, env=env)
+    # Copy the refit orientation manifest from the ONNX export next to the
+    # engine so TRTLoRAManager can find it at runtime. The manifest tells
+    # the runtime which renamed weights are stored in the engine slot in
+    # ``[in_dim, out_dim]`` orientation (dynamo's MatMul layout) so the
+    # LoRA delta gets transposed before refit. Absent for non-refit and
+    # for the legacy torchscript path (which stored torch-orientation
+    # natively, no transpose needed).
+    onnx_manifest = Path(str(onnx_paths[onnx_key]) + ".refit_manifest.json")
+    if onnx_manifest.is_file():
+        engine_manifest = Path(str(engine_path) + ".refit_manifest.json")
+        engine_manifest.write_text(
+            onnx_manifest.read_text(encoding="utf-8"), encoding="utf-8",
+        )
+        logger.info("Copied refit manifest to {}", engine_manifest)
     elapsed = time.time() - t0
     logger.info("Built in {:.0f}s", elapsed)
 
@@ -954,8 +1060,8 @@ def main():
     # Batch mode
     batch = parser.add_argument_group("batch mode (--all)")
     batch.add_argument("--all", action="store_true",
-                       help="Build full engine matrix (VAE + decoder, "
-                            "refit + non-refit, across durations)")
+                       help="Build full engine matrix (VAE + refit-only "
+                            "decoder, across durations)")
     batch.add_argument("--duration", nargs="*", type=int, default=None,
                        help="Duration(s) in seconds for --all mode "
                             "(default: 60 120 240 — the canonical profile set "
@@ -1006,7 +1112,10 @@ def main():
     single.add_argument("--decoder", action="store_true",
                         help="Build decoder engine(s)")
     single.add_argument("--decoder-mixed", action="store_true",
-                        help="Use mixed precision for decoder")
+                        help="Build the bf16-hybrid decoder recipe "
+                             "(bf16 trunk + fp32 islands + per-Linear fp16 "
+                             "wrappers + fp32 proj_out deconv, "
+                             "strongly_typed=True)")
     single.add_argument("--decoder-precision",
                         choices=_DECODER_PRECISION_CHOICES,
                         default="auto",
@@ -1028,6 +1137,31 @@ def main():
                              "(default: TRTBuildConfig default)")
     single.add_argument("--skip-vae", action="store_true",
                         help="Skip VAE engine build")
+
+    fp8 = parser.add_argument_group("fp8_mixed options")
+    fp8.add_argument("--calibration-npz", type=str, default=None,
+                     help="Path to calibration .npz (currently informational; "
+                          "the FP8 patcher infers stats from "
+                          "--activation-absmax-json).")
+    fp8.add_argument("--activation-absmax-json", type=str, default=None,
+                     help="Per-Linear activation absmax JSON from "
+                          "scripts/calibration/collect_activation_absmax.py. When set, "
+                          "fp8_mixed runs in W8A8 mode (activation Q->DQ + "
+                          "weight DQ); when omitted, fp8_mixed stays in "
+                          "weight-only W8A16.")
+    fp8.add_argument("--activation-percentile",
+                     choices=("absmax", "p99", "p99_9", "p99_99"),
+                     default="absmax",
+                     help="Which activation amax field drives the FP8 scale "
+                          "(default: absmax).")
+    fp8.add_argument("--activation-outlier-skip-ratio", type=float, default=0.0,
+                     help="When > 0, Linears whose absmax/p99_9 ratio exceeds "
+                          "this threshold skip activation Q-DQ and stay on the "
+                          "W8A16 path (bf16 act x FP8 weight DQ). 4.0 is a "
+                          "reasonable default for outlier-heavy DiT layers.")
+    fp8.add_argument("--smoothquant-alpha", type=float, default=0.0,
+                     help="SmoothQuant migration strength (0.0 = off, 0.5 = "
+                          "standard).")
 
     args = parser.parse_args()
     if args.skip_onnx and args.force_onnx:
@@ -1114,6 +1248,18 @@ def _run_all(args, project_root, onnx_dir, env):
             checkpoint=args.checkpoint,
             decoder_precision=decoder_precision,
             batch_max=args.batch_max,
+            force=args.force_onnx,
+        )
+        onnx_paths = _patch_decoder_onnx_for_fp8(
+            onnx_paths,
+            need_decoder_std=False,
+            need_decoder_refit=build_decoder,
+            decoder_precision=decoder_precision,
+            calibration_npz=args.calibration_npz,
+            activation_absmax_json=args.activation_absmax_json,
+            activation_percentile=args.activation_percentile,
+            activation_outlier_skip_ratio=args.activation_outlier_skip_ratio,
+            smoothquant_alpha=args.smoothquant_alpha,
             force=args.force_onnx,
         )
     else:
@@ -1222,6 +1368,18 @@ def _run_single(args, project_root, onnx_dir, env):
         checkpoint=args.checkpoint,
         decoder_precision=decoder_precision,
         batch_max=args.batch_max,
+        force=args.force_onnx,
+    )
+    onnx_paths = _patch_decoder_onnx_for_fp8(
+        onnx_paths,
+        need_decoder_std=build_decoder and not args.decoder_refit,
+        need_decoder_refit=build_decoder and args.decoder_refit,
+        decoder_precision=decoder_precision,
+        calibration_npz=args.calibration_npz,
+        activation_absmax_json=args.activation_absmax_json,
+        activation_percentile=args.activation_percentile,
+        activation_outlier_skip_ratio=args.activation_outlier_skip_ratio,
+        smoothquant_alpha=args.smoothquant_alpha,
         force=args.force_onnx,
     )
 

@@ -16,7 +16,7 @@ import { DCW_MODES, DCW_WAVELETS, SLIDER_META } from "@/types/engine";
 //   G + ▲▼      structure (hint_strength)
 //   C + ▲▼      timbre (timbre_strength)
 //   B + ▲▼      prompt blend
-//   E/H/D + ▲▼  feedback / shift / ode (engine)
+//   E/D/H + ▲▼  feedback / feedback depth / shift (engine)
 //   W/Y + ▲▼    DCW low / DCW high
 //   T            toggle DCW on/off
 //   Shift+T      cycle DCW mode
@@ -37,8 +37,8 @@ const HELD_DIGITS = new Set<string>(); // KeyboardEvent.code, e.g. "Digit3"
 // param mapped per chord modifier
 const ENGINE_DCW_CHORDS: Record<string, string> = {
   e: "feedback",
+  d: "feedback_depth",
   h: "shift",
-  d: "ode_noise",
   w: "dcw_scaler",
   y: "dcw_high_scaler",
 };
@@ -73,11 +73,14 @@ export function useKeyboardShortcuts() {
 
     function bumpParam(param: string, direction: 1 | -1): void {
       const meta = SLIDER_META[param];
-      const step = meta?.step ?? 0.05;
-      // Reverse channels flip the arrow-key direction so ArrowUp still
-      // means "drive the slider thumb UP" — which on a reverse channel
-      // corresponds to a DECREASE in the engine value. Mirrors the slider
-      // drag and MIDI knob behavior.
+      const baseStep = meta?.step ?? 0.05;
+      // Arrow nudges use the param's own SLIDER_META.step as the
+      // increment, no 5× ramp. The previous 5× was tuned for the old
+      // 0.01 hero-macro step; once denoise/structure/timbre/feedback
+      // were bumped to 0.05 the multiplier produced 0.25-per-tap which
+      // felt like a slap. Shift halves the step for fine adjustments.
+      const stepMul = HELD_KEYS.has("shift") ? 0.5 : 1;
+      const step = baseStep * stepMul;
       const dirSign = getChannelRange(param)?.reverse ? -1 : 1;
       usePerformanceStore.getState().bumpSlider(param, direction * step * dirSign);
     }
@@ -95,6 +98,16 @@ export function useKeyboardShortcuts() {
       const remote = useSessionStore.getState().remote;
       if (remote) {
         remote.sendPrompt(promptA, activeKey, activeTimeSignature, promptB);
+      }
+      // Visual feedback: flash the "Send Tags" button so the operator
+      // sees a press in response to the keyboard fire (Ctrl/Cmd+Enter
+      // inside the textarea, or Enter outside any editable). Class
+      // mirrors the :active state in globals.css. 150 ms is long
+      // enough to register without overstaying the actual key press.
+      const btn = document.getElementById("send-prompt");
+      if (btn) {
+        btn.classList.add("is-pressed");
+        window.setTimeout(() => btn.classList.remove("is-pressed"), 150);
       }
     }
 

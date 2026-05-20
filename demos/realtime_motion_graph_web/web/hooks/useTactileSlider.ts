@@ -6,20 +6,12 @@ import { valueToT, type SliderMapping } from "@/lib/sliderMapping";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 
 // Lightweight per-slider tactile augmentation: feature-detected haptics on
-// landmark crossings (0, 0.5, 1.0 of the THUMB position) and a long-press
-// reset gesture.
-//
-// Touch the rail/slider for >= LONG_PRESS_MS without moving more than
-// LONG_PRESS_MOVE_PX and we treat it as a "snap back" gesture: the param
-// is reset to its default. iOS Safari ignores `navigator.vibrate` so the
-// haptic is a no-op there but the long-press still works.
+// landmark crossings (0, 0.5, 1.0 of the THUMB position).
 //
 // We do NOT take over the pointer pipeline — callers keep their own drag
 // handlers. We just attach a few extra listeners to the same element and
 // react to the same events.
 
-const LONG_PRESS_MS = 500;
-const LONG_PRESS_MOVE_PX = 8;
 const HAPTIC_CROSSINGS = [0, 0.5, 1.0] as const;
 const HAPTIC_TOL = 0.04;
 
@@ -44,11 +36,9 @@ interface Options {
    *  the rail. Bypasses any asymmetry between value and thumb position
    *  introduced by the unity-anchored piecewise mapping. */
   mapping: SliderMapping;
-  /** Element to attach long-press detection on. */
-  ref: React.MutableRefObject<HTMLElement | null>;
 }
 
-export function useTactileSlider({ param, mapping, ref }: Options): void {
+export function useTactileSlider({ param, mapping }: Options): void {
   // Track previous fraction so we only fire haptic at the moment a crossing
   // happens, not on every redraw at that position.
   const prevFrac = useRef<number | null>(null);
@@ -83,54 +73,4 @@ export function useTactileSlider({ param, mapping, ref }: Options): void {
     };
     return usePerformanceStore.subscribe(fire);
   }, [param, min, max, unity, reverse]);
-
-  // Long-press to reset.
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let startX = 0;
-    let startY = 0;
-
-    const cancel = () => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-
-    const onDown = (e: PointerEvent) => {
-      startX = e.clientX;
-      startY = e.clientY;
-      cancel();
-      timer = setTimeout(() => {
-        usePerformanceStore.getState().resetSlider(param);
-        // Stronger feedback for the destructive-feeling reset.
-        vibrate(20);
-      }, LONG_PRESS_MS);
-    };
-    const onMove = (e: PointerEvent) => {
-      if (!timer) return;
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      if (dx * dx + dy * dy > LONG_PRESS_MOVE_PX * LONG_PRESS_MOVE_PX) {
-        cancel();
-      }
-    };
-    const onUp = () => {
-      cancel();
-    };
-
-    el.addEventListener("pointerdown", onDown);
-    el.addEventListener("pointermove", onMove);
-    el.addEventListener("pointerup", onUp);
-    el.addEventListener("pointercancel", onUp);
-    return () => {
-      cancel();
-      el.removeEventListener("pointerdown", onDown);
-      el.removeEventListener("pointermove", onMove);
-      el.removeEventListener("pointerup", onUp);
-      el.removeEventListener("pointercancel", onUp);
-    };
-  }, [param, ref]);
 }

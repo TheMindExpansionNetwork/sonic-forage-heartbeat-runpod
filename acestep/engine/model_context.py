@@ -124,7 +124,8 @@ class ModelContext:
         # requires explicit destruction the way TRT contexts do, so the
         # subsequent gc.collect() + empty_cache() drains them.
         for attr in ("model", "vae", "text_encoder",
-                     "text_tokenizer", "silence_latent", "config"):
+                     "text_tokenizer", "silence_latent", "config",
+                     "_pending_decoder"):
             setattr(self, attr, None)
 
     # ------------------------------------------------------------------
@@ -188,10 +189,16 @@ class ModelContext:
         self.model = self._load_dit(dit_path, attn_impl)
         self.config = self.model.config
 
+        self._pending_decoder = None
         if skip_decoder:
             import torch.nn as nn
+            # Stash the real decoder (CPU tensors) so TRTLoRAManager can
+            # source its base weights from memory instead of re-opening
+            # the checkpoint shards (~13s on XL turbo). Released by
+            # apply_trt_backends after the manager captures them.
+            self._pending_decoder = self.model.decoder
             self.model.decoder = nn.Module()
-            logger.info("Decoder weights discarded (TRT engine will be used)")
+            logger.info("Decoder weights stashed for LoRA refit (will release after TRT setup)")
 
         self._place_dit(skip_decoder)
 

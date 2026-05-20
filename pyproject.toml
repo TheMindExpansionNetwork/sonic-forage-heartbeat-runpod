@@ -5,6 +5,12 @@ description = "DEMON: Diffusion Engine for Musical Orchestrated Noise"
 readme = "README.md"
 requires-python = "==3.11.*"
 license = {text = "MIT"}
+authors = [
+    {name = "Ryan Fosdick"}
+]
+maintainers = [
+    {name = "Daydream Live"}
+]
 dependencies = [
     # PyTorch with CUDA 12.8 - pinned to match ComfyUI
     "torch==2.9.1+cu128",
@@ -63,6 +69,9 @@ dependencies = [
     "PyWavelets>=1.5",
     "setuptools<81",  # pytorch_wavelets uses pkg_resources, removed in setuptools 81
     "onnxscript>=0.7.0",
+    # MCP SDK for the realtime motion-graph demo's onboard MCP server,
+    # which exposes every user-facing demo action as an MCP tool.
+    "mcp>=1.0",
 ]
 
 [[tool.uv.index]]

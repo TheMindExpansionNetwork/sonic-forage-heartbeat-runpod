@@ -10,6 +10,7 @@ import { useFixtureSwap } from "@/hooks/useFixtureSwap";
 import { useIdleReset } from "@/hooks/useIdleReset";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
+import { useMcpMirror } from "@/hooks/useMcpMirror";
 import { useMidi } from "@/hooks/useMidi";
 import { useParamSync } from "@/hooks/useParamSync";
 import { usePromptBlendSync } from "@/hooks/usePromptBlendSync";
@@ -30,8 +31,10 @@ import { AdvancedDrawer } from "./AdvancedDrawer";
 import { AudioSourceCrate } from "./AudioSourceCrate";
 import { ConfigModal } from "./ConfigModal";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { DesktopEdgeDrag } from "./DesktopEdgeDrag";
+import { FooterLinks } from "./FooterLinks";
+import { HeroMacros } from "./HeroMacros";
 import { HUDFrame } from "./HUDFrame";
+import { HudHelpReadout } from "./HudHelpReadout";
 import { InstallStage } from "./InstallStage";
 import { LiveIndicator } from "./LiveIndicator";
 import {
@@ -76,6 +79,7 @@ export function PerformanceShell() {
   useStemOverlaySync();
   useRefSourceAcks("timbre");
   useRefSourceAcks("structure");
+  useMcpMirror();
   const config = useConfig();
   useIdleReset(config.reset_seconds);
 
@@ -107,6 +111,14 @@ export function PerformanceShell() {
       {status === "ready" && <AudioSourceCrate />}
       {status === "ready" && <StemOverlayPanel />}
       <RecordButton />
+      {/* Permanent 3-knob row above the drawer handle — performance
+          palette (DENOISE / STRUCTURE / FEEDBACK / SEED). The component
+          handles its own visibility internally; mount it unconditionally
+          and let it decide. */}
+      <HeroMacros />
+      {/* Top-right CTA pair (VST waitlist + Feedback), both Tally
+          in-page modals. Self-positioning chrome — no host wiring. */}
+      <FooterLinks />
 
       <StartOverlay
         onPlay={() => {
@@ -132,15 +144,8 @@ export function PerformanceShell() {
           <MobileLoraBlendStepper />
         </>
       )}
-      {!isMobile && (
-        <>
-          <DesktopEdgeDrag side="top" />
-          <DesktopEdgeDrag side="left" />
-          <DesktopEdgeDrag side="right" />
-        </>
-      )}
-
       <AdvancedDrawer />
+      <HudHelpReadout />
       <ConfigModal />
       <ConfirmDialog />
 

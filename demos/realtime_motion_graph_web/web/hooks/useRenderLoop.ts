@@ -205,7 +205,8 @@ export function useRenderLoop(refs: Refs) {
         lastSampleAt = now;
         const lora = useLoraStore.getState();
         const sample: Record<string, number> = { ...perf.sliderValues };
-        sample.seed = perf.seed;
+        // Seed is a uint32 integer that snaps on randomize / manual edit
+        // — graphing it would just spike to noise. Omitted intentionally.
         for (const id of lora.enabled) {
           const v = lora.strengths[id];
           if (typeof v === "number") sample[`lora_str_${id}`] = v;

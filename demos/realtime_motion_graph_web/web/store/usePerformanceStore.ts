@@ -85,6 +85,15 @@ const tweens = new Map<string, Tween>();
 // keeps the master rAF callback from doing dead work while idle.
 let tweenUnregister: (() => void) | null = null;
 
+// Tween outputs below this snap to 0 (when the target is 0). The
+// cubic ease-out's tail can pass through arbitrarily small positive
+// values in the last few percent of the glide, and the engine's
+// schedule builder used to do `int(steps / denoise)` on whatever it
+// received — a denoise of ~1e-17 lifted from a tween mid-flight made
+// it request a 512-PiB linspace and OOM. Below this floor the slider
+// is effectively zero anyway, so snap it.
+const TWEEN_ZERO_FLOOR = 1e-6;
+
 function tickTweens(now: number): void {
   if (tweens.size === 0) {
     // Defensive: scheduler keeps calling until we unregister, but we
@@ -105,7 +114,11 @@ function tickTweens(now: number): void {
     const k = elapsed / durationMs;
     // Cubic ease-out: snappy start, settles into target.
     const eased = 1 - Math.pow(1 - k, 3);
-    updates[param] = t.start + (target - t.start) * eased;
+    let v = t.start + (target - t.start) * eased;
+    // Snap subnormal-ish positives to 0 when we're tweening down to 0
+    // so the engine never sees a near-zero denoise (see floor comment).
+    if (target === 0 && v > 0 && v < TWEEN_ZERO_FLOOR) v = 0;
+    updates[param] = v;
   }
   if (Object.keys(updates).length > 0) {
     usePerformanceStore.setState((s) => ({
@@ -224,13 +237,13 @@ export function isManualOverrideActive(param: string): boolean {
 
 const DEFAULT_SLIDER_VALUES: Record<string, number> = {
   denoise: 0.7,
-  hint_strength: 1.4,
+  hint_strength: 1.0,
   timbre_strength: 1.0,
   lora_blend: 0.5,
   prompt_blend: 0.4,
   feedback: 0.0,
-  shift: 0.5,
-  ode_noise: 0.0,
+  feedback_depth: 1,
+  shift: 3.0,
   ch_g0: 1.0,
   ch_g1: 1.0,
   ch_g2: 1.0,
@@ -258,6 +271,11 @@ const DEFAULT_SLIDER_VALUES: Record<string, number> = {
 };
 
 interface PerformanceState {
+  /** Per-param defaults used by double-click reset, long-press snap-back,
+   *  and idle reset. Seeded from DEFAULT_SLIDER_VALUES and overwritten by
+   *  applyConfig() so the reset target matches the operator-configured
+   *  startup value, not the hardcoded fallback. */
+  sliderDefaults: Record<string, number>;
   /** What we're actually sending to the engine. When `smooth` is on, this
    *  trails `sliderTargets` along a tween; otherwise it equals it. Read by
    *  param-sync (hooks/useParamSync.ts) and the render loop (the audio-
@@ -276,7 +294,11 @@ interface PerformanceState {
    *  per-key when the demo finishes (tickDropTweens) or the user
    *  touches the slider (setSlider / bumpSlider / setSliderDirect). */
   sliderDisplayOverride: Record<string, number>;
-  /** Random seed in 0..1; "dice" button reroll. */
+  /** Integer seed forwarded straight to torch.manual_seed on the engine.
+   *  Range [0, 0xFFFFFFFF] (uint32). The "dice" button rerolls; the
+   *  value cell is double-click-editable. Previously a 0..1 float that
+   *  pipeline.py multiplied by 1000 — that hidden multiplier capped
+   *  entropy at 1001 values; we send the int as-is now. */
   seed: number;
   /** Two prompts. The A/B blend itself lives in
    *  ``sliderValues["prompt_blend"]`` so it rides the Smooth tween
@@ -334,6 +356,15 @@ interface PerformanceState {
    *  flips it true. Drives the "drag to start" affordance and gates
    *  the side-rail tutorial hints. */
   remixStarted: boolean;
+
+  /** One-shot opt-out for useFixtureSwap's perf.fixture subscription.
+   *  Set true before writing perf.fixture to suppress the next
+   *  user-initiated swap path (loadFixtureAudio → sendSwapSource).
+   *  useMcpMirror sets it when adopting an MCP-driven swap whose audio
+   *  was already swapped server-side, so the front-end only updates its
+   *  display state instead of re-running the swap. Consumed-and-cleared
+   *  by useFixtureSwap. */
+  skipNextFixtureSwap: boolean;
 
   /** DCW (wavelet-domain post-step correction) non-numeric state. The
    * numeric knobs (dcw_scaler, dcw_high_scaler, dcw_mult_blend,
@@ -410,6 +441,7 @@ interface PerformanceState {
   setPaused: (p: boolean) => void;
   togglePause: () => void;
   setRemixStarted: (b: boolean) => void;
+  setSkipNextFixtureSwap: (b: boolean) => void;
   /** Run a visual-only "slide to zero" demo on `param`. Seeds
    *  `sliderDisplayOverride[param] = fromValue` and tweens it down to 0
    *  over `durationMs` using a cubic ease-out, then deletes the key so
@@ -466,7 +498,8 @@ function clampToMeta(param: string, value: number): number {
   // the generic 2.0 fallback.
   const max = meta?.max
     ?? (param.startsWith("lora_str_") ? LORA_SLIDER_MAX : 2.0);
-  return Math.max(0, Math.min(max, value));
+  const min = meta?.min ?? 0;
+  return Math.max(min, Math.min(max, value));
 }
 
 /** Returns a partial state that drops `param` from sliderDisplayOverride
@@ -486,6 +519,7 @@ function clearOverridePatch(
 }
 
 export const usePerformanceStore = create<PerformanceState>((set) => ({
+  sliderDefaults: { ...DEFAULT_SLIDER_VALUES },
   sliderValues: { ...DEFAULT_SLIDER_VALUES },
   sliderTargets: { ...DEFAULT_SLIDER_VALUES },
   sliderDisplayOverride: {},
@@ -506,6 +540,7 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   kiosk: false,
   paused: false,
   remixStarted: false,
+  skipNextFixtureSwap: false,
 
   dcwEnabled: true,
   dcwMode: "double",
@@ -582,8 +617,10 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
     }));
     ensureTween(param);
   },
-  setSeed: (seed) => set({ seed: Math.max(0, Math.min(1, seed)) }),
-  randomizeSeed: () => set({ seed: Math.random() }),
+  setSeed: (seed) =>
+    set({ seed: Math.max(0, Math.min(0xffffffff, Math.floor(seed))) }),
+  randomizeSeed: () =>
+    set({ seed: Math.floor(Math.random() * 0x100000000) }),
   setPromptA: (s) => set({ promptA: s }),
   setPromptB: (s) => set({ promptB: s }),
   setKey: (k) => set({ activeKey: k }),
@@ -620,6 +657,7 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   setPaused: (p) => set({ paused: p }),
   togglePause: () => set((s) => ({ paused: !s.paused })),
   setRemixStarted: (b) => set({ remixStarted: b }),
+  setSkipNextFixtureSwap: (b) => set({ skipNextFixtureSwap: b }),
   animateSliderDisplayFrom: (param, fromValue, durationMs) => {
     // Cancel any in-flight smoothing or prior demo tween for this param.
     cancelTween(param);
@@ -689,16 +727,16 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   resetToDefaults: () => {
     tweens.clear();
     dropTweens.clear();
-    set(() => ({
-      sliderValues: { ...DEFAULT_SLIDER_VALUES },
-      sliderTargets: { ...DEFAULT_SLIDER_VALUES },
+    set((s) => ({
+      sliderValues: { ...s.sliderDefaults },
+      sliderTargets: { ...s.sliderDefaults },
       sliderDisplayOverride: {},
       seed: 0,
       remixStarted: false,
     }));
   },
   resetSlider: (param) => {
-    const def = DEFAULT_SLIDER_VALUES[param];
+    const def = usePerformanceStore.getState().sliderDefaults[param];
     if (typeof def !== "number") return;
     cancelTween(param);
     stampManualTouch(param);

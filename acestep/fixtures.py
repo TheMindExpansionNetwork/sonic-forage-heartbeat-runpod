@@ -23,7 +23,7 @@ Conditioning (encode_text) is intentionally *not* cached: the demo's
 blended-prompt UI typically drifts off any baked tags within seconds,
 and encode_text is cheap enough (~60ms warm) that caching it is not
 worth the complexity. See :func:`fixture_sidecar`. Sidecars are
-produced by ``scripts/precompute_fixture_sidecars.py`` and uploaded
+produced by ``scripts/calibration/precompute_fixture_sidecars.py`` and uploaded
 to the dataset alongside the WAVs.
 """
 
@@ -43,7 +43,7 @@ REPO_ID = "daydreamlive/demon-fixtures"
 REPO_TYPE = "dataset"
 
 # Local staging dir for sidecars that haven't been pushed to HF yet.
-# scripts/precompute_fixture_sidecars.py defaults its --out here, and
+# scripts/calibration/precompute_fixture_sidecars.py defaults its --out here, and
 # fixture_sidecar() checks this first before falling through to the HF
 # dataset. Override via DEMON_FIXTURE_SIDECARS_DIR.
 _DEFAULT_LOCAL_SIDECAR_DIR = Path(__file__).resolve().parents[1] / "out" / "fixture_sidecars"
@@ -170,6 +170,13 @@ class FixtureSidecar:
     diverges from any baked tags within seconds of connecting, and
     encode_text is cheap enough (~60ms warm) that the cache savings
     don't justify the server-authoritative complication.
+
+    Sidecars are NOT checkpoint-specific. The VAE that produces
+    ``latent`` and the semantic tokenizer/detokenizer that produce
+    ``context_latent`` are shared across the ACE-Step v1.5 family
+    (turbo, xl-turbo, ...); only the DiT differs. ``produced_with``
+    records which checkpoint happened to generate the file for
+    provenance, but the loader does not gate on it.
     """
 
     name: str
@@ -185,7 +192,10 @@ class FixtureSidecar:
     samples: int
     sample_rate: int
     channels: int
-    checkpoint: str
+    # Checkpoint the precompute script ran on. Informational only;
+    # legacy ``checkpoint`` field is honored when ``produced_with`` is
+    # missing. Empty string when neither is present.
+    produced_with: str
     latent: torch.Tensor
     context_latent: torch.Tensor
 
@@ -205,40 +215,58 @@ def _resolve_sidecar_file(name: str) -> Optional[Path]:
         return Path(hf_hub_download(repo_id=REPO_ID, filename=name, repo_type=REPO_TYPE))
     except EntryNotFoundError:
         return None
-    except Exception:
+    except Exception as exc:
         # Treat any other download error (network, permissions) the same
         # as a miss so the demo stays usable offline or before sidecars
-        # have been uploaded.
+        # have been uploaded. Log it so an unreachable HF / 401 doesn't
+        # look identical to "no sidecar exists" in production traces.
+        print(f"[fixture_sidecar] HF download failed for {name}: {exc}")
         return None
 
 
-def fixture_sidecar(name: str, *, checkpoint: str) -> Optional[FixtureSidecar]:
+def fixture_sidecar(name: str) -> Optional[FixtureSidecar]:
     """Load the sidecar bundle for ``name`` if available and fresh.
 
     Returns ``None`` (not an exception) on any of:
       - ``name`` not in :data:`KNOWN_FIXTURES`
       - sidecar JSON or safetensors not present in the dataset
       - format_version mismatch
-      - checkpoint mismatch (sidecar tensors are tied to a specific
-        VAE / DiT build)
+
+    Sidecars are NOT gated on the runtime checkpoint: the VAE and the
+    semantic tokenizer/detokenizer that produce the cached tensors are
+    shared across the ACE-Step v1.5 family. The JSON's ``produced_with``
+    (legacy: ``checkpoint``) field is informational only.
+
+    On every miss past ``name in KNOWN_FIXTURES`` we print the reason
+    so the demo's logs make it obvious why the sidecar fast path didn't
+    fire (silent ``None`` returns previously left operators staring at
+    "Detecting BPM + key..." without any clue whether the sidecar files
+    were missing or stale).
     """
     if name not in KNOWN_FIXTURES:
         return None
 
     json_path = _resolve_sidecar_file(f"{name}.sidecar.json")
     if json_path is None:
+        print(f"[fixture_sidecar] {name}: sidecar JSON not found (local dir + HF dataset)")
         return None
     sf_path = _resolve_sidecar_file(f"{name}.sidecar.safetensors")
     if sf_path is None:
+        print(f"[fixture_sidecar] {name}: sidecar safetensors not found (local dir + HF dataset)")
         return None
 
     try:
         meta = json.loads(json_path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        print(f"[fixture_sidecar] {name}: sidecar JSON unreadable ({exc})")
         return None
-    if int(meta.get("format_version", 0)) != SIDECAR_FORMAT_VERSION:
-        return None
-    if str(meta.get("checkpoint", "")) != checkpoint:
+    fv = int(meta.get("format_version", 0))
+    if fv != SIDECAR_FORMAT_VERSION:
+        print(
+            f"[fixture_sidecar] {name}: format_version mismatch "
+            f"(sidecar={fv} vs loader={SIDECAR_FORMAT_VERSION}) — "
+            f"re-run scripts/calibration/precompute_fixture_sidecars.py --force"
+        )
         return None
 
     # Lazy import so the basic fixture path doesn't pull torch on import.
@@ -248,7 +276,8 @@ def fixture_sidecar(name: str, *, checkpoint: str) -> Optional[FixtureSidecar]:
         with safe_open(str(sf_path), framework="pt", device="cpu") as f:
             latent = f.get_tensor("latent")
             context_latent = f.get_tensor("context_latent")
-    except Exception:
+    except Exception as exc:
+        print(f"[fixture_sidecar] {name}: safetensors load failed ({exc})")
         return None
 
     # ``time_signature`` was added after the original sidecar format;
@@ -264,7 +293,7 @@ def fixture_sidecar(name: str, *, checkpoint: str) -> Optional[FixtureSidecar]:
         samples=int(meta["samples"]),
         sample_rate=int(meta["sample_rate"]),
         channels=int(meta["channels"]),
-        checkpoint=str(meta["checkpoint"]),
+        produced_with=str(meta.get("produced_with") or meta.get("checkpoint") or ""),
         latent=latent,
         context_latent=context_latent,
     )

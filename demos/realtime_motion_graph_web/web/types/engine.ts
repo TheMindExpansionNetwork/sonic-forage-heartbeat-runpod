@@ -3,6 +3,11 @@
 export interface SliderMeta {
   /** Maximum value (slider top). */
   max: number;
+  /** Minimum value (slider bottom). Defaults to 0 when omitted. Used
+   *  for sliders whose engine value has a non-zero floor (e.g.
+   *  feedback_depth, where 0 is meaningless — the smallest valid tap is
+   *  1, "blend with the most recent finished latent"). */
+  min?: number;
   /** Arrow-key step. */
   step: number;
   /** Hide from the simple Main tile; live in pro/advanced areas. */
@@ -12,8 +17,8 @@ export interface SliderMeta {
 /** Standard non-LoRA sliders. LoRA sliders (`lora_str_<id>`) get added at
  * runtime when the catalog arrives — they aren't listed here. */
 export const SLIDER_META: Record<string, SliderMeta> = {
-  denoise: { max: 1.0, step: 0.1 },
-  hint_strength: { max: 2.0, step: 0.2 },
+  denoise: { max: 1.0, step: 0.05 },
+  hint_strength: { max: 1.0, step: 0.05 },
   timbre_strength: { max: 1.0, step: 0.05 },
   // 0 = LoRA A only, 1 = LoRA B only, 0.5 = both at half-max. UI-only knob —
   // useEdgeLoraBinding watches this and writes the paired lora_str_<id> values.
@@ -25,9 +30,17 @@ export const SLIDER_META: Record<string, SliderMeta> = {
   // ``set_prompt_blend`` WS message by usePromptBlendSync.
   prompt_blend: { max: 1.0, step: 0.05 },
 
-  feedback: { max: 1.0, step: 0.1, pro: true },
-  shift: { max: 1.0, step: 0.1, pro: true },
-  ode_noise: { max: 0.5, step: 0.05, pro: true },
+  feedback: { max: 1.0, step: 0.05, pro: true },
+  // Delay-tap depth for `feedback`. 1 == blend with the most recent
+  // finished latent (current behavior). N>1 reaches N ticks back, so
+  // feedback can produce echo / ghost effects without needing to crank
+  // the blend coefficient near 1.0 (which is the only way to reach
+  // distant past via the implicit recursion).
+  feedback_depth: { min: 1, max: 8, step: 1, pro: true },
+  // ACE-Step flow shift. Directly the value the diffusion solver receives;
+  // 3.0 is the upstream turbo default, 3.5 our packaged default. Useful
+  // operator range is roughly [1, 6].
+  shift: { min: 1.0, max: 6.0, step: 0.5, pro: true },
   // RCFG guidance scale. Only takes effect when rcfg_mode != "off". The
   // turbo model is CFG-distilled (trained to operate at scale=1 with
   // conditioning baked in); driving guidance past ~10 on turbo tends

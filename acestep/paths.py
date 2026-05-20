@@ -16,16 +16,109 @@ Resolution order for MODELS_DIR:
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 _ENV_MODELS_DIR = "ACESTEP_MODELS_DIR"
 _DEFAULT_MODELS_DIR = os.path.join(os.path.expanduser("~"), ".daydream-scope", "models", "demon")
+_LOCAL_CONFIG_FILENAME = "acestep.local.json"
 
 
 def models_dir() -> Path:
     """Root directory for all ACEStep models and engines."""
     return Path(os.environ.get(_ENV_MODELS_DIR, _DEFAULT_MODELS_DIR))
+
+
+# Module-level memoization for the local config. The file is read once
+# on first access — the engine's LoRA library is registered at boot and
+# can't be hot-swapped after, so a process restart is already required
+# to pick up config edits. ``_LOCAL_CONFIG_UNLOADED`` is a sentinel so
+# we can distinguish "not yet read" from "read and got empty dict".
+_LOCAL_CONFIG_UNLOADED: object = object()
+_local_config_cache: object = _LOCAL_CONFIG_UNLOADED
+
+
+def local_config_path() -> Path:
+    """Path to the operator's local config file (``acestep.local.json``
+    at the project root).
+
+    The file is gitignored so each clone can carry its own local paths
+    without leaking them. See ``acestep.local.example.json`` (committed
+    sibling) for the schema and field documentation.
+    """
+    return project_root() / _LOCAL_CONFIG_FILENAME
+
+
+def load_local_config() -> dict:
+    """Read ``acestep.local.json`` from the project root.
+
+    Memoized on first call; restart the process to pick up edits.
+    Returns ``{}`` on missing file or any read/parse error — a broken
+    local config must never block engine boot. Errors are printed to
+    stdout so a typo doesn't fail silently.
+    """
+    global _local_config_cache
+    if _local_config_cache is not _LOCAL_CONFIG_UNLOADED:
+        return _local_config_cache  # type: ignore[return-value]
+    p = local_config_path()
+    try:
+        loaded = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        _local_config_cache = {}
+        return {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        print(f"[paths] failed to read {p}: {e}; ignoring")
+        _local_config_cache = {}
+        return {}
+    if not isinstance(loaded, dict):
+        print(
+            f"[paths] {p} must be a JSON object, got "
+            f"{type(loaded).__name__}; ignoring"
+        )
+        _local_config_cache = {}
+        return {}
+    _local_config_cache = loaded
+    return loaded
+
+
+def clear_local_config_cache() -> None:
+    """Drop the memoized local config. Tests + manual reloads only."""
+    global _local_config_cache
+    _local_config_cache = _LOCAL_CONFIG_UNLOADED
+
+
+def extra_lora_dirs() -> list[Path]:
+    """Additional LoRA root directories from the local config.
+
+    Reads the ``lora_extra_dirs`` array from ``acestep.local.json``.
+    Relative paths are resolved against the config file's directory
+    (the project root) so an operator can check a config into a
+    sibling repo and still have the paths work. ``~`` is expanded.
+
+    Used by the LoRA discovery path so operators can point at training
+    output directories or alternate libraries for testing without
+    moving files into ``loras_dir()``. Missing dirs are silently
+    skipped at scan time; we don't validate here so a stale path in
+    the config doesn't crash the boot.
+    """
+    cfg = load_local_config()
+    raw = cfg.get("lora_extra_dirs")
+    if not isinstance(raw, list):
+        return []
+    base = local_config_path().parent
+    out: list[Path] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        s = entry.strip()
+        if not s:
+            continue
+        p = Path(os.path.expanduser(s))
+        if not p.is_absolute():
+            p = (base / p).resolve()
+        out.append(p)
+    return out
 
 
 def checkpoints_dir() -> Path:
@@ -60,16 +153,43 @@ def melband_roformer_model_path(
 
 
 def discover_loras(directory: Path | None = None) -> list[Path]:
-    """List ``*.safetensors`` files in ``directory`` (default: ``loras_dir()``).
+    """List ``*.safetensors`` files recursively under ``directory``
+    (default: ``loras_dir()``).
 
-    Returns an empty list if the directory does not exist; callers should
-    treat that as "no library", not as an error. Hidden files
-    (``.gitignore``, etc.) and subdirectories are ignored.
+    Subdirectories are scanned so an operator can group LoRAs by
+    artist / training run / source without flattening into one folder.
+    Returns an empty list if the directory does not exist; callers
+    should treat that as "no library", not as an error. Hidden files
+    (``.gitignore``, etc.) are still skipped via the ``*.safetensors``
+    pattern.
     """
     d = Path(directory) if directory is not None else loras_dir()
     if not d.is_dir():
         return []
-    return sorted(p for p in d.glob("*.safetensors") if p.is_file())
+    return sorted(p for p in d.rglob("*.safetensors") if p.is_file())
+
+
+def discover_all_loras() -> list[Path]:
+    """Scan ``loras_dir()`` plus every directory in ``extra_lora_dirs()``.
+
+    Recursive in each root. Deduplicated by absolute path so a LoRA
+    that lives under both the primary library and an extra dir (e.g.
+    a symlink) is registered once. Order is: primary library first
+    (sorted by path), then each extra dir in env-declaration order
+    (each sorted by path). This makes the catalog deterministic
+    across boots.
+    """
+    roots: list[Path] = [loras_dir(), *extra_lora_dirs()]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for root in roots:
+        for p in discover_loras(root):
+            key = str(p.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    return out
 
 
 def lora_trigger(lora_path: Path | str) -> str:
@@ -124,7 +244,7 @@ def trt_engine_path(engine_name: str) -> Path:
 #
 # Larger profiles reserve more workspace at TRT context-creation time and
 # sit on more VRAM regardless of the actual input — see
-# tests/benchmarks/vram_60s_vs_240s_results.md. Pick the smallest profile
+# scripts/benchmarks/vram_60s_vs_240s_results.md. Pick the smallest profile
 # that fits the audio (see `select_trt_engines` and `available_trt_engines`).
 _TRT_ENGINE_PROFILES: dict[float, dict[str, str]] = {
     60.0: {
@@ -146,14 +266,19 @@ _TRT_ENGINE_PROFILES: dict[float, dict[str, str]] = {
 
 _XL_TURBO_TRT_ENGINE_PROFILES: dict[float, dict[str, str]] = {
     60.0: {
-        "decoder": "decoder_xl-turbo_mixed_refit_b4_60s",
+        "decoder": "decoder_xl-turbo_fp8_refit_b4_60s",
         "vae_encode": "vae_encode_fp16_60s",
         "vae_decode": "vae_decode_fp16_60s",
     },
     120.0: {
-        "decoder": "decoder_xl-turbo_mixed_refit_b4_120s",
+        "decoder": "decoder_xl-turbo_fp8_refit_b4_120s",
         "vae_encode": "vae_encode_fp16_120s",
         "vae_decode": "vae_decode_fp16_120s",
+    },
+    240.0: {
+        "decoder": "decoder_xl-turbo_fp8_refit_b4_240s",
+        "vae_encode": "vae_encode_fp16_240s",
+        "vae_decode": "vae_decode_fp16_240s",
     },
 }
 
@@ -171,6 +296,30 @@ def _checkpoint_name(checkpoint: str | Path | None) -> str:
         return _DEFAULT_TRT_CHECKPOINT
     raw = str(checkpoint).replace("\\", "/").rstrip("/")
     return raw.rsplit("/", 1)[-1] or _DEFAULT_TRT_CHECKPOINT
+
+
+# Maps internal checkpoint identifiers to the model-scale label used by
+# LoRA sidecar metadata (``model.base_model_scale`` — "2B" or "5B").
+# Checkpoints not in this map are scale-unknown; the runtime falls back
+# to "don't filter" so an undocumented checkpoint doesn't accidentally
+# hide every LoRA.
+_CHECKPOINT_SCALES: dict[str, str] = {
+    "acestep-v15-turbo": "2B",
+    "acestep-v15-xl-turbo": "5B",
+}
+
+
+def checkpoint_scale(checkpoint: str | Path | None) -> str | None:
+    """Map a checkpoint identifier to its model-scale label ("2B" / "5B").
+
+    Compares against the LoRA sidecar's ``model.base_model_scale`` so
+    the UI can hide incompatible LoRAs. Returns ``None`` for unknown
+    checkpoints — callers should treat this as "don't filter" rather
+    than "incompatible with everything".
+    """
+    if checkpoint is None:
+        return None
+    return _CHECKPOINT_SCALES.get(_checkpoint_name(checkpoint))
 
 
 def trt_engine_profiles(
@@ -296,13 +445,22 @@ def _trt_build_command(
         parts.append("--decoder-only")
     parts.extend(["--duration", str(duration)])
     if checkpoint == "acestep-v15-xl-turbo" and "decoder" in needs:
+        # XL canonical engines are FP8 W8A8, which requires a per-profile
+        # activation absmax JSON captured against the matching bf16 engine.
+        # The path encodes the duration so the hint matches the storage
+        # layout used by scripts/calibration/collect_activation_absmax.py --output-dir.
+        absmax_json = (
+            f"<MODELS_DIR>/calibration/decoder_xl_fp8/{duration}s/"
+            "activation_absmax.json"
+        )
         parts.extend([
             "--batch-max", "4",
             "--batch-opt", "4",
             "--builder-optimization-level", "5",
             "--workspace-gb", "20",
             "--export-locally",
-            "--decoder-precision", "bf16_mixed",
+            "--decoder-precision", "fp8_mixed",
+            "--activation-absmax-json", absmax_json,
         ])
     return " ".join(parts)
 
@@ -457,7 +615,7 @@ def available_dreamvae_decode_engine(duration_s: float) -> Path | None:
 # Windowed VAE decode (single shared profile across both decoder
 # variants). The profile is small enough that it costs ~1.5 GB of
 # workspace at TRT context-creation time vs ~9 GB for the canonical
-# 240 s engine — see tests/benchmarks/bench_vae_decode_profiles.py.
+# 240 s engine — see scripts/benchmarks/bench_vae_decode_profiles.py.
 #
 # Profile shape (in latent frames at 25 fps):
 #     min = 75   (3 s)

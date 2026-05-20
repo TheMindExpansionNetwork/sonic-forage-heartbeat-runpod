@@ -87,11 +87,18 @@ class LoRAManagerBase(abc.ABC):
     """
 
     def __init__(self) -> None:
-        # Subclasses set _base_weights and _param_dtype before super().__init__.
+        # Subclasses set _base_weights, _param_dtype, and _param_numel
+        # before super().__init__. _param_numel is the element count of
+        # the base weight (orientation-independent) so _compute_deltas
+        # can sanity-check that a LoRA was trained for THIS base model
+        # rather than silently producing wrong-shape deltas (e.g. a 2B
+        # LoRA materialized against an XL engine).
         if not hasattr(self, "_base_weights"):
             self._base_weights: Dict[str, torch.Tensor] = {}
         if not hasattr(self, "_param_dtype"):
             self._param_dtype: Dict[str, torch.dtype] = {}
+        if not hasattr(self, "_param_numel"):
+            self._param_numel: Dict[str, int] = {}
 
         # Library + lifecycle state.  Insertion order is preserved so
         # ``remove_lora(-1)`` can pop the most-recently-registered entry,
@@ -176,15 +183,25 @@ class LoRAManagerBase(abc.ABC):
     def register_library(
         self, directory: Optional[Path] = None,
     ) -> List[str]:
-        """Discover and register every ``*.safetensors`` in ``directory``.
+        """Discover and register every ``*.safetensors`` reachable from
+        the configured LoRA roots.
 
-        Defaults to :func:`acestep.paths.loras_dir`.  Returns the list
-        of registered ids in directory order (sorted by filename).
-        Missing directory returns an empty list.
+        When ``directory`` is supplied, scans only that one root
+        (recursive). When omitted, scans :func:`acestep.paths.loras_dir`
+        plus everything listed in ``ACESTEP_EXTRA_LORA_DIRS`` via
+        :func:`acestep.paths.discover_all_loras`, so operators can
+        point at training output directories without moving files into
+        the primary library.
+
+        Returns the list of registered ids in scan order (primary root
+        first, then each extra dir; each root sorted by filename).
+        Missing directories are silently skipped.
         """
-        from acestep.paths import discover_loras, loras_dir
-        d = directory if directory is not None else loras_dir()
-        files = discover_loras(d)
+        from acestep.paths import discover_all_loras, discover_loras
+        if directory is None:
+            files = discover_all_loras()
+        else:
+            files = discover_loras(directory)
         ids: List[str] = []
         for p in files:
             try:
@@ -193,7 +210,9 @@ class LoRAManagerBase(abc.ABC):
                 logger.warning("Failed to register {}: {}", p, e)
         if files:
             logger.info(
-                "Registered library: {} LoRAs from {}", len(ids), d,
+                "Registered library: {} LoRAs across {} root(s)",
+                len(ids),
+                1 if directory is not None else "all configured",
             )
         return ids
 
@@ -286,6 +305,8 @@ class LoRAManagerBase(abc.ABC):
         deltas: Dict[str, torch.Tensor] = {}
         total_bytes = 0
         skipped = 0
+        shape_mismatch = 0
+        first_mismatch: Optional[tuple] = None
         for param_name, ab in pairs.items():
             if "A" not in ab or "B" not in ab:
                 continue
@@ -298,12 +319,49 @@ class LoRAManagerBase(abc.ABC):
             d = (B @ A).to(dtype=target_dt).to(
                 device=self._delta_storage_device(),
             ).contiguous()
+            # Catch base-model mismatches (e.g. 2B LoRA on XL engine):
+            # element count is invariant under transpose, so a numel
+            # mismatch here is unambiguous. We don't compare full
+            # shape because the engine stores some weights transposed
+            # vs the LoRA's torch [out, in] convention.
+            expected_numel = self._param_numel.get(param_name)
+            if expected_numel is not None and d.numel() != expected_numel:
+                shape_mismatch += 1
+                if first_mismatch is None:
+                    first_mismatch = (
+                        param_name, tuple(d.shape), d.numel(), expected_numel,
+                    )
+                continue
             deltas[param_name] = d
             total_bytes += d.numel() * d.element_size()
         if skipped:
             logger.debug(
                 "_compute_deltas({}): {} params skipped (not in engine)",
                 Path(lora_path).name, skipped,
+            )
+        # If every applicable LoRA tensor mismatches the base, this is a
+        # base-model mismatch — surface a clear error rather than silently
+        # returning empty deltas (which would let enable_lora succeed but
+        # do nothing) or crashing later inside _apply_to_engine's add_.
+        if shape_mismatch and not deltas:
+            assert first_mismatch is not None
+            bad_param, lora_shape, lora_numel, base_numel = first_mismatch
+            raise RuntimeError(
+                f"LoRA {Path(lora_path).name} is incompatible with the "
+                f"loaded base model: {shape_mismatch} tensor(s) have "
+                f"shapes that don't fit any engine weight slot. "
+                f"E.g. {bad_param!r}: LoRA produced shape {lora_shape} "
+                f"(numel={lora_numel}) but the base weight has numel="
+                f"{base_numel}. Common cause: a 2B LoRA was loaded "
+                f"against an XL engine (hidden=2048 vs 4096) or "
+                f"vice-versa. Verify the LoRA's training base checkpoint."
+            )
+        if shape_mismatch:
+            logger.warning(
+                "_compute_deltas({}): {} tensors had shape mismatches "
+                "vs base; {} usable deltas remain. Partial overlap likely "
+                "means the LoRA targets a subset that happens to fit.",
+                Path(lora_path).name, shape_mismatch, len(deltas),
             )
         return deltas, total_bytes
 
@@ -662,9 +720,11 @@ class EagerLoRAManager(LoRAManagerBase):
         # _on_enabled and dropped on _on_disabled.
         self._gpu_deltas: Dict[str, Dict[str, torch.Tensor]] = {}
 
+        self._param_numel: Dict[str, int] = {}
         for name, param in named:
             self._decoder_params[name] = param
             self._param_dtype[name] = param.dtype
+            self._param_numel[name] = param.numel()
 
         logger.info(
             "Eager LoRA manager ready: {} decoder params indexed on {} "

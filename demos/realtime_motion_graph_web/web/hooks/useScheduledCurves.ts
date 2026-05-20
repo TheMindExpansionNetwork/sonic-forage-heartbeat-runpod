@@ -66,7 +66,10 @@ export function useScheduledCurves(): void {
           const max = param.startsWith("lora_str_")
             ? LORA_SLIDER_MAX
             : (SLIDER_META[param]?.max ?? 1.0);
-          const value = yNorm * max;
+          const min = param.startsWith("lora_str_")
+            ? 0
+            : (SLIDER_META[param]?.min ?? 0);
+          const value = min + yNorm * (max - min);
           setSliderDirect(param, value);
           // LoRA strength sliders rendered on the desktop edge rails
           // (DesktopEdgeDrag) read from useLoraStore.strengths — the

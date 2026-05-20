@@ -11,6 +11,7 @@
 
 import * as fzstd from "fzstd";
 
+import { useSessionStore } from "@/store/useSessionStore";
 import {
   SAMPLE_RATE,
   SLICE_FLAG_DELTA,
@@ -92,6 +93,22 @@ export class RemoteBackend extends EventTarget {
   detectedBpm: number | null = null;
   detectedKey: string | null = null;
   detectedTimeSignature: string | null = null;
+  /** Active checkpoint identifier (e.g. "acestep-v15-turbo"). Null when
+   *  the server didn't ship one (older backend, --no-backend mode). */
+  checkpoint: string | null = null;
+  /** Model-scale label for the active checkpoint ("2B" | "5B" | null).
+   *  Used by the LoRA library UI to hide LoRAs whose trained
+   *  ``base_model_scale`` doesn't match. Null = unknown checkpoint;
+   *  the UI treats that as "don't filter". */
+  checkpointScale: string | null = null;
+  /** Current StreamPipeline ring-buffer depth, mirrored from the
+   *  server. Set from the ``ready`` message and from ``depth_applied``
+   *  acks after a successful runtime retune. */
+  pipelineDepth: number | null = null;
+  /** Largest depth the server's loaded backend can serve. TRT decoders
+   *  report their hidden_states batch_max; eager / compile pin to 4.
+   *  Null until ready. */
+  maxPipelineDepth: number | null = null;
 
   private _pending: PendingPayload | null;
   private _pendingSwap: SwapReadyMessage | null = null;
@@ -176,19 +193,29 @@ export class RemoteBackend extends EventTarget {
 
       ws.onopen = () => {
         if (!this._pending) return;
-        // Phase 1: JSON config + binary audio upload.
+        // Phase 1: JSON config, then (unless server-side fixture) the
+        // binary audio upload. For known fixtures the pod loads the
+        // waveform from its own cache, so re-uploading ~20 MB of PCM
+        // here is pure waste (~11 s on the measured cold path). When
+        // `use_server_fixture` is set the server skips its audio recv,
+        // so we must skip the send to match.
         ws.send(JSON.stringify(this._pending.config));
-        const { interleaved, channels } = this._pending;
-        const samples = interleaved.length / channels;
-        const hdr = new ArrayBuffer(8);
-        const dv = new DataView(hdr);
-        dv.setUint32(0, channels, true);
-        dv.setUint32(4, samples, true);
-        const pcm = new Uint8Array(interleaved.buffer);
-        const combined = new Uint8Array(hdr.byteLength + pcm.byteLength);
-        combined.set(new Uint8Array(hdr), 0);
-        combined.set(pcm, hdr.byteLength);
-        ws.send(combined);
+        const useServerFixture =
+          (this._pending.config as { use_server_fixture?: boolean })
+            .use_server_fixture === true;
+        if (!useServerFixture) {
+          const { interleaved, channels } = this._pending;
+          const samples = interleaved.length / channels;
+          const hdr = new ArrayBuffer(8);
+          const dv = new DataView(hdr);
+          dv.setUint32(0, channels, true);
+          dv.setUint32(4, samples, true);
+          const pcm = new Uint8Array(interleaved.buffer);
+          const combined = new Uint8Array(hdr.byteLength + pcm.byteLength);
+          combined.set(new Uint8Array(hdr), 0);
+          combined.set(pcm, hdr.byteLength);
+          ws.send(combined);
+        }
         phase = "ready";
       };
 
@@ -216,6 +243,25 @@ export class RemoteBackend extends EventTarget {
             this.detectedBpm = msg.bpm ?? null;
             this.detectedKey = msg.key ?? null;
             this.detectedTimeSignature = msg.time_signature ?? null;
+            this.checkpoint = msg.checkpoint ?? null;
+            this.checkpointScale = msg.checkpoint_scale ?? null;
+            this.pipelineDepth =
+              typeof msg.pipeline_depth === "number"
+                ? msg.pipeline_depth
+                : null;
+            this.maxPipelineDepth =
+              typeof msg.max_pipeline_depth === "number"
+                ? msg.max_pipeline_depth
+                : null;
+            // Push the scale + depth bounds into the session store so the
+            // LoRA library / engine controls can render without subscribing
+            // to RemoteBackend instance fields.
+            {
+              const s = useSessionStore.getState();
+              s.setCheckpointScale(this.checkpointScale);
+              s.setPipelineDepth(this.pipelineDepth);
+              s.setMaxPipelineDepth(this.maxPipelineDepth);
+            }
             phase = "initial-buffer";
           } catch (e) {
             reject(e);
@@ -301,6 +347,22 @@ export class RemoteBackend extends EventTarget {
             this.dispatchEvent(
               new CustomEvent("params", { detail: msg.params }),
             );
+          } else if (msg.type === "params_echo") {
+            // Echo of raw knob values applied by the MCP control bus;
+            // useMcpMirror writes these into the perf/lora stores so the
+            // browser's UI moves the sliders to match.
+            this.dispatchEvent(
+              new CustomEvent("params_echo", { detail: msg.raw }),
+            );
+          } else if (msg.type === "prompt_blend_echo") {
+            // Same shape as params_echo but for the dedicated prompt-
+            // blend slider, which doesn't ride the generic params
+            // channel. useMcpMirror mirrors this through setSlider so
+            // the Smooth tween eases the value and usePromptBlendSync
+            // ships the tweened sequence back to the server.
+            this.dispatchEvent(
+              new CustomEvent("prompt_blend_echo", { detail: msg.value }),
+            );
           } else if (msg.type === "prompt_applied") {
             this.dispatchEvent(
               new CustomEvent("prompt_applied", { detail: msg.tags }),
@@ -346,6 +408,15 @@ export class RemoteBackend extends EventTarget {
             this.dispatchEvent(
               new CustomEvent("structure_failed", { detail: msg.error }),
             );
+          } else if (msg.type === "depth_applied") {
+            const v = typeof msg.value === "number" ? msg.value : null;
+            if (v !== null) {
+              this.pipelineDepth = v;
+              useSessionStore.getState().setPipelineDepth(v);
+              this.dispatchEvent(
+                new CustomEvent("depth_applied", { detail: v }),
+              );
+            }
           } else {
             this.dispatchEvent(new CustomEvent("json", { detail: msg }));
           }
@@ -512,6 +583,24 @@ export class RemoteBackend extends EventTarget {
       this.ws.send(JSON.stringify({
         type: "set_prompt_blend",
         value: Math.max(0, Math.min(1, value)),
+      }));
+    } catch {}
+  }
+
+  /**
+   * Live pipeline_depth retune. The server stages the value and applies
+   * it on the next runner-thread before_tick rendezvous, then echoes
+   * the (clamped) result back as ``depth_applied``. Shrinking discards
+   * in-flight slots beyond the new depth; growing extends with empty
+   * slots that warm up over the next ``newDepth - oldDepth`` ticks.
+   */
+  sendSetDepth(value: number): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (!Number.isFinite(value)) return;
+    try {
+      this.ws.send(JSON.stringify({
+        type: "set_depth",
+        value: Math.round(value),
       }));
     } catch {}
   }

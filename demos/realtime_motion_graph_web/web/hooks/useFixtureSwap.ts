@@ -61,6 +61,7 @@ export function useFixtureSwap() {
           const detail = (e as CustomEvent<{
             interleaved: Float32Array;
             channels: number;
+            bpm?: number | null;
             key?: string;
             time_signature?: string;
           }>).detail;
@@ -73,18 +74,20 @@ export function useFixtureSwap() {
           if (getConfig().restart_song_on_swap) {
             session.player?.seek(0);
           }
-          // Always update detectedKey / detectedTimeSignature so the
-          // advanced strip's "Detected: …" readout reflects what the
-          // server actually resolved — even when the user overrode it
-          // below.
+          // Always update detectedBpm / detectedKey / detectedTimeSignature
+          // so the advanced strip's "Detected: …" readout reflects what
+          // the server actually resolved — even when the user overrode
+          // it below.
           const perf = usePerformanceStore.getState();
           const rawTs = detail.time_signature;
           const detectedTs = rawTs != null && isTimeSignature(rawTs)
             ? rawTs
             : null;
-          if (detail.key || detectedTs) {
+          const detectedBpm =
+            typeof detail.bpm === "number" ? detail.bpm : perf.detectedBpm;
+          if (detail.bpm != null || detail.key || detectedTs) {
             perf.setDetected(
-              perf.detectedBpm,
+              detectedBpm,
               detail.key ?? perf.detectedKey,
               detectedTs ?? perf.detectedTimeSignature,
             );
@@ -199,6 +202,16 @@ export function useFixtureSwap() {
 
     const unsub = usePerformanceStore.subscribe((s, prev) => {
       if (s.fixture !== prev.fixture && s.fixture) {
+        // One-shot opt-out: useMcpMirror sets this when adopting an
+        // MCP-driven swap whose audio was already swapped server-side.
+        // Skip the load+sendSwapSource round-trip, just record the new
+        // fixture as already-swapped so a later real user pick still
+        // works. Consumed regardless of source.
+        if (s.skipNextFixtureSwap) {
+          usePerformanceStore.getState().setSkipNextFixtureSwap(false);
+          lastSwappedTo.current = s.fixture;
+          return;
+        }
         void run(s.fixture);
       }
     });

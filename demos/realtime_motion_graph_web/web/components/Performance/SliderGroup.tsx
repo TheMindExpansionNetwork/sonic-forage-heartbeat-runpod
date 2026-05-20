@@ -1,7 +1,7 @@
 "use client";
 
 import type { CSSProperties } from "react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useTactileSlider } from "@/hooks/useTactileSlider";
 import { tToValue, valueToT } from "@/lib/sliderMapping";
@@ -80,7 +80,14 @@ export function SliderGroup({
 }: Props) {
   const meta = SLIDER_META[param];
   const effectiveMax = max ?? meta?.max ?? 1.0;
-  const effectiveMin = min ?? 0;
+  const effectiveMin = min ?? meta?.min ?? 0;
+  // Integer-stepped sliders (e.g. feedback_depth) display without
+  // decimals so the readout matches what the engine actually receives
+  // (pipeline.py rounds floats to int for these). Without this, a
+  // mid-tween value reads "3.47" while the engine is using 3.
+  const integerDisplay = (meta?.step ?? 0) >= 1;
+  const formatValue = (v: number) =>
+    integerDisplay ? String(Math.round(v)) : v.toFixed(2);
   // Mapping bundle, passed to lib/sliderMapping helpers (and the
   // tactile-slider hook). When `unity` is set, the rail uses piecewise
   // mapping anchored at the midpoint; otherwise linear from min..max.
@@ -98,14 +105,35 @@ export function SliderGroup({
   const setSlider = usePerformanceStore((s) => s.setSlider);
   const trackRef = useRef<HTMLDivElement | null>(null);
 
-  // Haptics on landmark crossings (0, 0.5, 1.0 of slider position) +
-  // long-press reset. Pass the full mapping so the haptic fires on the
-  // thumb's position, not the engine value — on reverse + unity-anchored
-  // channels those move opposite each other (and at different slopes).
+  // Double-click on the value cell swaps it for a text input. setSlider
+  // already clamps via clampToMeta, so we don't re-clamp here — invalid
+  // values land at the channel's [min, max]. Empty / unparseable inputs
+  // leave the value untouched.
+  const [editing, setEditing] = useState(false);
+  const [editText, setEditText] = useState("");
+  const editingRef = useRef(false);
+  useEffect(() => {
+    editingRef.current = editing;
+  }, [editing]);
+
+  const startEdit = () => {
+    setEditText(formatValue(value));
+    setEditing(true);
+  };
+  const commitEdit = () => {
+    const parsed = parseFloat(editText);
+    if (!Number.isNaN(parsed)) setSlider(param, parsed);
+    setEditing(false);
+  };
+  const cancelEdit = () => setEditing(false);
+
+  // Haptics on landmark crossings (0, 0.5, 1.0 of slider position).
+  // Pass the full mapping so the haptic fires on the thumb's position,
+  // not the engine value — on reverse + unity-anchored channels those
+  // move opposite each other (and at different slopes).
   useTactileSlider({
     param,
     mapping,
-    ref: trackRef,
   });
 
   // Slider thumb fraction t ∈ [0, 1] (0 = bottom, 1 = top). For
@@ -166,9 +194,7 @@ export function SliderGroup({
       const now = performance.now();
       if (now - lastDownAt < DBLCLICK_MS) {
         // Second click within the dblclick window: reset and bail before
-        // any drag state is set. Coexists with the long-press reset on
-        // mobile (useTactileSlider) — operators can use whichever feels
-        // natural.
+        // any drag state is set.
         usePerformanceStore.getState().resetSlider(param);
         lastDownAt = 0;
         return;
@@ -230,6 +256,31 @@ export function SliderGroup({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [param, effectiveMin, effectiveMax, unity, reverse, setSlider]);
 
+  // Mouse wheel over the rail itself (not the label / value / kbd hint)
+  // adjusts the value — 2% of rail per notch, 0.5% with Shift. Bound to
+  // .slider-track so the hitbox matches "literally on the fader".
+  // Non-passive so we can preventDefault and stop the page from scrolling
+  // while the cursor sits on the rail. Scrolling in slider-coordinates
+  // (t, not engine value) keeps the gesture coherent under reverse +
+  // unity mappings — wheel-up moves the thumb up regardless.
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!el) return;
+    const m = { min: effectiveMin, max: effectiveMax, unity, reverse: !!reverse };
+    const onWheel = (e: WheelEvent) => {
+      if (editingRef.current) return;
+      e.preventDefault();
+      const step = e.shiftKey ? 0.005 : 0.01;
+      const dir = -Math.sign(e.deltaY);
+      if (dir === 0) return;
+      const current = usePerformanceStore.getState().sliderTargets[param] ?? 0;
+      const newT = Math.max(0, Math.min(1, valueToT(current, m) + dir * step));
+      setSlider(param, tToValue(newT, m));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [param, effectiveMin, effectiveMax, unity, reverse, setSlider]);
+
   // Tint follows the thumb's position so the color sweep matches the
   // drag, not the value — keeps the gradient coherent for reverse and
   // unity-anchored channels (operator sees teal at the top regardless
@@ -244,20 +295,47 @@ export function SliderGroup({
   const tooltip = tooltipFor(param);
 
   return (
-    <div className="slider-group" data-param={param} style={tintStyle}>
-      <div
-        className="slider-label"
-        {...(tooltip
-          ? { "data-dd-tooltip": tooltip, "data-dd-tooltip-wide": "" }
-          : {})}
-      >
+    <div
+      className="slider-group"
+      data-param={param}
+      style={tintStyle}
+      data-dd-tooltip-title={label}
+      {...(tooltip
+        ? { "data-dd-tooltip": tooltip, "data-dd-tooltip-wide": "" }
+        : {})}
+    >
+      <div className="slider-label">
         {label}
       </div>
       <div className="slider-track" ref={trackRef}>
         <div className="slider-fill" style={{ height: `${pct}%` }} />
         <div className="slider-thumb" style={{ bottom: `${pct}%` }} />
       </div>
-      <div className="slider-value">{value.toFixed(2)}</div>
+      {editing ? (
+        <input
+          className="slider-value slider-value-edit"
+          type="text"
+          inputMode="decimal"
+          autoFocus
+          value={editText}
+          onChange={(e) => setEditText(e.target.value)}
+          onFocus={(e) => e.currentTarget.select()}
+          onBlur={commitEdit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              e.currentTarget.blur();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              cancelEdit();
+            }
+          }}
+        />
+      ) : (
+        <div className="slider-value" onDoubleClick={startEdit}>
+          {formatValue(value)}
+        </div>
+      )}
       {kbd && <kbd className="desktop-only">{kbd}</kbd>}
     </div>
   );
