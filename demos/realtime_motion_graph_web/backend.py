@@ -195,6 +195,43 @@ def _send_stem_payload(
         ws.send(arr.tobytes())
 
 
+def _extract_and_select_upload_stem(
+    waveform: torch.Tensor,
+    *,
+    session: Session,
+    source: PreparedSource,
+    source_mode: str | None,
+    log_context: str = "",
+) -> tuple[dict[str, torch.Tensor] | None, str | None, PreparedSource, torch.Tensor]:
+    if source_mode is None:
+        return None, None, source, waveform
+
+    log_prefix = f"{log_context}: " if log_context else ""
+    rip_verb = "ripping" if log_context else "Ripping"
+    prepare_verb = "preparing" if log_context else "Preparing"
+    print(
+        f"[Server] {log_prefix}{rip_verb} upload stems via Mel-Band RoFormer "
+        f"(source_mode={source_mode})..."
+    )
+    try:
+        upload_stems = extract_upload_stems(
+            waveform=waveform,
+            device=session.handler.device,
+            backend_sample_rate=SAMPLE_RATE,
+        )
+        if source_mode == "full":
+            return upload_stems, None, source, waveform
+
+        selected_wf = upload_stems[source_mode]
+        selected_audio = Audio(waveform=selected_wf, sample_rate=SAMPLE_RATE)
+        print(f"[Server] {log_prefix}{prepare_verb} {source_mode} stem as source...")
+        selected_source = session.prepare_source(selected_audio)
+        return upload_stems, None, selected_source, selected_wf
+    except Exception as exc:
+        print(f"[Server] {log_prefix}stem extraction failed: {exc}")
+        return None, str(exc), source, waveform
+
+
 def _resolve_bpm_key_source(
     session: Session,
     *,
@@ -743,40 +780,23 @@ def handle_client(
     )
     upload_stems: dict[str, torch.Tensor] | None = None
     stem_error: str | None = None
-    if stem_source_mode is not None:
-        print(
-            f"[Server] Ripping upload stems via Mel-Band RoFormer "
-            f"(source_mode={stem_source_mode})..."
-        )
+    upload_stems, stem_error, source, waveform = _extract_and_select_upload_stem(
+        waveform,
+        session=session,
+        source=source,
+        source_mode=stem_source_mode,
+    )
+    if stem_error is not None and stem_source_mode != "full":
         try:
-            upload_stems = extract_upload_stems(
-                waveform=waveform,
-                device=session.handler.device,
-                backend_sample_rate=SAMPLE_RATE,
-            )
-            if stem_source_mode != "full":
-                selected_wf = upload_stems[stem_source_mode]
-                print(f"[Server] Preparing {stem_source_mode} stem as source...")
-                selected_audio = Audio(
-                    waveform=selected_wf, sample_rate=SAMPLE_RATE,
-                )
-                source = session.prepare_source(selected_audio)
-                waveform = selected_wf
-                audio_in = selected_audio
-        except Exception as exc:
-            stem_error = str(exc)
-            print(f"[Server] stem extraction failed: {exc}")
-            if stem_source_mode != "full":
-                try:
-                    ws.send(json.dumps({
-                        "type": "error",
-                        "code": "stem_extract_failed",
-                        "message": f"Stem extraction failed: {exc}",
-                    }))
-                except Exception:
-                    pass
-                ws.close(1011, "stem extraction failed")
-                return
+            ws.send(json.dumps({
+                "type": "error",
+                "code": "stem_extract_failed",
+                "message": f"Stem extraction failed: {stem_error}",
+            }))
+        except Exception:
+            pass
+        ws.close(1011, "stem extraction failed")
+        return
 
     _ms("resolve_source_done")
 
@@ -1883,37 +1903,22 @@ def handle_client(
             )
             new_upload_stems: dict[str, torch.Tensor] | None = None
             new_stem_error: str | None = None
-            if new_stem_source_mode is not None:
-                print(
-                    f"[Server] swap: ripping upload stems via Mel-Band RoFormer "
-                    f"(source_mode={new_stem_source_mode})..."
+            new_upload_stems, new_stem_error, new_source, new_wf = (
+                _extract_and_select_upload_stem(
+                    new_wf,
+                    session=session,
+                    source=new_source,
+                    source_mode=new_stem_source_mode,
+                    log_context="swap",
                 )
-                try:
-                    new_upload_stems = extract_upload_stems(
-                        waveform=new_wf,
-                        device=session.handler.device,
-                        backend_sample_rate=SAMPLE_RATE,
-                    )
-                    if new_stem_source_mode != "full":
-                        new_wf = new_upload_stems[new_stem_source_mode]
-                        new_audio_in = Audio(
-                            waveform=new_wf, sample_rate=SAMPLE_RATE,
-                        )
-                        print(
-                            f"[Server] swap: preparing "
-                            f"{new_stem_source_mode} stem as source..."
-                        )
-                        new_source = session.prepare_source(new_audio_in)
-                except Exception as exc:
-                    new_stem_error = str(exc)
-                    print(f"[Server] swap: stem extraction failed: {exc}")
-                    if new_stem_source_mode != "full":
-                        with send_lock:
-                            ws.send(json.dumps({
-                                "type": "swap_failed",
-                                "error": f"Stem extraction failed: {exc}",
-                            }))
-                        return
+            )
+            if new_stem_error is not None and new_stem_source_mode != "full":
+                with send_lock:
+                    ws.send(json.dumps({
+                        "type": "swap_failed",
+                        "error": f"Stem extraction failed: {new_stem_error}",
+                    }))
+                return
             # Use the active timbre reference if one is uploaded; otherwise
             # the new playback source's own latent. Override persists
             # across source swaps.
