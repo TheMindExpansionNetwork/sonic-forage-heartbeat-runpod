@@ -32,6 +32,7 @@ import { ConfigModal } from "./ConfigModal";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { FooterLinks } from "./FooterLinks";
 import { HeroMacros } from "./HeroMacros";
+import { HeroMacrosTooltip } from "./HeroMacrosTooltip";
 import { HUDFrame } from "./HUDFrame";
 import { HudHelpReadout } from "./HudHelpReadout";
 import { InstallStage } from "./InstallStage";
@@ -140,6 +141,7 @@ export function PerformanceShell() {
       )}
       <AdvancedDrawer />
       <HudHelpReadout />
+      <HeroMacrosTooltip />
       <ConfigModal />
       <ConfirmDialog />
 

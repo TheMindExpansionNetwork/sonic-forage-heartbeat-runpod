@@ -2684,6 +2684,22 @@ body.drawer-open .hud-help-readout {
   color: var(--text);
   line-height: 1;
 }
+/* Keyboard-shortcut hint under the value, matching the .knob-kbd
+   vocabulary used by the bay's knob row. Honored by the same
+   `.mixer-rack--no-kbd-hints kbd` toggle as the in-drawer hints
+   (live globally — when the operator opts out of kbd hints, the
+   bay's faders hide theirs too). */
+.hero-style-fader-kbd {
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  line-height: 1;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+.mixer-rack--no-kbd-hints .hero-style-fader-kbd { display: none; }
 .hero-style-fader--empty { opacity: 0.35; }
 .hero-style-fader--empty .hero-style-fader-track { cursor: default; }
 
@@ -6080,6 +6096,57 @@ body.curve-open #install-video-area #graph {
   text-transform: none;
   letter-spacing: 0.04em;
   font-size: 10px;
+}
+/* Hero-bay controls render their wide tooltip via the React
+   `<HeroMacrosTooltip/>` component (title-then-body chip, matching
+   DrawerHelpBar / HudHelpReadout). Suppress the CSS `::after` pseudo
+   inside `.hero-macros` so it doesn't double-show with the React
+   tooltip. The compact non-wide variant (e.g. SeedKnob's
+   "Randomize seed (right-click to MIDI-learn)") still uses the
+   pseudo since it doesn't need the two-line format. */
+.hero-macros [data-dd-tooltip][data-dd-tooltip-wide]::after {
+  display: none !important;
+}
+
+/* React-rendered hero-bay tooltip — mirrors the chip used by
+   DrawerHelpBar / HudHelpReadout so the visual vocabulary stays
+   consistent across the three surfaces. Position is set inline by the
+   component (fixed top/left, transformed so the bottom-center anchors
+   above the hovered control). */
+.hero-macros-tooltip {
+  position: fixed;
+  z-index: 100;
+  pointer-events: none;
+  max-width: 320px;
+  padding: 8px 12px 10px;
+  /* Plain dark sheet, same vocabulary as the DrawerHelpBar — no
+     brand-gradient hairline, no orange glow. The accent color shows
+     up only on the title text inside. */
+  background: rgba(8, 8, 14, 0.92);
+  border: 1px solid var(--frame-line);
+  border-radius: var(--radius-md);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+.hero-macros-tooltip-title {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: var(--tracking-bar);
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 4px;
+}
+.hero-macros-tooltip-text {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-strong);
+  margin: 0;
+}
+@media (pointer: coarse) {
+  /* Hover doesn't exist on touch — the React component itself only
+     fires on pointer move, but defensively hide if it somehow renders. */
+  .hero-macros-tooltip { display: none !important; }
 }
 [data-dd-tooltip]:hover::after,
 [data-dd-tooltip]:focus-visible::after {
