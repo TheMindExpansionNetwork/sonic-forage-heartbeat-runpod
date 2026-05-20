@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import threading
 import time
@@ -61,18 +62,23 @@ def extract_upload_stems(
     sending overlays or preparing a selected stem as the inference source.
     """
     torch_device = _coerce_device(device)
-    model = _get_model(torch_device)
-
     t0 = time.time()
     with _INFER_LOCK:
-        vocals_44k, instruments_44k = separate_stems(
-            model,
-            waveform.detach().cpu().float().unsqueeze(0),
-            backend_sample_rate,
-            torch_device,
-        )
-    if torch_device.type == "cuda":
-        torch.cuda.synchronize(torch_device)
+        model = _get_model(torch_device)
+        try:
+            vocals_44k, instruments_44k = separate_stems(
+                model,
+                waveform.detach().cpu().float().unsqueeze(0),
+                backend_sample_rate,
+                torch_device,
+            )
+            if torch_device.type == "cuda":
+                torch.cuda.synchronize(torch_device)
+        finally:
+            evicted = _evict_model_from_cache(torch_device)
+            model = None
+            if evicted:
+                _collect_device_cache(torch_device)
     print(f"[Server] Mel-Band RoFormer stems complete in {time.time() - t0:.1f}s")
 
     vocals = _fit_stem_waveform(
@@ -125,8 +131,7 @@ def _resolve_model_path() -> Path:
 
 
 def _get_model(device: torch.device) -> MelBandRoformer:
-    model_path = _resolve_model_path()
-    key = (str(model_path), str(device))
+    model_path, key = _model_cache_key(device)
     with _MODEL_LOCK:
         cached = _MODEL_CACHE.get(key)
         if cached is not None:
@@ -138,6 +143,30 @@ def _get_model(device: torch.device) -> MelBandRoformer:
         _MODEL_CACHE[key] = model
         print(f"[Server] Mel-Band RoFormer loaded in {time.time() - t0:.1f}s")
         return model
+
+
+def _model_cache_key(device: torch.device) -> tuple[Path, tuple[str, str]]:
+    model_path = _resolve_model_path()
+    return model_path, (str(model_path), str(device))
+
+
+def _evict_model_from_cache(device: torch.device) -> bool:
+    """Drop the temporary RoFormer so ACE-Step gets its VRAM back immediately."""
+    _, key = _model_cache_key(device)
+    with _MODEL_LOCK:
+        model = _MODEL_CACHE.pop(key, None)
+    if model is None:
+        return False
+
+    print(f"[Server] Releasing Mel-Band RoFormer model from {device}...")
+    del model
+    return True
+
+
+def _collect_device_cache(device: torch.device) -> None:
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _resample_stem_to_backend_rate(
