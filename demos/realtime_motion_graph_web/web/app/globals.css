@@ -2201,28 +2201,29 @@ body.drawer-open {
    drawer is open since the drawer's own help bar takes over there. */
 .hud-help-readout {
   position: fixed;
-  top: max(calc(var(--hud-thickness) + 18px), env(safe-area-inset-top, 0px));
+  /* Sits in the header band — aligned with the halo badge — so the
+     readout floats ABOVE the waveform scrub strip
+     (top: hud-thickness + 24px) instead of landing on top of it. */
+  top: max(
+    calc(var(--hud-thickness) / 2 - 10px + var(--top-bias, 5px)),
+    env(safe-area-inset-top, 0px)
+  );
   left: 50%;
   transform: translateX(-50%);
   z-index: 25;
   pointer-events: none;
   max-width: min(540px, 70vw);
-  padding: 7px 14px 8px;
-  background: rgba(6, 6, 12, 0.78);
+  padding: 5px 13px 6px;
+  /* Quiet chip — light translucent fill + blur, no gradient border or
+     drop-shadow (those read as "too much" against the header chrome). */
+  background: rgba(10, 10, 16, 0.6);
   border: 1px solid var(--frame-line);
-  border-top: 2px solid transparent;
-  background-image:
-    linear-gradient(rgba(6, 6, 12, 0.78), rgba(6, 6, 12, 0.78)),
-    var(--dd-gradient);
-  background-origin: padding-box, border-box;
-  background-clip: padding-box, border-box;
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
-  -webkit-backdrop-filter: blur(6px);
-  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(8px);
+          backdrop-filter: blur(8px);
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
 }
 body.drawer-open .hud-help-readout {
   display: none;
@@ -3546,11 +3547,37 @@ body.curve-open #install-video-area #graph {
    this before sweeping the faders". Recessed background so it reads as
    advisory rather than a primary control surface. */
 .voice-tile-warning {
+  position: relative;
   margin: 0 0 6px;
-  padding: 6px 8px 7px;
+  padding: 6px 22px 7px 8px;
   border: 1px solid var(--accent-line);
   border-radius: var(--radius-sm);
   background: rgba(255, 184, 60, 0.04);
+}
+/* Dismiss the experimental-feature notice — the dismissal is persisted
+   to localStorage by VoiceTile. */
+.voice-tile-warning-close {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 100ms ease, background 100ms ease;
+}
+.voice-tile-warning-close:hover {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.06);
 }
 .voice-tile-warning-title {
   font-family: var(--font-mono);
@@ -5888,12 +5915,21 @@ body.curve-open #install-video-area #graph {
    placard carries the brand gradient strip + radii). */
 .audio-source-dock {
   position: fixed;
-  /* "Now playing" placard + upload pair sits in the lower-right corner.
-     Right-anchored; the Full Controls panel is on the LEFT now so this
-     dock does NOT need to slide inward when the panel opens. */
-  bottom: max(calc(var(--hud-thickness) + 24px), env(safe-area-inset-bottom, 0px));
+  /* Mirrors the halo badge across the horizontal midline: the same
+     right inset as the badge, and a bottom margin equal to the badge's
+     TOP margin — so the now-playing dock and the hamburger read as a
+     symmetric pair with matching page margins. .save-pill mirrors this
+     in the lower-left. */
+  bottom: max(
+    calc(var(--hud-thickness) / 2 - 10px + var(--top-bias, 5px)),
+    env(safe-area-inset-bottom, 0px)
+  );
   right: max(calc(var(--hud-thickness) + 24px), env(safe-area-inset-right, 0px));
   z-index: 8;
+  /* Only the interactive children — the body when expanded, the bubble
+     when collapsed — catch input; the dock's own footprint stays
+     click-through (see .audio-source-dock-body / .audio-source-bubble). */
+  pointer-events: none;
   display: flex;
   flex-direction: row;
   align-items: stretch;
@@ -5921,6 +5957,90 @@ body.curve-open #install-video-area #graph {
 .audio-source-dock:has(.audio-source-upload-btn:active),
 .audio-source-dock:has(.audio-source-mic-btn:active) {
   transform: translateY(0);
+}
+
+/* ── Auto-collapse to a play bubble ──────────────────────────────────
+   AudioSourceCrate sets [data-collapsed] on the dock 2s after the
+   pointer leaves. The body (placard + upload + mic) cross-fades + folds
+   toward the corner as the bubble pops in; hovering the bubble (which
+   bubbles the dock's onMouseEnter) clears the flag and expands again. */
+.audio-source-dock-body {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 0;
+  pointer-events: auto;
+  transform-origin: bottom right;
+  transition:
+    opacity 0.2s ease,
+    transform 0.26s cubic-bezier(.2, .8, .2, 1);
+}
+.audio-source-dock[data-collapsed] .audio-source-dock-body {
+  opacity: 0;
+  transform: scale(0.86) translateX(16px);
+  pointer-events: none;
+}
+.audio-source-bubble {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 46px;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  /* Let the writhing ribbon ring bleed outside the circle. */
+  overflow: visible;
+  /* Hidden while the dock is expanded. */
+  opacity: 0;
+  transform: scale(0.5);
+  transition:
+    opacity 0.2s ease,
+    transform 0.26s cubic-bezier(.2, .8, .2, 1),
+    filter 0.18s ease;
+}
+/* Dark inner disc — the writhing ribbon canvas is the visible border,
+   exactly like .halo-badge::before + .halo-badge .halo-ribbons. */
+.audio-source-bubble::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: rgba(6, 6, 12, 0.66);
+  -webkit-backdrop-filter: blur(6px);
+          backdrop-filter: blur(6px);
+  z-index: 0;
+}
+.audio-source-bubble .halo-ribbons {
+  position: absolute;
+  inset: -3px;
+  width: calc(100% + 6px);
+  height: calc(100% + 6px);
+  pointer-events: none;
+  overflow: visible;
+  z-index: 1;
+  filter: drop-shadow(
+    0 0 calc(1px + var(--bloom-amount, 0) * 8px) rgba(255, 255, 255, 0.55)
+  );
+}
+.audio-source-bubble svg {
+  position: relative;
+  z-index: 2;
+}
+.audio-source-bubble:hover {
+  filter: brightness(1.1) saturate(1.08);
+}
+.audio-source-dock[data-collapsed] .audio-source-bubble {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
 }
 .audio-source-crate {
   position: relative; /* positioning context for the brand gradient ::before */
@@ -6542,18 +6662,6 @@ body.curve-open #install-video-area #graph {
     network-indicator-fade-in 200ms cubic-bezier(.2, .8, .2, 1) forwards,
     start-whisper-breathe 2.6s ease-in-out infinite 200ms;
   transition: bottom 240ms cubic-bezier(.2, .8, .2, 1);
-}
-/* Curve scheduler overlay docks its tab strip + close button against
-   the bottom of the viewport (≈48–56px tall). When that overlay is
-   open, hoist the pill above the tabs so it doesn't sit on top of the
-   curve tabs or the preset menus that grow upward from them. */
-.network-indicator[data-curves-open="true"] {
-  bottom: calc(
-    var(--drawer-handle-h, 28px) +
-    env(safe-area-inset-bottom, 0px) +
-    var(--curves-tab-strip-h, 64px) +
-    12px
-  );
 }
 .network-indicator__bars rect {
   fill: currentColor;
@@ -7215,7 +7323,7 @@ body.curve-open #install-video-area #graph {
 }
 .almost-ready-modal {
   position: relative;
-  width: min(440px, 100%);
+  width: min(540px, 100%);
   max-height: min(80vh, 640px);
   background: var(--sheet-bg);
   border: 1px solid var(--frame-line);
@@ -7271,52 +7379,128 @@ body.curve-open #install-video-area #graph {
   font-size: 0.92em;
   line-height: 1.45;
 }
-.almost-ready-key-section {
+/* Step indicator — two bars; the active step's bar is accent-filled. */
+.almost-ready-steps {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 4px 0 0;
-  padding: 0;
-  border: none;
+  gap: 6px;
+  margin: 10px 0 0;
 }
-.almost-ready-key-legend {
-  font-family: var(--font-mono);
-  font-size: 0.7em;
+.almost-ready-step-dot {
+  width: 24px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--frame-line);
+  transition: background 160ms ease;
+}
+.almost-ready-step-dot.is-active { background: var(--accent); }
+.almost-ready-step-head {
+  margin: 14px 0 10px;
+}
+.almost-ready-step-num {
+  display: block;
+  font-size: 0.82em;
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   color: var(--text-dim);
-  padding: 0 0 4px;
 }
-.almost-ready-key-mode {
+.almost-ready-step-title {
+  margin: 3px 0 0;
+  font-size: 1.18em;
+  font-weight: 500;
+  color: var(--text-strong);
+  letter-spacing: 0.02em;
+}
+
+/* Step 1 — selectable source cards (one per inference source). */
+.almost-ready-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.almost-ready-card {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 8px 10px;
+  gap: 11px;
+  width: 100%;
+  text-align: left;
+  padding: 12px 13px;
+  background: rgba(255, 255, 255, 0.02);
   border: 1px solid var(--frame-line);
   border-radius: var(--radius-sm);
   cursor: pointer;
-  transition: border-color 120ms, background 120ms;
+  font-family: inherit;
+  transition: border-color 130ms ease, background 130ms ease;
 }
-.almost-ready-key-mode:hover { border-color: var(--accent); }
-.almost-ready-key-mode input[type="radio"] {
-  margin-top: 2px;
-  cursor: pointer;
+.almost-ready-card:hover { border-color: var(--accent-line); }
+.almost-ready-card.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
-.almost-ready-key-mode strong {
-  display: block;
+.almost-ready-card-radio {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  border-radius: 50%;
+  border: 1.5px solid var(--frame-line);
+  transition: border-color 130ms ease, background 130ms ease;
+}
+.almost-ready-card:hover .almost-ready-card-radio {
+  border-color: var(--accent-line);
+}
+.almost-ready-card.is-selected .almost-ready-card-radio {
+  border-color: var(--accent);
+  background: radial-gradient(circle, var(--accent) 0 4px, transparent 5px);
+}
+.almost-ready-card-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.almost-ready-card-title {
   color: var(--text-strong);
   font-weight: 500;
-  margin-bottom: 2px;
 }
-.almost-ready-key-mode-hint {
-  display: block;
+.almost-ready-card.is-selected .almost-ready-card-title {
+  color: var(--accent);
+}
+.almost-ready-card-hint {
   color: var(--text-dim);
   font-size: 0.92em;
-  line-height: 1.35;
+  line-height: 1.4;
 }
-.almost-ready-key-select {
-  margin-left: 28px;
-  width: calc(100% - 28px);
+
+/* Step 2 — key / time-signature fields. */
+.almost-ready-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 14px;
+}
+.almost-ready-field:last-child { margin-bottom: 0; }
+.almost-ready-field-label {
+  font-size: 0.82em;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.almost-ready-select {
+  width: 100%;
+}
+.almost-ready-field-hint {
+  color: var(--text-dim);
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+
+/* Condensed disclaimer footnote on step 1. */
+.almost-ready-note {
+  margin: 14px 0 0;
+  color: var(--text-dim);
+  font-size: 0.86em;
+  line-height: 1.4;
+  opacity: 0.85;
 }
 .almost-ready-footer {
   display: flex;
@@ -7351,6 +7535,15 @@ body.curve-open #install-video-area #graph {
   color: var(--text);
   border-color: var(--text-dim);
 }
+/* Ghost button ("Pick another") — borderless, pushed to the far left
+   of the footer via margin-right:auto. */
+.almost-ready-btn--ghost {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+.almost-ready-btn--ghost:hover { color: var(--text); }
 
 /* ─────────────────────────────────────────────────────────────────────
    ConfirmDialog — generic yes/no replacement for window.confirm().
@@ -7456,21 +7649,6 @@ body.curve-open #install-video-area #graph {
   border-color: var(--text-dim);
 }
 
-/* AlmostReadyDialog disclaimer paragraph: subdued, smaller, italic so it
-   reads as advisory copy rather than primary content. Sits below the
-   key fieldset. */
-.almost-ready-disclaimer {
-  margin: 12px 0 0;
-  padding: 8px 10px;
-  border: 1px dashed var(--frame-line);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 0.85em;
-  line-height: 1.45;
-  font-style: italic;
-}
-
 /* Reference picker (timbre / structure) — sits under the strength
    sliders in MainTile. Compact one-row affordance: caption + custom
    dropdown with "Input Track" and "Upload…" pinned, then the user's
@@ -7516,6 +7694,7 @@ body.curve-open #install-video-area #graph {
   flex: 1 1 0;
   min-width: 0;
   display: flex;
+  gap: 5px;
 }
 .ref-control-button {
   flex: 1 1 0;
@@ -7569,6 +7748,35 @@ body.curve-open #install-video-area #graph {
   border-color: var(--text-dim);
 }
 .ref-control-button:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+/* Sibling upload button — same outlined vocabulary as the dropdown
+   button, sized to a compact icon square. (Was an unstyled default
+   <button>.) */
+.ref-control-upload {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  background: transparent;
+  border: 1px solid var(--frame-line);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  transition: color 80ms linear, border-color 80ms linear;
+}
+.ref-control-upload:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.ref-control-upload:focus-visible {
+  outline: none;
+  border-color: var(--text-dim);
+}
+.ref-control-upload:disabled {
   opacity: 0.5;
   cursor: progress;
 }
@@ -7853,7 +8061,13 @@ body.curve-open #install-video-area #graph {
    whole pill in the dirty state) to fire useSavedSessions.save(). */
 .save-pill {
   position: fixed;
-  bottom: max(calc(var(--hud-thickness) + 24px), env(safe-area-inset-bottom, 0px));
+  /* Lower-left mirror of .audio-source-dock — identical insets, so the
+     save pill and the now-playing dock balance the bottom corners the
+     way the wordmark and the hamburger balance the top. */
+  bottom: max(
+    calc(var(--hud-thickness) / 2 - 10px + var(--top-bias, 5px)),
+    env(safe-area-inset-bottom, 0px)
+  );
   left: max(calc(var(--hud-thickness) + 24px), env(safe-area-inset-left, 0px));
   display: inline-flex;
   align-items: center;
