@@ -113,7 +113,7 @@ function buildConfig(
   // headroom is what unlocks longer audio uploads (cap lives in
   // loadFixture.ts; depth=4 makes future bumps VRAM-safe).
   const custom = useCustomTracksStore.getState();
-  const sourceMode = custom.resolveSourceMode(fixtureName);
+  const sourceMode = custom.resolveBackendSourceMode(fixtureName);
   // Optional opaque per-browser identifier from the host (the demo's
   // standalone shell wires no getter, so this is null and the field is
   // omitted; demon-public-demo wires PostHog's distinct_id).
@@ -398,7 +398,7 @@ export function useStartSession() {
     if (sessionFixture.fixtureName) {
       const sourceMode = useCustomTracksStore
         .getState()
-        .resolveSourceMode(sessionFixture.fixtureName);
+        .resolveBackendSourceMode(sessionFixture.fixtureName);
       if (sourceMode) {
         useCustomTracksStore
           .getState()
