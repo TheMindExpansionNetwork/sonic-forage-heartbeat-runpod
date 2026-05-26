@@ -262,15 +262,18 @@ async function hydrateCustomTracks(
       metadata.sourceMode !== "full" && stems
         ? stems[metadata.sourceMode]
         : source;
+    const hasSavedStemAssets = Boolean(stems);
+    const skipStemExtraction =
+      metadata.sourceMode !== "full" || hasSavedStemAssets;
     hydrated.push({
       metadata,
       decoded,
       ...(originalFile ? { originalFile } : {}),
       ...(stems ? { stems } : {}),
-      // This is the important restore invariant: saved sessions already
-      // have the selected PCM, so sending stem_source_mode would re-run
-      // MelFormer and can blow VRAM.
-      skipStemExtraction: true,
+      // Avoid re-running MelFormer when saved stems already exist or the
+      // selected inference PCM came from a saved stem. Legacy/full saves
+      // without cached stems are allowed to re-rip on play for overlays.
+      ...(skipStemExtraction ? { skipStemExtraction } : {}),
     });
   }
 
@@ -329,7 +332,7 @@ export async function applySessionSnapshot(
   opts.onProgress?.("restoring-stems");
   if (
     snapshot.customTracks.some(
-      (track) => track.name === snapshot.fixture && track.sourceMode !== "full",
+      (track) => track.name === snapshot.fixture && track.stemAssetIds,
     )
   ) {
     flashSessionStatus("Restored saved stem audio.");

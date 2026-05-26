@@ -247,11 +247,13 @@ export function HeroMacros() {
   const curveOpen = useCurveStore((s) => s.overlayOpen);
   const toggleCurve = useCurveStore((s) => s.toggleOverlay);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  // Stem section is only visible when the active track was uploaded
-  // with a non-"full" sourceMode — i.e. the user opted into stem
-  // separation. For "full" mode the backend produces no stems, so
-  // the faders would never become live.
+  // Stem section is visible for custom uploads. The backend auto-rips
+  // uploaded tracks even when inference uses the full mix, so full-track
+  // saves should still expose realtime stem layers after restore.
   const fixture = usePerformanceStore((s) => s.fixture);
+  const hasCustomTrack = useCustomTracksStore((s) =>
+    fixture ? s.tracks.has(fixture) : false,
+  );
   const sourceMode = useCustomTracksStore((s) =>
     fixture ? s.tracks.get(fixture)?.sourceMode : undefined,
   );
@@ -264,7 +266,7 @@ export function HeroMacros() {
   const stemsReady = useCustomTracksStore((s) =>
     Boolean(fixture && s.tracks.get(fixture)?.stems),
   );
-  const showStems = !!sourceMode && sourceMode !== "full";
+  const showStems = hasCustomTrack;
   // Mirrors the status copy from the original StemOverlayPanel — sits
   // italicised just under the section header so the operator sees what
   // the pipeline is doing while the panners are still inert.
@@ -275,7 +277,7 @@ export function HeroMacros() {
       : stemStatus === "failed"
         ? stemError || "Stem rip failed"
         : stemsReady
-          ? `Inference source: ${sourceMode}`
+          ? `Inference source: ${sourceMode ?? "full"}`
           : "Stems will load on play";
 
   // Clear the per-song remix gate when the user moves the bay's
