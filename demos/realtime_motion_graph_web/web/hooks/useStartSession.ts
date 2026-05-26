@@ -114,6 +114,7 @@ function buildConfig(
   // loadFixture.ts; depth=4 makes future bumps VRAM-safe).
   const custom = useCustomTracksStore.getState();
   const sourceMode = custom.resolveBackendSourceMode(fixtureName);
+  const skipStemExtraction = custom.shouldSkipStemExtraction(fixtureName);
   // Optional opaque per-browser identifier from the host (the demo's
   // standalone shell wires no getter, so this is null and the field is
   // omitted; demon-public-demo wires PostHog's distinct_id).
@@ -142,6 +143,7 @@ function buildConfig(
     // override-wins-over-sidecar regression.
     fixture_name: fixtureName,
     ...(sourceMode ? { stem_source_mode: sourceMode } : {}),
+    ...(skipStemExtraction ? { skip_stem_extraction: true } : {}),
     // Only set when the target pod advertised it can load this fixture
     // server-side (capability-gated by the caller via
     // probeServerSideFixtures). When true the pod reads the waveform

@@ -3,9 +3,10 @@
 import type { DecodedFixture } from "@/engine/audio/loadFixture";
 
 const DB_NAME = "demon-local-session-assets";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const AUDIO_STORE = "audio";
 const FILE_STORE = "files";
+const SESSION_STORE = "sessions";
 
 interface AudioAssetRecord extends DecodedFixture {
   id: string;
@@ -36,6 +37,9 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(FILE_STORE)) {
         db.createObjectStore(FILE_STORE, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(SESSION_STORE)) {
+        db.createObjectStore(SESSION_STORE, { keyPath: "id" });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -139,4 +143,27 @@ export async function hasSessionUploadFile(id: string): Promise<boolean> {
 
 export async function deleteSessionUploadFile(id: string): Promise<void> {
   await withStore(FILE_STORE, "readwrite", (store) => store.delete(id));
+}
+
+export async function putLocalSavedSessionRecord<T extends { id: string }>(
+  record: T,
+): Promise<void> {
+  await withStore(SESSION_STORE, "readwrite", (store) => store.put(record));
+}
+
+export async function getLocalSavedSessionRecord<T>(
+  id: string,
+): Promise<T | null> {
+  const record = await withStore<T | undefined>(SESSION_STORE, "readonly", (store) =>
+    store.get(id),
+  );
+  return record ?? null;
+}
+
+export async function listLocalSavedSessionRecords<T>(): Promise<T[]> {
+  return withStore<T[]>(SESSION_STORE, "readonly", (store) => store.getAll());
+}
+
+export async function deleteLocalSavedSessionRecord(id: string): Promise<void> {
+  await withStore(SESSION_STORE, "readwrite", (store) => store.delete(id));
 }

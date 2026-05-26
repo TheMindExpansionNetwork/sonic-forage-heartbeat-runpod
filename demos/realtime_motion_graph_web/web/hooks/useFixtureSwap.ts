@@ -165,6 +165,9 @@ export function useFixtureSwap() {
         const sourceMode = useCustomTracksStore
           .getState()
           .resolveBackendSourceMode(name);
+        const skipStemExtraction = useCustomTracksStore
+          .getState()
+          .shouldSkipStemExtraction(name);
         if (sourceMode) {
           useCustomTracksStore.getState().setStemStatus(name, "processing");
         }
@@ -186,6 +189,7 @@ export function useFixtureSwap() {
           name,
           undefined,
           sourceMode,
+          skipStemExtraction,
         );
         if (!sent) {
           remote.removeEventListener("swap_ready", onReady);
