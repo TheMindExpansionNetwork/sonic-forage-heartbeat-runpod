@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef } from "react";
 
 import { LiteTrackCarousel } from "./LiteTrackCarousel";
 import { RecordToggle } from "./RecordToggle";
@@ -15,90 +15,74 @@ interface Props {
   unsavedDot?: boolean;
 }
 
-type LiteTab = "mix" | "track";
-
-const TABS: LiteTab[] = ["mix", "track"];
-const TAB_LABELS: Record<LiteTab, string> = {
-  mix: "Mix",
-  track: "Track",
-};
-
-// Mobile mixer bay. A simple two-pill tab strip switches between two
-// content sections — Mix and Track — that render conditionally (only
-// the active one is mounted). The previous scroll-snap carousel
-// implementation overlapped both sections on iOS Safari and let the
-// inner track-carousel swipe leak out to the outer scroller; replacing
-// it with conditional render eliminates both classes of bug at the
-// cost of losing the swipe-to-switch gesture.
+// Mobile mixer bay. Everything in one panel — no MIX/TRACK tab switch.
+// The bay grows to fill the bottom half of the viewport so the operator
+// sees the full performance surface at once: track picker on top, the
+// four main faders mid-body, REC + "All controls" on the action row.
 //
-//   MIX   — 4 faders (denoise / structure / feedback / lora_blend) +
-//           "All controls" gateway to the full 7-tab sheet.
-//   TRACK — track carousel (upload + mic inside the picker) + REC.
+// The previous tabbed layout hid either the track or the faders behind
+// a pill toggle, which on a one-thumb mobile session meant the operator
+// kept paging back and forth. Surfacing both rows is the cheap win;
+// progressive disclosure still hides Mod/Channels/Styles behind the
+// "All controls" sheet.
+//
+// Side effect: a ResizeObserver writes the live bay height to
+// ``--lite-controls-h`` on the documentElement so the waveform-scrub
+// strip and the graph wrap can anchor their bottoms to the actual top
+// of the bay instead of guessing 50vh. Without this the bay was
+// hiding the bottom of both on tall phones / unusual aspect ratios.
 export function LiteControls({ onOpenAllControls, unsavedDot }: Props) {
-  const [tab, setTab] = useState<LiteTab>("mix");
-
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const root = document.documentElement;
+    const apply = () => {
+      root.style.setProperty("--lite-controls-h", `${el.offsetHeight}px`);
+    };
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      // Clear the var so consumers fall back to their CSS default
+      // when the bay unmounts (e.g. operator rotates to landscape
+      // and the lite controls flip off).
+      root.style.removeProperty("--lite-controls-h");
+    };
+  }, []);
   return (
-    <div className="lite-controls">
-      <div
-        className="lite-tabs"
-        role="tablist"
-        aria-label="Mobile mixer"
-      >
-        {TABS.map((t) => (
-          <button
-            key={t}
-            type="button"
-            role="tab"
-            aria-selected={tab === t}
-            className={`lite-tab${tab === t ? " lite-tab--active" : ""}`}
-            onClick={() => setTab(t)}
-          >
-            {TAB_LABELS[t]}
-            {/* Unsaved dot surfaces on whichever pill isn't currently
-                active — so the cue is visible regardless of context. */}
-            {unsavedDot && tab !== t && t === "mix" && (
-              <span
-                className="lite-tab-dot"
-                aria-label="Unsaved changes"
-              />
-            )}
-          </button>
-        ))}
+    <div ref={rootRef} className="lite-controls">
+      <div className="lite-row lite-row--track">
+        <LiteTrackCarousel />
       </div>
-      <div className="lite-tab-body" data-active-tab={tab}>
-        {tab === "mix" ? (
-          <section data-tab="mix" className="lite-tab-section">
-            <div className="lite-row lite-row--main">
-              <SliderGroup param="denoise" label="denoise" />
-              <SliderGroup param="hint_strength" label="structure" />
-              <SliderGroup param="feedback" label="feedback" />
-              <SliderGroup param="lora_blend" label="blend" />
-            </div>
-            <button
-              type="button"
-              className="lite-all-controls"
-              onClick={onOpenAllControls}
-              aria-label="All controls"
-              data-dd-tooltip="All controls"
-              data-dd-tooltip-pos="below"
-            >
-              {unsavedDot && (
-                <span
-                  className="lite-all-controls-dot"
-                  aria-label="Unsaved changes"
-                />
-              )}
-              <span className="lite-all-controls-arrow" aria-hidden="true">
-                →
-              </span>
-            </button>
-          </section>
-        ) : (
-          <section data-tab="track" className="lite-tab-section">
-            <LiteTrackCarousel />
-            <RecordToggle />
-          </section>
-        )}
+      <div className="lite-row lite-row--main">
+        <SliderGroup param="denoise" label="denoise" />
+        <SliderGroup param="hint_strength" label="structure" />
+        <SliderGroup param="timbre_strength" label="timbre" />
+        <SliderGroup param="shift" label="shift" />
+      </div>
+      <div className="lite-row lite-row--actions">
+        <RecordToggle />
+        <button
+          type="button"
+          className="lite-all-controls"
+          onClick={onOpenAllControls}
+          aria-label="All controls"
+          data-dd-tooltip="All controls"
+          data-dd-tooltip-pos="above"
+        >
+          {unsavedDot && (
+            <span
+              className="lite-all-controls-dot"
+              aria-label="Unsaved changes"
+            />
+          )}
+          <span className="lite-all-controls-label">More</span>
+          <span className="lite-all-controls-arrow" aria-hidden="true">
+            →
+          </span>
+        </button>
       </div>
     </div>
   );

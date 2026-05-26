@@ -200,6 +200,17 @@ body.cursor-hidden nextjs-portal * {
 
 body.cursor-idle .cursor-canvas { opacity: 0; }
 
+/* Hide the custom cursor entirely on touch-only devices. The cursor
+ * was designed as a desktop mouse trail — on mobile, every tap left
+ * a white dot under the user's finger which read as a stray artefact
+ * over their own touch input. Matched via the hover/pointer media
+ * features so it triggers on any touch-only device regardless of
+ * viewport width (covers tablets in landscape and unusual aspect
+ * ratios that the 768 px breakpoint would miss). */
+@media (hover: none) and (pointer: coarse) {
+  .cursor-canvas { display: none; }
+}
+
 /* ── Performance screen + Play overlay ───────────────────────────────────── */
 #performance {
   position: fixed;
@@ -646,6 +657,27 @@ body[data-mode="graph"].drawer-open #install-stage {
    --bloom-amount). Using --hud-thickness as the gap scales the breathing
    room with the rest of the HUD. */
 #install-video-area #graph-wrap { position: absolute; inset: calc(var(--hud-thickness) * 2 + var(--ribbon-bleed)); z-index: 2; }
+@media (max-width: 768px) {
+  /* On mobile the bottom of the moving-lines canvas was getting
+   * tucked under the LiteControls bay. Anchor the bottom inset to
+   * the live bay height (see ``--lite-controls-h``, set by
+   * LiteControls' ResizeObserver). top stays at the default
+   * (hud-thickness * 2 + ribbon-bleed); only the bottom is
+   * overridden so the lines never disappear behind the bay. */
+  #install-video-area #graph-wrap {
+    inset: calc(var(--hud-thickness) * 2 + var(--ribbon-bleed))
+           calc(var(--hud-thickness) * 2 + var(--ribbon-bleed))
+           calc(var(--lite-controls-h, 50vh) + 8px)
+           calc(var(--hud-thickness) * 2 + var(--ribbon-bleed));
+  }
+  /* Heavier top/bottom feathering on phones so the line ends don't
+   * read as a hard horizontal cut against the visualizer below. The
+   * desktop default 36 px gets lost on the larger relative-feather
+   * area mobile uses; 80 px gives a calmer fade against the bay. */
+  #install-video-area #graph {
+    --graph-feather-y: 80px;
+  }
+}
 #install-video-area #graph {
   width: 100%; height: 100%; display: block;
   /* Stronger feathering: the centered playhead exposes both edges, and
@@ -1838,6 +1870,14 @@ body[data-mode="graph"]::before {
   /* Vertical room for the 14px thumb knob without growing the row.
      The track itself stays 6px tall; the thumb floats above and below. */
   margin: 4px 7px;
+  /* The slider lives inside the MobileFullSheet, whose .mobile-sheet-track
+   * uses ``scroll-snap-type: x mandatory`` to swipe between tabs. Without
+   * ``touch-action: none``, a horizontal drag on the slider is interpreted
+   * by the browser as a scroll gesture on the parent — the sheet snaps to
+   * the next tab instead of moving the strength value. ``none`` tells the
+   * browser "this element handles all touch gestures itself", so the
+   * dispatcher's pointer-capture wins and the sheet stays put. */
+  touch-action: none;
 }
 .lora-strength-track:hover { background: rgba(255, 255, 255, 0.14); }
 .lora-strength-fill {
@@ -4933,28 +4973,49 @@ body.curve-open #install-video-area #graph {
   }
 }
 .lite-controls {
-  /* Wave 13.5: tabbed + swipeable mobile mixer. Bay has a fixed
-     width clamp so each tab section can snap to it. Two sections
-     live side-by-side in a horizontal scroll-snap track inside the
-     body. */
+  /* Mobile-only performance bay. Pinned to the bottom safe-area and sized
+     to fill the lower ~half of the viewport so the operator can see and
+     reach the full surface without paging through tabs: track carousel
+     up top, the four main faders mid-body, REC + "All controls" at the
+     bottom. The visualizer remains visible (dimmed) above through the
+     transparent gap. */
   position: fixed;
-  left: 50%;
-  transform: translateX(-50%);
-  bottom: max(env(safe-area-inset-bottom, 0px) + 8px, 8px);
-  width: clamp(320px, 92vw, 560px);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* Full-width bay on every mobile size. The previous
+   * ``margin-inline: var(--stepper-rail-w)`` kept the bay clear of
+   * the edge fader rails, but it shrank the usable surface on
+   * tablets / wide phones and left ugly L/R margins. The rails are
+   * still mounted underneath at left/right: 0; they show through
+   * the gradient bg but don't block touches (the bay sits at
+   * z-index 8, above the rails). Safe-area only — env() so notched
+   * landscape phones don't push the bay under the chin. */
+  margin-inline: 0;
+  padding:
+    10px
+    max(14px, env(safe-area-inset-left, 0px))
+    calc(env(safe-area-inset-bottom, 0px) + 12px)
+    max(14px, env(safe-area-inset-right, 0px));
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 6px;
-  padding: 6px 10px 8px;
-  background: rgba(6, 6, 12, 0.62);
-  border: 1px solid var(--frame-line);
-  border-radius: var(--radius-md);
+  gap: 8px;
+  background: linear-gradient(
+    to top,
+    rgba(6, 6, 12, 0.94) 0%,
+    rgba(6, 6, 12, 0.82) 65%,
+    rgba(6, 6, 12, 0.62) 100%
+  );
+  border-top: 1px solid var(--frame-line);
+  border-left: 1px solid var(--frame-line);
+  border-right: 1px solid var(--frame-line);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    0 4px 14px rgba(0, 0, 0, 0.4);
-  -webkit-backdrop-filter: blur(8px);
-          backdrop-filter: blur(8px);
+    0 -4px 14px rgba(0, 0, 0, 0.4);
+  -webkit-backdrop-filter: blur(10px);
+          backdrop-filter: blur(10px);
   z-index: 8;
   /* Only render on mobile — desktop has the inset Full Controls panel
      and the HeroMacros bay instead. */
@@ -4965,6 +5026,8 @@ body.curve-open #install-video-area #graph {
     display: flex;
   }
 }
+/* (No narrow-phone-specific override needed — the main rule above
+ * already runs the bay full-width with safe-area padding only.) */
 
 /* Wave 13.4 lite tabs — Mix / Track pill row sitting at the top of
    the bay. Small mono-caps cells with frame-line outline; active cell
@@ -5047,33 +5110,48 @@ body.curve-open #install-video-area #graph {
   align-items: center;
 }
 
-.lite-row--main {
+/* Track row — single native <select> spanning the full width of the
+ * bay. Sits across the top; the picker owns its own padding and
+ * chevron, so the wrapper just expands to full width. */
+.lite-row--track {
   flex: 0 0 auto;
-  min-height: 0;
-  gap: 16px;
-  justify-content: center;
-  padding: 4px 4px 4px;
-  /* Vertical alignment so the four faders share one baseline. */
-  align-items: flex-end;
+  width: 100%;
+  min-width: 0;
+}
+.lite-row--track > .lite-track-picker {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
-/* Utility cluster sits to the right of the fader block. Track
-   carousel on top, REC + "All controls" on the bottom row. */
-.lite-utility {
+.lite-row--main {
+  /* Take whatever vertical space is left between the track row and the
+     action row — the four faders should breathe on tall phones. */
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 12px;
+  justify-content: space-around;
+  padding: 6px 0 4px;
+  /* Vertical alignment so the four faders share one baseline. */
+  align-items: stretch;
+}
+
+.lite-row--main .slider-group {
+  flex: 1 1 0;
+  min-width: 0;
+  /* Each fader column stretches to the full row height so the track
+     gets every available pixel — that's where the touch precision lives. */
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 6px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-.lite-utility .lite-track-carousel { min-width: 0; }
-.lite-row--main .slider-group {
-  flex: 0 0 46px;
-  min-width: 0;
+  align-items: center;
+  /* Bigger gap than the desktop 6px because the mobile thumb is
+   * 28 px tall and its anchor is its center — at max value the thumb
+   * pokes ~14 px above the track top, which previously slid right
+   * over the slider-label. 18 px clears the half-thumb with a small
+   * buffer. */
+  gap: 18px;
 }
 .lite-row--main .slider-group .slider-label {
-  font-size: 0.55em;
+  font-size: 10px;
   letter-spacing: 0.04em;
   white-space: nowrap;
   overflow: hidden;
@@ -5081,36 +5159,92 @@ body.curve-open #install-video-area #graph {
   max-width: 100%;
 }
 .lite-row--main .slider-track {
-  width: 36px;
-  min-height: 100px;
+  width: 44px;
+  /* min-height instead of fixed height so the fader stretches with
+     viewport. The flex parent gives us the room. */
+  flex: 1 1 auto;
+  min-height: 140px;
 }
-.lite-row--main .slider-track::before { width: 5px; }
-.lite-row--main .slider-fill { width: 5px; }
+/* The visible track + fill are as wide as the thumb so the fader
+ * reads as a single chunky column instead of a thin line with a
+ * disc floating on it. The thumb still sits centered over the
+ * track and the contrast (muted track vs accent-bordered thumb)
+ * carries the "this is the handle" affordance. */
+/* Pill-rounded top + bottom on the mobile track so the circular
+ * thumb sits flush inside the column at the min/max ends (the
+ * thumb radius == half the track width, so border-radius: 14px on
+ * both the recess and the fill closes the corners exactly). */
+.lite-row--main .slider-track::before {
+  width: 28px;
+  border-radius: 14px;
+}
+.lite-row--main .slider-fill {
+  width: 28px;
+  border-radius: 14px;
+}
 .lite-row--main .slider-thumb {
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   border-width: 2px;
+  /* Circular cap — same skeuomorphic gradient + bevel shadows as the
+   * desktop rectangular thumb, just rounded. The center-line
+   * indicator (.slider-thumb::before) reshapes into a tiny dot below
+   * so the cap still surfaces its per-value tint. */
+  border-radius: 50%;
 }
-.lite-row--main {
-  gap: 6px;
+.lite-row--main .slider-thumb::before {
+  /* On the circular mobile thumb, the desktop horizontal indicator
+   * line would float untethered across the cap. Replace it with a
+   * small accent-tinted center dot — same job (shows the per-value
+   * colour), shape that fits a disc. */
+  left: 50%;
+  right: auto;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
 }
-/* Lite-controls "All controls" — icon-only on mobile. The label was
-   eating significant horizontal real estate next to 4 faders; an
-   arrow-only chip with a tooltip stays discoverable. */
-.lite-tab-section .lite-all-controls {
+
+/* Action row — REC on the left, "More" on the right. Both 44px tall to
+   meet the iOS HIG touch-target minimum. */
+.lite-row--actions {
+  flex: 0 0 auto;
+  width: 100%;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 4px;
+}
+.lite-row--actions > * {
+  flex: 0 0 auto;
+}
+.lite-row--actions .lite-all-controls {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  padding: 6px 10px;
-  min-width: 36px;
-  height: 36px;
-  flex-shrink: 0;
-  font-size: 14px;
-  line-height: 1;
+  gap: 6px;
+  padding: 0 14px;
+  min-width: 80px;
+  height: 44px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--frame-line);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: color 120ms, border-color 120ms, background 120ms;
 }
-.lite-tab-section .lite-all-controls .lite-all-controls-arrow {
-  font-size: 16px;
+.lite-row--actions .lite-all-controls:hover,
+.lite-row--actions .lite-all-controls:active {
+  color: var(--text-strong);
+  border-color: var(--accent-line);
+  background: rgba(255, 255, 255, 0.04);
+}
+.lite-row--actions .lite-all-controls .lite-all-controls-arrow {
+  font-size: 14px;
   line-height: 1;
 }
 
@@ -5456,7 +5590,13 @@ body.curve-open #install-video-area #graph {
 }
 
 /* Pill-style tab bar — sliding active background on tap, snappy scale
-   feedback so the swipe-to-tap interaction feels lively. */
+   feedback so the swipe-to-tap interaction feels lively.
+   Horizontally scrollable: the six labels (Core / Styles / Mod /
+   Channels / Saved / Config) don't fit on a narrow phone with their
+   full text. ``flex: 1 1 0`` used to squeeze them in, which clipped
+   the last tab ("Config") off the right edge on small viewports.
+   Now each tab is content-sized and the strip scrolls horizontally;
+   swipe to reach tabs that don't fit. */
 .mobile-sheet-tabs {
   flex-shrink: 0;
   display: flex;
@@ -5464,13 +5604,22 @@ body.curve-open #install-video-area #graph {
   padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
   border-top: 1px solid var(--frame-line);
   background: var(--frame);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none; /* Firefox */
+  /* Keep the swipe-to-scroll local — without this, swiping past the
+   * last tab chains into the parent and closes the sheet. */
+  overscroll-behavior-x: contain;
 }
+.mobile-sheet-tabs::-webkit-scrollbar { display: none; }
 .mobile-sheet-tab {
-  flex: 1 1 0;
+  /* Sized to fit its label (was ``flex: 1 1 0`` which clipped on
+   * narrow phones — see the .mobile-sheet-tabs comment above). */
+  flex: 0 0 auto;
   appearance: none;
   background: transparent;
   border: 0;
-  padding: 10px 8px;
+  padding: 10px 14px;
   border-radius: 999px;
   color: var(--text-dim);
   font-family: var(--font-mono);
@@ -5478,6 +5627,7 @@ body.curve-open #install-video-area #graph {
   letter-spacing: var(--tracking-wide);
   text-transform: uppercase;
   cursor: pointer;
+  white-space: nowrap;
   transition: color 180ms ease, background 180ms ease, transform 80ms ease;
 }
 .mobile-sheet-tab:hover { color: var(--text); }
@@ -6646,99 +6796,76 @@ body.curve-open #install-video-area #graph {
   background: transparent;
 }
 
-/* ── Lite track carousel ──────────────────────────────────────────────── */
-.lite-track-carousel {
+/* ── Lite track picker (native <select>) ─────────────────────────────── */
+/* Replaces the previous scroll-snap carousel of chips. Letting the OS
+ * draw the picker on tap gives a one-thumb friendly chooser (iOS
+ * wheel / Android dialog) with built-in scrolling, search, and
+ * accessibility for free. The CSS below dresses the closed-state
+ * select to match the bay's mono-caps aesthetic; ``appearance: none``
+ * strips the OS chrome but the picker still pops on tap. */
+.lite-track-picker {
   flex: 0 0 auto;
-  position: relative;
-  margin: 0 -16px;
-  padding: 0 4px;
-  /* Fade the edges so chips bleed off without a hard cut. */
-  -webkit-mask-image: linear-gradient(90deg,
-    transparent, black 20px, black calc(100% - 20px), transparent);
-          mask-image: linear-gradient(90deg,
-    transparent, black 20px, black calc(100% - 20px), transparent);
-}
-.lite-track-carousel-scroll {
   display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  scroll-snap-type: x proximity;
-  scrollbar-width: none;
-  padding: 6px 12px 8px;
-  -webkit-overflow-scrolling: touch;
-  /* This carousel is nested inside the Mix/Track scroll-snap track.
-     Without containment, swiping the chips chains the scroll out to
-     the parent and snaps back to the Mix tab. */
-  overscroll-behavior-x: contain;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 2px 0;
 }
-.lite-track-carousel-scroll::-webkit-scrollbar { display: none; }
-.lite-track-carousel-empty {
+.lite-track-picker-label {
   font-family: var(--font-mono);
-  font-size: 0.74em;
+  font-size: 0.66em;
   letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
   color: var(--text-dim);
-  padding: 12px 8px;
+  padding-left: 2px;
 }
-
-.lite-track-chip {
-  scroll-snap-align: center;
-  flex: 0 0 auto;
-  /* WCAG 2.5.5 floor (44x44) — chip is taller than tall, hugs label width. */
-  min-height: 48px;
-  min-width: 64px;
-  padding: 0 14px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: transparent;
+.lite-track-picker-field {
+  /* Positioning anchor for the chevron — the native select doesn't
+   * give us a hook to draw one inside, so it lives as an absolutely
+   * positioned span layered on top with pointer-events: none. */
+  position: relative;
+  display: flex;
+}
+.lite-track-picker-select {
+  flex: 1 1 auto;
+  min-height: 48px; /* WCAG 2.5.5 touch-target floor */
+  padding: 0 36px 0 14px;
+  background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--frame-line);
-  border-radius: 999px;
-  color: var(--text-dim);
+  border-radius: var(--radius-md);
+  color: var(--text);
   font: inherit;
   font-family: var(--font-mono);
-  font-size: 0.74em;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 0.78em;
+  letter-spacing: 0.04em;
+  /* Strip default browser chrome — the chevron span on the right
+   * carries the affordance. iOS/Android still open the native picker
+   * on tap regardless. */
+  -webkit-appearance: none;
+     -moz-appearance: none;
+          appearance: none;
   cursor: pointer;
+  width: 100%;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  transition: color 120ms, border-color 120ms, background 120ms,
-              transform 120ms, box-shadow 120ms;
+  overflow: hidden;
 }
-.lite-track-chip:hover {
-  color: var(--accent);
-  border-color: var(--accent-line);
-}
-.lite-track-chip:active {
-  transform: scale(0.96);
-}
-.lite-track-chip--current {
-  color: var(--text);
+.lite-track-picker-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
   border-color: var(--accent);
-  background: var(--accent-soft);
-  box-shadow: 0 0 12px var(--accent-glow);
 }
-.lite-track-chip--custom {
-  /* Subtle hint that this is user-uploaded. */
-  border-style: dashed;
-}
-.lite-track-chip--upload {
-  color: var(--accent);
-  border-color: var(--accent-line);
-  border-style: dashed;
-}
-.lite-track-chip--upload:disabled {
+.lite-track-picker-select:disabled {
   opacity: 0.6;
   cursor: progress;
 }
-.lite-track-chip-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.lite-track-chip-label {
-  max-width: 18ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.lite-track-picker-chevron {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-dim);
+  pointer-events: none;
+  font-size: 0.85em;
 }
 
 /* ── Lite actions row (replaces .lite-row--prompt after reshuffle) ──── */
@@ -6870,6 +6997,14 @@ body.curve-open #install-video-area #graph {
     opacity 240ms ease-out,
     left 320ms cubic-bezier(.2, .7, .2, 1);
   pointer-events: auto;
+  /* Critical on mobile: without this the browser interprets a
+   * horizontal touch drag as panning and yanks the pointer event
+   * stream away from JS mid-scrub (setPointerCapture is too late to
+   * keep ownership). Symptom was a touch-scrub that worked for ~10
+   * px then stopped, and loop-drawing was effectively impossible.
+   * ``none`` gives the component exclusive control of every gesture
+   * on the strip. */
+  touch-action: none;
 }
 .waveform-scrub-box[data-ready="true"] {
   opacity: 1;
@@ -6926,6 +7061,52 @@ body.curve-open #install-video-area #graph {
   background: rgba(240, 138, 72, 0.9);
   color: #1a0e05;
   border-color: transparent;
+}
+
+/* Mobile waveform strip. Sits below the DEMON brand mark and inside the
+   side fader rails. Slim height keeps the scrub-line UX while leaving
+   the visualizer + control surface room to breathe. The desktop CSS
+   uses --hud-thickness offsets that are zero on mobile (no HUD frame
+   on phones) so we re-anchor from the top instead. The brand mark
+   itself sits at top:18 + height:42 = bottom 60, so 70 leaves a 10px
+   gap. */
+@media (max-width: 768px) {
+  /* On mobile the scrub strip fills the screen between the brand
+   * header and the slider bay rather than sitting as a thin line at
+   * the top — gives the user a generous scrub target and turns the
+   * waveform itself into the primary visual instead of a hidden
+   * detail. Anchored top+bottom (no fixed height) so it stretches
+   * with viewport: top below the brand mark, bottom above the
+   * lite-controls bay which occupies the lower ~half of the
+   * viewport. Full width — no rail clearance — matching the bay's
+   * full-width treatment. */
+  .waveform-scrub-box {
+    top: max(env(safe-area-inset-top, 0px) + 70px, 70px);
+    left: max(env(safe-area-inset-left, 0px), 8px);
+    right: max(env(safe-area-inset-right, 0px), 8px);
+    /* Anchor the bottom to the actual top edge of the LiteControls
+     * bay (var written by LiteControls' ResizeObserver). Fallback to
+     * 50vh for the brief moment before the bay measures itself or
+     * if LiteControls isn't mounted for some reason. +8 px breathing
+     * gap so the strip never visually touches the bay. */
+    bottom: calc(var(--lite-controls-h, 50vh) + 8px);
+    height: auto;
+    /* Inner breathing room — the canvases (position:absolute;
+     * inset:0) anchor to the padding box, so this pulls the
+     * waveform graphic away from the container edges. Equal
+     * top/bottom keeps the waveform vertically centered. */
+    padding: 18px 14px;
+    box-sizing: border-box;
+    /* Sit above the install-stage background but below modals and the
+       LiteControls bay. */
+    z-index: 5;
+  }
+  /* Mobile sliders are touch-only — the LOOP toggle's hover-reveal would
+     never fire, so keep it permanently visible (faint until armed). */
+  .waveform-scrub-box .waveform-loop-toggle {
+    opacity: 0.85;
+    pointer-events: auto;
+  }
 }
 
 /* ── Custom tooltip (replaces native `title=` for hover-visible UI) ──
@@ -8482,13 +8663,10 @@ body.curve-open #install-video-area #graph {
   #install-video-area #graph-wrap .graph-lane-labels {
     display: none;
   }
-  /* Waveform scrub strip is hidden on mobile — it eats vertical space
-     that the squished graph needs, and the scrubbing precision is
-     poor at touch resolution anyway. Scrubbing remains available via
-     the full controls sheet. */
-  .waveform-scrub-box {
-    display: none;
-  }
+  /* Waveform strip now ships on mobile too — see the dedicated
+     positioning block earlier in this file. The previous hide-on-mobile
+     rule was the workaround from when there was no touch-friendly
+     scrub UI. */
 }
 
 /* Static wordmark — when the LibraryButton retired in Wave 10, the
