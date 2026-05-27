@@ -163,7 +163,7 @@ function HeroStyleFader({ slotIndex }: HeroStyleFaderProps) {
   );
 }
 
-const STEM_OVERLAY_MAX = 1.5;
+const STEM_OVERLAY_MAX = 6.0;
 const STEM_LABELS: Record<StemOverlayKind, string> = {
   vocals: "Vocals",
   instruments: "Instr",
@@ -247,9 +247,10 @@ export function HeroMacros() {
   const curveOpen = useCurveStore((s) => s.overlayOpen);
   const toggleCurve = useCurveStore((s) => s.toggleOverlay);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  // Stem section is visible for custom uploads. The backend auto-rips
-  // uploaded tracks even when inference uses the full mix, so full-track
-  // saves should still expose realtime stem layers after restore.
+  // Stem section is visible for any uploaded track, including "full".
+  // The backend extracts and ships vocal/instrument overlay stems for
+  // every custom upload; "full" only keeps the whole mix as inference
+  // source. Built-in fixtures have no custom-track entry here.
   const fixture = usePerformanceStore((s) => s.fixture);
   const hasCustomTrack = useCustomTracksStore((s) =>
     fixture ? s.tracks.has(fixture) : false,
