@@ -418,6 +418,10 @@ export class GraphRenderer {
   // mid-fill buffer is harmless (it self-corrects on the next tick).
   private _laneBands: LaneBand[] = [];
   private _laneBandCount = 0;
+  // Number of lanes that qualified for display but didn't fit inside
+  // MAX_LANES this frame. Read by <GraphLaneLabels/> to render a
+  // "+N more" pill below the stack. Zero when everything fits.
+  private _hiddenLaneCount = 0;
   // Per-lane scratch arrays for _drawLanes. Pre-allocated so the
   // hot draw path never .push()es above MAX_LANES.
   private readonly _laneNameBuf: (string | null)[] = new Array(MAX_LANES).fill(
@@ -1023,7 +1027,10 @@ export class GraphRenderer {
     // Step 1+2: collect active lanes into the pre-allocated scratch
     // buffer. When the pool is full, evict the lane with the oldest
     // lastFire if this candidate is more recent (linear scan, n ≤ 10).
+    // Also count totalEligible so we know how many qualifying lanes
+    // didn't fit — surfaces as a "+N more" pill via the labels overlay.
     let activeCount = 0;
+    let totalEligible = 0;
     for (const [name, hist] of this.histories) {
       if (hist.filled === 0) continue;
       const headIdx = (hist.head - 1 + HISTORY_LEN) % HISTORY_LEN;
@@ -1032,6 +1039,7 @@ export class GraphRenderer {
       // Skip lanes that have never moved AND are currently at zero —
       // dormant LoRAs / unused params, would only add noise.
       if (headV < 0.005 && lastFire === 0) continue;
+      totalEligible++;
       if (activeCount < MAX_LANES) {
         this._laneNameBuf[activeCount] = name;
         this._laneLastFireBuf[activeCount] = lastFire;
@@ -1051,6 +1059,7 @@ export class GraphRenderer {
         }
       }
     }
+    this._hiddenLaneCount = Math.max(0, totalEligible - activeCount);
     if (activeCount === 0) {
       this._laneBandCount = 0;
       return;
@@ -1349,6 +1358,14 @@ export class GraphRenderer {
   /** Populated entries in getLaneBands(). */
   getLaneBandCount(): number {
     return this._laneBandCount;
+  }
+
+  /** Count of qualifying lanes that didn't fit inside MAX_LANES this
+   * frame. Surfaced by <GraphLaneLabels/> as a "+N more" pill below
+   * the stack so the user knows there's more activity than they're
+   * seeing. Zero when everything fits. */
+  getHiddenLaneCount(): number {
+    return this._hiddenLaneCount;
   }
 
   /** Current layout mode — read by the labels overlay to decide

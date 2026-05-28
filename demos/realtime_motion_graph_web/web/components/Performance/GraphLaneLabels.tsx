@@ -44,7 +44,15 @@ interface DisplayPill {
   y: number;
   color: string;
   idle: boolean;
+  // Special "+N more" overflow chip. Rendered with a neutral CSS
+  // variant (.graph-lane-label--more) — color/borderColor inline are
+  // ignored in favor of CSS tokens.
+  isMore?: boolean;
 }
+
+// Sentinel param name for the overflow chip so React's key stays stable
+// across ticks (the count changes but the chip is the same DOM node).
+const MORE_PILL_PARAM = "__hidden_more__";
 
 export function GraphLaneLabels() {
   const [pills, setPills] = useState<DisplayPill[]>([]);
@@ -98,6 +106,26 @@ export function GraphLaneLabels() {
             idle: b.idle,
           });
         }
+        // Overflow chip — when more lanes qualify than MAX_LANES, surface
+        // the hidden count as a neutral "+N more" pill anchored below
+        // the last visible lane in the gutter. Centers a few px below
+        // the stack so it reads as a continuation marker, not a lane.
+        const hidden = g.getHiddenLaneCount();
+        if (hidden > 0 && count > 0) {
+          const last = bands[count - 1];
+          if (last && last.bandTop > 0) {
+            const chipY = last.bandTop + last.bandHeight + 14;
+            next.push({
+              param: MORE_PILL_PARAM,
+              display: `+${hidden} more`,
+              x: 0,
+              y: chipY,
+              color: "", // ignored; CSS variant carries the neutral color
+              idle: false,
+              isMore: true,
+            });
+          }
+        }
       } else {
         // Polylines mode — pill anchored at the polyline's y at the
         // playhead, same as before. Skip lines whose value is currently
@@ -147,20 +175,21 @@ export function GraphLaneLabels() {
       style={{ width: size.w, height: size.h }}
       aria-hidden="true"
     >
-      {pills.map((p) => (
-        <span
-          key={p.param}
-          className={`graph-lane-label${p.idle ? " graph-lane-label--idle" : ""}`}
-          style={{
-            left: p.x,
-            top: p.y,
-            color: p.color,
-            borderColor: p.color,
-          }}
-        >
-          {p.display}
-        </span>
-      ))}
+      {pills.map((p) => {
+        const classes = ["graph-lane-label"];
+        if (p.idle) classes.push("graph-lane-label--idle");
+        if (p.isMore) classes.push("graph-lane-label--more");
+        // For the overflow chip, omit inline color/borderColor so the
+        // CSS variant's neutral palette takes over.
+        const style: React.CSSProperties = p.isMore
+          ? { left: p.x, top: p.y }
+          : { left: p.x, top: p.y, color: p.color, borderColor: p.color };
+        return (
+          <span key={p.param} className={classes.join(" ")} style={style}>
+            {p.display}
+          </span>
+        );
+      })}
     </div>
   );
 }

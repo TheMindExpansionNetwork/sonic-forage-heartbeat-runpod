@@ -798,6 +798,19 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
   opacity: 0.4;
   transition: opacity 200ms cubic-bezier(.2, .8, .2, 1);
 }
+/* "+N more" overflow chip — rendered below the stack when more lanes
+   qualify than MAX_LANES (10). Neutral palette: no param-color border
+   or text, because this isn't a lane, it's a continuation marker. The
+   render component intentionally omits inline color/borderColor for
+   this variant so these CSS rules win. */
+.graph-lane-label--more {
+  color: var(--text-dim);
+  border-color: var(--frame-line);
+  background: rgba(6, 6, 12, 0.78);
+  font-size: 9px;
+  /* Slightly tighter than lane labels — secondary information. */
+  letter-spacing: 0.25em;
+}
 @keyframes graph-lane-label-fade-in {
   from { opacity: 0; }
   to { opacity: 1; }
