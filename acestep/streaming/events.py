@@ -322,11 +322,19 @@ class SubscriberDropped:
 class BackpressurePolicy(Enum):
     """How a :class:`Subscription` handles a publish into a full queue.
 
-    - ``NEVER_DROP``: queue is bounded; on full, close the subscription
-      after delivering one :class:`SubscriberDropped`. Use for
-      control-plane events where missing one corrupts the consumer.
-    - ``DROP_OLDEST``: on full, evict the oldest queued event to make
-      room. Use for high-rate recoverable events (slices).
+    On overflow the queue never evicts a ``NEVER_DROP`` event to make
+    room for any other event (see :meth:`Subscription._post`); the
+    eviction target is always the oldest *droppable* event.
+
+    - ``NEVER_DROP``: never evicted, and never evicts. When a
+      ``NEVER_DROP`` event arrives at a full queue with no droppable
+      event to evict, the subscription is closed after delivering one
+      :class:`SubscriberDropped`. Use for control-plane events where
+      missing one corrupts the consumer.
+    - ``DROP_OLDEST``: on full, evict the oldest *droppable* queued event
+      to make room; if none exists (backlog is all control events), drop
+      the incoming event instead. Use for high-rate recoverable events
+      (slices).
     - ``COALESCE``: on full, walk the queue back-to-front and replace
       the most recent event of the SAME concrete type with the new one
       (so the consumer always sees the latest value). Falls back to
@@ -403,6 +411,19 @@ class Subscription:
         Called only by :meth:`EventBus.publish` while holding no lock
         beyond the bus's subscriber-list lock. Honors the per-event
         policy on overflow.
+
+        Overflow rule (correct-by-construction): a full queue never
+        evicts a ``NEVER_DROP`` event to make room. Instead we drop the
+        OLDEST *droppable* (non-``NEVER_DROP``) event, so a flood of
+        high-rate slices can't knock a queued control frame
+        (``SwapReady``, ``LoraCatalogUpdate``, …) out of the queue —
+        which the old evict-absolute-oldest path could, silently losing
+        an unrecoverable control event. The subscription is closed only
+        when the backlog is *entirely* control events AND the incoming
+        event is itself ``NEVER_DROP`` (a consumer so wedged it can't
+        even drain the control plane). A lossy event arriving against an
+        all-control backlog is simply dropped — losing a slice is
+        recoverable; losing a control frame is not.
         """
         policy = _policy_for(event, self._policy_override)
         with self._cv:
@@ -413,11 +434,10 @@ class Subscription:
                 self._cv.notify()
                 return
             # Queue full.
-            if policy is BackpressurePolicy.DROP_OLDEST:
-                self._buf.popleft()
-                self._buf.append(event)
-                self._cv.notify()
-                return
+            #
+            # COALESCE: replace the newest same-type event in place. This
+            # doesn't grow the queue and never displaces a control event,
+            # so try it first; the consumer always sees the latest value.
             if policy is BackpressurePolicy.COALESCE:
                 etype = type(event)
                 # Walk back-to-front so the newest same-type event is
@@ -426,12 +446,24 @@ class Subscription:
                     if type(self._buf[i]) is etype:
                         self._buf[i] = event
                         return
-                # No same-type event queued; fall back to evict-oldest.
-                self._buf.popleft()
-                self._buf.append(event)
-                self._cv.notify()
+            # Make room by dropping the OLDEST droppable event. Never
+            # evict a NEVER_DROP (control-plane) event to do it.
+            for i, queued in enumerate(self._buf):
+                if _policy_for(
+                    queued, self._policy_override,
+                ) is not BackpressurePolicy.NEVER_DROP:
+                    del self._buf[i]
+                    self._buf.append(event)
+                    self._cv.notify()
+                    return
+            # Backlog is entirely NEVER_DROP events (consumer wedged on
+            # the control plane).
+            if policy is not BackpressurePolicy.NEVER_DROP:
+                # Incoming is lossy (e.g. an audio slice). Dropping it is
+                # recoverable; keep the control backlog intact.
                 return
-            # NEVER_DROP: close the subscription. Tell the drainer to
+            # Incoming is itself NEVER_DROP and there's no droppable event
+            # to evict — close the subscription. Tell the drainer to
             # deliver one SubscriberDropped and exit. We do this by
             # clearing the buffer (which would otherwise stack
             # unservable events) and queueing the single notice.
