@@ -483,6 +483,15 @@ interface PerformanceState {
   bandLoopEnabled: boolean;
   /** Snap resolution for loop-region edits. Beat by default. */
   loopGridRes: LoopGridRes;
+  /** Operator opt-out for the automatic LoRA-trigger prefix. When true,
+   *  `enabledLoraTriggerPrefix()` returns "" regardless of which LoRAs
+   *  are enabled, so the wire prompt is exactly the operator's text.
+   *  Per-session (not persisted) — defaults off, matching the prior
+   *  "auto-prepend always on" behavior. Toggled from the Prompt Mode
+   *  view; affects every send path (Prompt Mode Send, in-tile Send
+   *  Tags, key/LoRA change triggers, etc) because the helper reads
+   *  this flag at call time. */
+  disableLoraAutoTrigger: boolean;
 
   // ── actions ───────────────────────────────────────────────────────────
   setSlider: (param: string, value: number) => void;
@@ -582,6 +591,7 @@ interface PerformanceState {
   setSmoothMs: (ms: number) => void;
   toggleLufs: () => void;
   toggleLoop: () => void;
+  toggleDisableLoraAutoTrigger: () => void;
   /** Read localStorage-backed prefs (showKbdHints) and
    *  apply them to the store. Called from a client-only useEffect so SSR
    *  always renders with the defaults — without this, hydration mismatches
@@ -679,6 +689,7 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   loopBand: null,
   bandLoopEnabled: true,
   loopGridRes: "beat",
+  disableLoraAutoTrigger: false,
 
   setSlider: (param, value) => {
     stampManualTouch(param);
@@ -902,6 +913,8 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   setLoopBand: (band) => set({ loopBand: band }),
   setBandLoopEnabled: (enabled) => set({ bandLoopEnabled: enabled }),
   setLoopGridRes: (res) => set({ loopGridRes: res }),
+  toggleDisableLoraAutoTrigger: () =>
+    set((s) => ({ disableLoraAutoTrigger: !s.disableLoraAutoTrigger })),
   hydratePersistedPrefs: () =>
     set({
       showKbdHints: loadBool(SHOW_KBD_HINTS_STORAGE_KEY, true),
