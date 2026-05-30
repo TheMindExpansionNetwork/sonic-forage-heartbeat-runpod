@@ -2,7 +2,10 @@
 
 import { useEffect, useRef } from "react";
 
-import { loadFixtureAudio } from "@/engine/audio/loadFixture";
+import {
+  loadFixtureAudio,
+  type StemSourceMode,
+} from "@/engine/audio/loadFixture";
 import {
   applyLoraCapWithServerSync,
   getConfig,
@@ -27,17 +30,28 @@ export function useFixtureSwap() {
   // Skip the very first fixture write (which fires when the catalog populates
   // and writes the default name into the store).
   const lastSwappedTo = useRef<string | null>(null);
+  // The stem_source_mode last actually sent to the server. Used to (a)
+  // dedupe the server's `stem_assets` source_mode echo so it doesn't
+  // bounce back as a fresh swap, and (b) let the source-mode hotswap
+  // subscription re-run a swap for the *same* fixture when only the mode
+  // changed (the name-based `lastSwappedTo` guard would otherwise block it).
+  const lastSwappedMode = useRef<StemSourceMode | null>(null);
 
   useEffect(() => {
     let cancelled = false;
 
-    const run = async (name: string) => {
+    // `force` re-runs the swap for the currently-loaded fixture (used by
+    // the source-mode hotswap). It bypasses the same-name short-circuit
+    // and skips the "new track" denoise gate below — toggling vocals ↔
+    // instruments is the same song, so it shouldn't yank the performer
+    // back to the hear-the-source start gate.
+    const run = async (name: string, force = false) => {
       if (cancelled) return;
       const session = useSessionStore.getState();
       if (session.status !== "ready" || !session.remote || !session.player) {
         return; // No live session yet; the next Play will pick the new fixture.
       }
-      if (lastSwappedTo.current === name) return;
+      if (!force && lastSwappedTo.current === name) return;
 
       const { setStatus } = useSessionStore.getState();
       setStatus("ready", `Loading ${name}…`);
@@ -165,6 +179,11 @@ export function useFixtureSwap() {
         const sourceMode = useCustomTracksStore
           .getState()
           .resolveSourceMode(name);
+        // Record what we're about to send BEFORE the round-trip so the
+        // server's `stem_assets` source_mode echo (which calls
+        // setSourceMode) is recognised as already-applied and doesn't
+        // re-enter the hotswap subscription below.
+        lastSwappedMode.current = sourceMode ?? null;
         if (sourceMode) {
           useCustomTracksStore.getState().setStemStatus(name, "processing");
         }
@@ -200,30 +219,35 @@ export function useFixtureSwap() {
         return;
       }
       lastSwappedTo.current = name;
-      // Each new track re-enters the "hear source first" gate when
-      // enabled in config: snap engine denoise to 0 (user hears the
-      // source from frame 1) and play a visual-only glide on the ribbon
-      // from its prior position down to 0 as a "this is a slider" hint.
-      // remixStarted always clears so the "drag to start" affordance
-      // shows again; side-rail hints stay suppressed until the user
-      // drags the top ribbon up. Shares config with useStartSession so
-      // one knob controls both Play and swap.
-      //
-      // skipNextDenoiseGate is a one-shot opt-out for saved-session
-      // resumes: the demo-side applySessionState sets it before
-      // writing perf.fixture so the gate doesn't trample the restored
-      // denoise value with a snap-to-zero. Consume-and-clear here so
-      // the next legitimate swap reverts to the normal behaviour.
-      const perfState = usePerformanceStore.getState();
-      const gate = getConfig().denoise_session_gate;
-      if (perfState.skipNextDenoiseGate) {
-        perfState.setSkipNextDenoiseGate(false);
-      } else if (gate.enabled) {
-        const prevDenoise = perfState.sliderTargets["denoise"] ?? 0;
-        perfState.setSliderDirect("denoise", 0);
-        perfState.animateSliderDisplayFrom("denoise", prevDenoise, gate.glide_ms);
+      // A source-mode hotswap (force) is the same song with a different
+      // stem feeding inference — skip the new-track gate entirely so the
+      // performer's denoise / remix-started state is left untouched.
+      if (!force) {
+        // Each new track re-enters the "hear source first" gate when
+        // enabled in config: snap engine denoise to 0 (user hears the
+        // source from frame 1) and play a visual-only glide on the ribbon
+        // from its prior position down to 0 as a "this is a slider" hint.
+        // remixStarted always clears so the "drag to start" affordance
+        // shows again; side-rail hints stay suppressed until the user
+        // drags the top ribbon up. Shares config with useStartSession so
+        // one knob controls both Play and swap.
+        //
+        // skipNextDenoiseGate is a one-shot opt-out for saved-session
+        // resumes: the demo-side applySessionState sets it before
+        // writing perf.fixture so the gate doesn't trample the restored
+        // denoise value with a snap-to-zero. Consume-and-clear here so
+        // the next legitimate swap reverts to the normal behaviour.
+        const perfState = usePerformanceStore.getState();
+        const gate = getConfig().denoise_session_gate;
+        if (perfState.skipNextDenoiseGate) {
+          perfState.setSkipNextDenoiseGate(false);
+        } else if (gate.enabled) {
+          const prevDenoise = perfState.sliderTargets["denoise"] ?? 0;
+          perfState.setSliderDirect("denoise", 0);
+          perfState.animateSliderDisplayFrom("denoise", prevDenoise, gate.glide_ms);
+        }
+        perfState.setRemixStarted(false);
       }
-      perfState.setRemixStarted(false);
       setStatus("ready", "Playing");
     };
 
@@ -243,13 +267,35 @@ export function useFixtureSwap() {
       }
     });
 
+    // Hotswap the inference source (full ↔ vocals ↔ instruments) for the
+    // active upload. The source-mode switch writes setSourceMode(); we
+    // re-run the swap for the same fixture so the server re-encodes the
+    // chosen stem. Guards: only the *active* fixture, only a real change,
+    // and never the server's own source_mode echo (lastSwappedMode).
+    const unsubSource = useCustomTracksStore.subscribe((s, prev) => {
+      const fixture = usePerformanceStore.getState().fixture;
+      if (!fixture) return;
+      const mode = s.tracks.get(fixture)?.sourceMode;
+      if (!mode) return;
+      const prevMode = prev.tracks.get(fixture)?.sourceMode;
+      if (mode === prevMode) return; // some other track / field changed
+      if (mode === lastSwappedMode.current) return; // server echo, already live
+      void run(fixture, true);
+    });
+
     // Seed lastSwappedTo with the current fixture so the initial population
-    // (catalog → default fixture write) doesn't trigger a no-op swap.
+    // (catalog → default fixture write) doesn't trigger a no-op swap, and
+    // seed lastSwappedMode so the first stem_assets echo is recognised.
     lastSwappedTo.current = usePerformanceStore.getState().fixture;
+    lastSwappedMode.current =
+      useCustomTracksStore
+        .getState()
+        .resolveSourceMode(lastSwappedTo.current) ?? null;
 
     return () => {
       cancelled = true;
       unsub();
+      unsubSource();
     };
   }, []);
 }

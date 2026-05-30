@@ -7,6 +7,7 @@ import { Knob } from "./Knob";
 import { RefControl } from "./RefControl";
 import { SeedKnob } from "./SeedKnob";
 import { defaultLabelFor, kbdHintFor } from "./SliderTile";
+import { SourceModeSwitch } from "./SourceModeSwitch";
 import { StemPanner } from "./StemPanner";
 import { TrackPicker } from "./TrackPicker";
 
@@ -73,14 +74,17 @@ function CoreStems() {
   const stemsReady = useCustomTracksStore((s) =>
     Boolean(fixture && s.tracks.get(fixture)?.stems),
   );
-  if (!sourceMode) return null;
+  if (!fixture || !sourceMode) return null;
+  // The source switch carries its own readout, so the status line only
+  // narrates the in-flight / failed / pre-play states.
+  const processing = stemStatus === "processing";
   const summary =
-    stemStatus === "processing"
-      ? "Ripping stems…"
+    processing
+      ? "Swapping inference source…"
       : stemStatus === "failed"
         ? stemError || "Stem rip failed"
         : stemsReady
-          ? `Inference source: ${sourceMode}`
+          ? "Inference source"
           : "Stems will load on play";
   return (
     <div className="core-stems">
@@ -88,6 +92,7 @@ function CoreStems() {
       <div className="core-stems-status" title={stemError || undefined}>
         {summary}
       </div>
+      <SourceModeSwitch fixture={fixture} current={sourceMode} busy={processing} />
       <div className="hero-stem-panners">
         <StemPanner kind="vocals" />
         <StemPanner kind="instruments" />
