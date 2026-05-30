@@ -2231,7 +2231,8 @@ body.drawer-open {
 /* Tiny square toggle pinned to the bottom of the edge handle. Switches
    the drawer between tabbed and spread (all-controls) layouts. Sits
    inside the 32px handle column so it reads as part of the handle, not
-   a floating chip. Only shown when the drawer is open. */
+   a floating chip. Always visible (even when closed) so the operator can
+   open directly into the expanded layout. */
 .install-sheet-spread-toggle {
   position: absolute;
   right: 5px;
