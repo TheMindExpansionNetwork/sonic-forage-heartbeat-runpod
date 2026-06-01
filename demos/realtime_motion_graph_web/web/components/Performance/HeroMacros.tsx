@@ -313,6 +313,7 @@ export function HeroMacros() {
           onClick={() => document.dispatchEvent(new Event("dd:toggle-drawer"))}
           aria-label={drawerOpen ? "Close Full Controls" : "Open Full Controls"}
           aria-expanded={drawerOpen}
+          data-midi-learn="drawer_toggle"
         >
           <span className="hero-macros-toggle-label">
             {drawerOpen ? "Simple Controls" : "Full Controls"}

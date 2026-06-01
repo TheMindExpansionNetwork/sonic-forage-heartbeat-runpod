@@ -12,7 +12,9 @@ export type NoteAction =
   | "mode_toggle"
   | "pause"
   | "kiosk_toggle"
-  | "schedule_curves_toggle";
+  | "schedule_curves_toggle"
+  | "drawer_toggle"
+  | "advanced_drawer_toggle";
 
 export interface MidiMap {
   /** CC number → param name (or LORA_SLOT_MARKER). Continuous controllers

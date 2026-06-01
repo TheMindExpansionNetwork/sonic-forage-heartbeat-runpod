@@ -57,6 +57,18 @@ function noteAction(action: NoteAction): void {
     case "schedule_curves_toggle":
       useCurveStore.getState().toggleOverlay();
       return;
+    case "drawer_toggle":
+      // Open/close the Full Controls drawer. AdvancedDrawer owns the
+      // open state and listens for this event (same path as the
+      // HeroMacros toggle button and the `o` keyboard shortcut).
+      document.dispatchEvent(new Event("dd:toggle-drawer"));
+      return;
+    case "advanced_drawer_toggle":
+      // Open straight into the expanded (all-controls) layout, or close
+      // if already open — same path as the spread-toggle button and the
+      // double-tap-Esc shortcut.
+      document.dispatchEvent(new Event("dd:expand-toggle-drawer"));
+      return;
   }
 }
 

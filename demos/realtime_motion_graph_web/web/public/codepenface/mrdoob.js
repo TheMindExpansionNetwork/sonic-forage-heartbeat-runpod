@@ -518,7 +518,26 @@ function onResize() {
 
 const timer = new THREE.Timer();
 
+// Per-frame size reconcile. The host animates this iframe's box over a
+// 320ms CSS transition when the drawer opens/closes, but the browser
+// coalesces the iframe's `resize` events, so the canvas backing store
+// lags and the compositor bitmap-scales the stale frame (the "blocky"
+// look). Tracking innerWidth/Height in the render loop keeps the canvas
+// matched to the box every frame, so the resize stays crisp and smooth.
+// The heavier wall rebuild stays on the coarse `resize` event below.
+let lastW = 0;
+let lastH = 0;
+
 function animate() {
+
+	if ( window.innerWidth !== lastW || window.innerHeight !== lastH ) {
+
+		lastW = window.innerWidth;
+		lastH = window.innerHeight;
+		renderer.setSize( lastW, lastH );
+		fitCameraToBox();
+
+	}
 
 	timer.update();
 	const dt = Math.min( timer.getDelta(), 1 / 30 );

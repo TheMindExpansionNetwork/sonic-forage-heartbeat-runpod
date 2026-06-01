@@ -195,6 +195,7 @@ export function AdvancedDrawer({ savedTab, unsavedDot }: Props = {}) {
         }
         aria-pressed={open && spread}
         title={!open ? "Expanded controls" : spread ? "Tabbed view" : "Spread view"}
+        data-midi-learn="advanced_drawer_toggle"
       >
         <svg
           viewBox="0 0 16 16"
