@@ -3,104 +3,150 @@
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
 
-// Orchestration for the prompt deck. The engine only knows two slots
-// (A/B) and a lerp between them. The deck is a many-slot UX layered on
-// top: at any moment one logical slot is "current" and lives in one of
-// the two engine slots; switching to another logical slot loads it into
-// the inactive engine slot and tweens prompt_blend toward it.
+// Orchestration for the prompt deck.
 //
-// State lives in usePerformanceStore: promptSlots / currentSlotId /
-// physicalSlot (0 = current in A, 1 = current in B). This module is
-// stateless — it reads/writes the store and pokes the WS.
+// THREE concepts kept deliberately separate:
+//
+//   focusedSlotId  → UI focus (textarea binding only; no engine effect
+//                    until that slot is also loaded as A or B).
+//   currentSlotId  → engine A endpoint. Only changes when the operator
+//                    explicitly picks via the crossfader's A label
+//                    popover.
+//   blendPartnerId → engine B endpoint. Only changes via the
+//                    crossfader's B label popover. Auto-backfilled on
+//                    deletes so the crossfader stays valid for 2+
+//                    slots.
+//
+// Decoupling focus from the engine endpoints is what stops the
+// crossfader's A/B labels from shifting under the operator every time
+// they tap a chip in the deck. Tap a chip → textarea updates. Slot
+// stays loaded where it was. To actually swap the playing prompt,
+// you click the A or B label on the crossfader.
 
-/**
- * Switch the active logical slot to `targetId`. No-op if `targetId` is
- * already current or doesn't exist. Side effects, in order:
- *   1. Load the target's text into the *inactive* engine slot
- *      (promptA if physicalSlot is currently 1; promptB if 0).
- *   2. sendPrompt(A, B) so the server re-encodes the new pair.
- *   3. setSlider("prompt_blend", target) — the smoothing tween animates
- *      the engine from the old logical slot to the new one. If the
- *      Smooth toggle is off, the move is instant.
- *   4. Commit physicalSlot + currentSlotId.
- */
-export function switchToPromptSlot(targetId: string): void {
-  const perf = usePerformanceStore.getState();
-  if (perf.currentSlotId === targetId) return;
-  const target = perf.promptSlots.find((s) => s.id === targetId);
-  if (!target) return;
-  const current = perf.promptSlots.find((s) => s.id === perf.currentSlotId);
-  if (!current) return;
-
-  const inactive: 0 | 1 = perf.physicalSlot === 0 ? 1 : 0;
-  if (inactive === 1) {
-    // Current sits in A; target loads into B.
-    perf.setPromptA(current.text);
-    perf.setPromptB(target.text);
-  } else {
-    // Current sits in B; target loads into A.
-    perf.setPromptA(target.text);
-    perf.setPromptB(current.text);
-  }
-
+function sendCurrent(): void {
   const remote = useSessionStore.getState().remote;
-  if (remote) {
-    const tagsA = inactive === 1 ? current.text : target.text;
-    const tagsB = inactive === 1 ? target.text : current.text;
-    remote.sendPrompt(tagsA, perf.activeKey, perf.activeTimeSignature, tagsB);
-  }
-
-  // Blend target == inactive engine slot. The smoothing tween (or
-  // instant jump, if Smooth is off) carries the engine from the old
-  // current to the new one. usePromptBlendSync throttles the wire
-  // sends.
-  perf.setSlider("prompt_blend", inactive);
-  perf.setCurrentSlot(targetId, inactive);
+  if (!remote) return;
+  const s = usePerformanceStore.getState();
+  remote.sendPrompt(
+    s.promptA,
+    s.activeKey,
+    s.activeTimeSignature,
+    s.blendPartnerId !== null ? s.promptB : undefined,
+  );
 }
 
 /**
- * Add a new slot and switch to it. Convenience wrapper used by the "+"
- * affordance in PromptsTile — adding without switching would leave the
- * new (empty) slot dangling in the deck. Returns the new slot id.
+ * Internal: keep blendPartnerId pointing at a valid non-current slot
+ * whenever there are 2+ slots; clear it (and promptB) when only 1
+ * remains. Called after every mutation that could invalidate the
+ * partner (add / remove / explicit re-point). Mutates store state in
+ * place — caller runs sendCurrent() afterward.
  */
-export function addAndSwitchToPromptSlot(label?: string): string {
+function ensureValidPartner(): void {
+  const s = usePerformanceStore.getState();
+  if (s.promptSlots.length < 2) {
+    if (s.blendPartnerId !== null) {
+      s.setBlendPartner(null);
+      s.setPromptB("");
+      s.setSlider("prompt_blend", 0);
+    }
+    return;
+  }
+  const partnerExists =
+    s.blendPartnerId !== null &&
+    s.promptSlots.some((slot) => slot.id === s.blendPartnerId);
+  const partnerIsCurrent = s.blendPartnerId === s.currentSlotId;
+  if (partnerExists && !partnerIsCurrent) return;
+  const pick = s.promptSlots.find((slot) => slot.id !== s.currentSlotId);
+  if (!pick) return;
+  s.setBlendPartner(pick.id);
+  s.setPromptB(pick.text);
+}
+
+/**
+ * Tap-on-chip handler. Pure UI focus shift — binds the textarea to
+ * the target slot. Does NOT touch engine A / B / blend. The operator
+ * is saying "I want to edit / read this slot," not "I want to hear
+ * it." To make the slot audible, they click the A or B label on the
+ * crossfader.
+ */
+export function focusPromptSlot(targetId: string): void {
+  const perf = usePerformanceStore.getState();
+  if (perf.focusedSlotId === targetId) return;
+  if (!perf.promptSlots.some((s) => s.id === targetId)) return;
+  perf.setFocusedSlot(targetId);
+}
+
+/**
+ * Load `targetId` into engine A — used by the crossfader's A-label
+ * popover. Updates promptA, re-sends, and also moves the textarea
+ * focus to the target so the operator can immediately edit what
+ * they just loaded. Does NOT touch prompt_blend; the operator's
+ * slider position (or MIDI knob) is preserved.
+ */
+export function setBlendEndpointA(targetId: string): void {
+  const perf = usePerformanceStore.getState();
+  if (targetId === perf.currentSlotId) return;
+  if (targetId === perf.blendPartnerId) return; // can't blend with self
+  const target = perf.promptSlots.find((s) => s.id === targetId);
+  if (!target) return;
+  perf.setPromptA(target.text);
+  perf.setCurrentSlot(targetId);
+  perf.setFocusedSlot(targetId);
+  ensureValidPartner();
+  sendCurrent();
+}
+
+/**
+ * Load `targetId` into engine B — used by the crossfader's B-label
+ * popover. Same shape as setBlendEndpointA but for the B side. Also
+ * moves textarea focus to the loaded slot.
+ */
+export function setBlendPartner(targetId: string): void {
+  const perf = usePerformanceStore.getState();
+  if (targetId === perf.blendPartnerId) return;
+  if (targetId === perf.currentSlotId) return;
+  const target = perf.promptSlots.find((s) => s.id === targetId);
+  if (!target) return;
+  perf.setBlendPartner(targetId);
+  perf.setPromptB(target.text);
+  perf.setFocusedSlot(targetId);
+  sendCurrent();
+}
+
+/**
+ * Add a new slot and focus it (for immediate rename). Does not load
+ * to A or B — the new slot is empty, so the operator authors it
+ * first and explicitly loads it when ready. Returns the new slot id.
+ */
+export function addAndFocusPromptSlot(label?: string): string {
   const id = usePerformanceStore.getState().addPromptSlot(label, "");
-  switchToPromptSlot(id);
+  ensureValidPartner();
+  focusPromptSlot(id);
   return id;
 }
 
 /**
- * Remove a slot. If it's the active one, the store's removePromptSlot
- * already advances currentSlotId to a neighbor; we then push the new
- * current slot's text to the engine so the wire matches. If the removed
- * slot was *only* the inactive engine partner, nothing on the wire
- * changes — the next switch loads a fresh partner anyway.
+ * Remove a slot. The store re-points currentSlotId / blendPartnerId /
+ * focusedSlotId if any pointed at the removed slot; this wrapper
+ * then re-loads promptA/promptB from the new endpoints, runs
+ * ensureValidPartner to backfill a partner when needed, and re-sends.
  */
 export function removePromptSlot(id: string): void {
   const before = usePerformanceStore.getState();
-  if (before.currentSlotId !== id) {
-    before.removePromptSlot(id);
-    return;
-  }
+  const wasCurrent = before.currentSlotId === id;
+  const wasPartner = before.blendPartnerId === id;
   before.removePromptSlot(id);
+
+  if (!wasCurrent && !wasPartner) return;
+
   const after = usePerformanceStore.getState();
-  const newCurrent = after.promptSlots.find((s) => s.id === after.currentSlotId);
-  if (!newCurrent) return;
-  // The removed slot was the active one; the store already chose a
-  // neighbor as currentSlotId but physicalSlot still points at the
-  // engine slot that held the deleted text. Re-load the new current
-  // into that slot and re-send so the engine reflects what the UI
-  // shows. Blend stays where it is — no transition.
-  if (after.physicalSlot === 0) after.setPromptA(newCurrent.text);
-  else after.setPromptB(newCurrent.text);
-  const remote = useSessionStore.getState().remote;
-  if (remote) {
-    const fresh = usePerformanceStore.getState();
-    remote.sendPrompt(
-      fresh.promptA,
-      fresh.activeKey,
-      fresh.activeTimeSignature,
-      fresh.promptB,
+  if (wasCurrent) {
+    const newCurrent = after.promptSlots.find(
+      (s) => s.id === after.currentSlotId,
     );
+    if (newCurrent) after.setPromptA(newCurrent.text);
   }
+  ensureValidPartner();
+  sendCurrent();
 }

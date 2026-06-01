@@ -353,17 +353,42 @@ interface PerformanceState {
    *  pipelines the same way every other knob does. */
   promptA: string;
   promptB: string;
-  /** Client-only prompt deck. The user sees a strip of named slots; only
-   *  two of them at any moment are loaded into the engine as A/B. The
-   *  active slot is identified by ``currentSlotId``; ``physicalSlot``
-   *  records which engine slot it's mounted in (0 = A, 1 = B). Switching
-   *  to another deck slot loads the target into the *other* engine slot
-   *  and tweens prompt_blend toward it (see ``lib/promptDeck.ts``). Not
-   *  persisted across reloads — saved sessions restore promptA/promptB
-   *  directly via the legacy path. */
+  /** Client-only prompt deck. The user sees a strip of named slots; the
+   *  engine still only has two prompt slots (A and B), so at any moment
+   *  two deck entries are loaded into the engine. Mapping:
+   *
+   *    - ``currentSlotId`` → engine A (the foreground / textarea-bound
+   *      slot). Editing the textarea writes here; tapping a chip in the
+   *      deck sets this and snaps ``prompt_blend`` to 0.
+   *    - ``blendPartnerId`` → engine B. ``null`` means no blending —
+   *      the deck behaves purely as a switcher. Set via the "Blend
+   *      with…" picker in PromptsTile; clearing it removes the
+   *      crossfader. Any non-current slot can be picked, so A→B, A→C,
+   *      B→C etc. are all expressible by re-picking A and/or B.
+   *
+   *  When ``blendPartnerId`` is non-null the engine's ``prompt_blend``
+   *  slider lerps between the two named slots, MIDI-learnable like any
+   *  other slider. Not persisted across reloads — saved sessions
+   *  restore promptA/promptB directly via the legacy path. */
   promptSlots: PromptSlot[];
+  /** Engine A endpoint (loaded into promptA). Changes only when the
+   *  operator explicitly picks a new A via the crossfader's A-label
+   *  popover — never on chip tap. Stable mid-performance. */
   currentSlotId: string;
-  physicalSlot: 0 | 1;
+  /** Engine B endpoint (loaded into promptB). Same stability rule —
+   *  changes via the B-label popover only. */
+  blendPartnerId: string | null;
+  /** UI-only: which slot the PromptsTile textarea is bound to. Tap a
+   *  chip in the deck to focus it; editing the textarea writes to
+   *  this slot's text. Focus is *decoupled* from A/B — if the focused
+   *  slot is also loaded as A or B, edits mirror to promptA/promptB
+   *  and the engine hears them. If the focused slot is neither A nor
+   *  B (you focused a chip just to rename or pre-author it), edits
+   *  stay in the slot and reach the engine only when you load that
+   *  slot into A or B. Separating these three concerns is what
+   *  prevents the crossfader's endpoints from shifting under the
+   *  operator every time they tap a chip. */
+  focusedSlotId: string;
   /** Currently active key (e.g. "G# minor"). May come from auto-detect. */
   activeKey: string;
   /** Currently active time-signature numerator as a wire string
@@ -518,16 +543,25 @@ interface PerformanceState {
   removePromptSlot: (id: string) => void;
   /** Rename a deck slot (label only — text is unaffected). */
   renamePromptSlot: (id: string, label: string) => void;
-  /** Update a slot's prompt text. If the slot is currently loaded in an
-   *  engine slot (A or B), the corresponding promptA/promptB is also
-   *  updated so the engine-bound mirror stays consistent. Does NOT
-   *  re-encode — the operator commits via Send Tags. */
+  /** Update a slot's prompt text. If the slot is loaded as the current
+   *  endpoint (engine A) or the blend partner (engine B), the matching
+   *  promptA/promptB mirror is also updated so the engine-bound state
+   *  stays consistent. Does NOT re-encode — the operator commits via
+   *  Send Tags. */
   setPromptSlotText: (id: string, text: string) => void;
-  /** Raw state write — record which deck slot is "current" and which
-   *  engine slot it occupies. Used by lib/promptDeck.ts after it has
-   *  loaded the new prompt into the inactive engine slot and animated
-   *  the blend; the slot-switch UI shouldn't call this directly. */
-  setCurrentSlot: (id: string, physicalSlot: 0 | 1) => void;
+  /** Raw state write — record which deck slot is "current" (engine A).
+   *  Used by lib/promptDeck.ts after it has loaded the new prompt
+   *  into engine A and snapped the blend. UI shouldn't call directly. */
+  setCurrentSlot: (id: string) => void;
+  /** Raw state write — record which deck slot is the blend partner
+   *  (engine B), or null when blending is off. Used by lib/promptDeck.ts
+   *  after it has loaded the new prompt into engine B (or cleared it).
+   *  UI shouldn't call directly. */
+  setBlendPartner: (id: string | null) => void;
+  /** Set which slot the PromptsTile textarea is bound to. Pure UI
+   *  state — does not touch the engine or re-send. Called on chip
+   *  tap in the deck. */
+  setFocusedSlot: (id: string) => void;
   setKey: (k: string) => void;
   setTimeSignature: (s: TimeSignature) => void;
   setFixture: (name: string) => void;
@@ -650,11 +684,16 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
   sliderTargets: { ...DEFAULT_SLIDER_VALUES },
   sliderDisplayOverride: {},
   seed: 0,
+  // Engine state starts with A = slot 0, B = slot 1. The crossfader
+  // in PromptsTile is always-on whenever there are 2+ slots — both
+  // endpoints clickable to re-point. Operator opts OUT of blending by
+  // never moving the slider off 0, not by hiding the affordance.
   promptA: DEFAULT_PROMPT_SLOTS[0].text,
   promptB: DEFAULT_PROMPT_SLOTS[1].text,
   promptSlots: DEFAULT_PROMPT_SLOTS.map((s) => ({ ...s })),
   currentSlotId: DEFAULT_PROMPT_SLOTS[0].id,
-  physicalSlot: 0,
+  blendPartnerId: DEFAULT_PROMPT_SLOTS[1].id,
+  focusedSlotId: DEFAULT_PROMPT_SLOTS[0].id,
   activeKey: "G# minor",
   activeTimeSignature: DEFAULT_TIME_SIGNATURE,
   fixture: "",
@@ -794,9 +833,24 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
       const idx = s.promptSlots.findIndex((slot) => slot.id === id);
       if (idx < 0) return {};
       const nextSlots = s.promptSlots.filter((slot) => slot.id !== id);
-      if (s.currentSlotId !== id) return { promptSlots: nextSlots };
-      const nextCurrent = nextSlots[Math.max(0, idx - 1)] ?? nextSlots[0];
-      return { promptSlots: nextSlots, currentSlotId: nextCurrent.id };
+      const patch: Partial<PerformanceState> = { promptSlots: nextSlots };
+      const neighbor = nextSlots[Math.max(0, idx - 1)] ?? nextSlots[0];
+      // If the removed slot was the current (A endpoint), pick the
+      // neighbor as the new current. lib/promptDeck.removePromptSlot
+      // re-sends both prompts after this so the engine catches up.
+      if (s.currentSlotId === id) {
+        patch.currentSlotId = neighbor.id;
+      }
+      // If the removed slot was the blend partner (B endpoint), clear
+      // the partner — lib/promptDeck.ensureValidPartner will backfill.
+      if (s.blendPartnerId === id) {
+        patch.blendPartnerId = null;
+      }
+      // Likewise re-point focus if the deleted slot was focused.
+      if (s.focusedSlotId === id) {
+        patch.focusedSlotId = neighbor.id;
+      }
+      return patch;
     }),
   renamePromptSlot: (id, label) =>
     set((s) => ({
@@ -811,13 +865,17 @@ export const usePerformanceStore = create<PerformanceState>((set) => ({
           slot.id === id ? { ...slot, text } : slot,
         ),
       };
-      if (id === s.currentSlotId) {
-        if (s.physicalSlot === 0) patch.promptA = text;
-        else patch.promptB = text;
-      }
+      // Mirror to whichever engine slot the deck slot is mapped onto.
+      // A slot can be both current AND partner (degenerate "blend
+      // with self") if the operator picks the same slot for both;
+      // in that case both promptA and promptB update.
+      if (id === s.currentSlotId) patch.promptA = text;
+      if (id === s.blendPartnerId) patch.promptB = text;
       return patch;
     }),
-  setCurrentSlot: (id, physicalSlot) => set({ currentSlotId: id, physicalSlot }),
+  setCurrentSlot: (id) => set({ currentSlotId: id }),
+  setBlendPartner: (id) => set({ blendPartnerId: id }),
+  setFocusedSlot: (id) => set({ focusedSlotId: id }),
   setKey: (k) => set({ activeKey: k }),
   setTimeSignature: (s) => set({ activeTimeSignature: s }),
   setFixture: (name) => set({ fixture: name }),

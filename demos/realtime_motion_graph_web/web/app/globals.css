@@ -4842,9 +4842,21 @@ body.curve-open #install-video-area #graph {
 .prompt-deck-slot:hover {
   border-color: var(--accent-line);
 }
-.prompt-deck-slot--active {
+/* "A" = loaded as engine A — strongest fill (the dominant performance
+   slot at blend=0). */
+.prompt-deck-slot--a {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+/* "B" = loaded as engine B — outlined, secondary. */
+.prompt-deck-slot--b {
+  border-color: var(--accent-line);
+}
+/* "Focused" = textarea binding — orthogonal to A/B. Can stack with
+   either or neither. Subtle ring so a chip that's already A/B picks
+   up an extra signal when it's also the editing target. */
+.prompt-deck-slot--focused {
+  box-shadow: 0 0 0 1px var(--accent) inset;
 }
 .prompt-deck-slot-label {
   background: transparent;
@@ -4857,13 +4869,24 @@ body.curve-open #install-video-area #graph {
   padding: 6px 10px;
   cursor: pointer;
   line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   -webkit-appearance: none;
           appearance: none;
   transition: color 140ms ease-out;
 }
 .prompt-deck-slot-label:hover { color: var(--text); }
-.prompt-deck-slot--active .prompt-deck-slot-label {
+.prompt-deck-slot--a .prompt-deck-slot-label {
   color: var(--accent);
+}
+.prompt-deck-slot--focused .prompt-deck-slot-label {
+  color: var(--text);
+}
+.prompt-deck-slot-focus-mark {
+  color: var(--accent);
+  font-size: 0.85em;
+  line-height: 1;
 }
 .prompt-deck-slot-remove {
   background: transparent;
@@ -4880,7 +4903,8 @@ body.curve-open #install-video-area #graph {
   transition: opacity 120ms ease-out, color 120ms ease-out, background 120ms ease-out;
 }
 .prompt-deck-slot:hover .prompt-deck-slot-remove,
-.prompt-deck-slot--active .prompt-deck-slot-remove {
+.prompt-deck-slot--a .prompt-deck-slot-remove,
+.prompt-deck-slot--b .prompt-deck-slot-remove {
   opacity: 0.6;
 }
 .prompt-deck-slot-remove:hover {
@@ -4920,6 +4944,204 @@ body.curve-open #install-video-area #graph {
   border-color: var(--accent-line);
   border-style: solid;
 }
+
+/* A and B badges on deck chips — show which slot is currently
+   loaded into engine A vs engine B. Both endpoints are popover-
+   pickable on the crossfader; the chip badges are a "where is X
+   loaded?" cue for the operator's library. */
+.prompt-deck-slot-endpoint-badge {
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: 8.5px;
+  letter-spacing: 0.04em;
+  border-radius: 999px;
+  line-height: 1.1;
+  vertical-align: 1px;
+}
+.prompt-deck-slot-endpoint-badge--a {
+  background: var(--accent);
+  color: var(--bg);
+}
+.prompt-deck-slot-endpoint-badge--b {
+  background: transparent;
+  border: 1px solid var(--accent-line);
+  color: var(--text);
+  padding: 0 4px;
+}
+
+/* Popover menu for picking the crossfader's B endpoint — anchored to
+   the B-endpoint button on the crossfader. Always-on crossfader means
+   there's no dedicated "Blend with…" button anymore; the B label IS
+   the picker. */
+.prompt-deck-blend-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 140px;
+  background: var(--bg);
+  border: 1px solid var(--frame-line);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.prompt-deck-blend-menu-item {
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.65em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 6px 10px;
+  line-height: 1.2;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  -webkit-appearance: none;
+          appearance: none;
+  transition: color 120ms ease-out, background 120ms ease-out;
+}
+.prompt-deck-blend-menu-item:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+.prompt-deck-blend-menu-item--selected {
+  color: var(--accent);
+}
+
+/* Crossfader bar — appears below the deck strip whenever a blend
+   partner is set. Two endpoint labels (A on left, B on right) with a
+   horizontal slider in between, value readout, and a ✕ to clear.
+   data-param="prompt_blend" so right-click → MIDI-learn works
+   identically to the legacy A/B slider. */
+.prompt-deck-crossfader {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-top: 4px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius-sm);
+}
+.prompt-deck-crossfader-end {
+  font-family: var(--font-mono);
+  font-size: 0.65em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text);
+  white-space: nowrap;
+  max-width: 10em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+/* Both endpoints are popover triggers — same shape, just color
+   accents differ (A is accent-tinted, B is neutral) so the user
+   can tell which side they're picking. */
+.prompt-deck-crossfader-end {
+  background: transparent;
+  border: none;
+  border-bottom: 1px dotted var(--frame-line);
+  padding: 2px 4px 1px;
+  cursor: pointer;
+  -webkit-appearance: none;
+          appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: color 120ms ease-out, border-color 120ms ease-out;
+}
+.prompt-deck-crossfader-end:hover,
+.prompt-deck-crossfader-end--open {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.prompt-deck-crossfader-end--a { color: var(--accent); }
+.prompt-deck-crossfader-end--b { color: var(--text); }
+.prompt-deck-crossfader-end-caret {
+  font-size: 0.85em;
+  line-height: 1;
+}
+.prompt-deck-crossfader-end-picker {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.prompt-deck-crossfader-end-picker .prompt-deck-blend-menu {
+  top: calc(100% + 4px);
+  left: 0;
+  right: auto;
+}
+/* A-side popover anchors right-edge so it doesn't push off-screen on
+   narrow drawer widths; B-side stays left-aligned. */
+.prompt-deck-crossfader-end-picker .prompt-deck-blend-menu--a {
+  left: 0;
+  right: auto;
+}
+.prompt-deck-crossfader-end-picker .prompt-deck-blend-menu--b {
+  left: auto;
+  right: 0;
+}
+.prompt-deck-crossfader-slider {
+  flex: 1 1 auto;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  background: linear-gradient(to right, var(--accent-line), var(--accent));
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+  accent-color: var(--accent);
+  min-width: 80px;
+}
+.prompt-deck-crossfader-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  background: var(--text-strong);
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.prompt-deck-crossfader-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  background: var(--text-strong);
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.prompt-deck-crossfader-value {
+  font-family: var(--font-mono);
+  font-size: 0.65em;
+  color: var(--accent);
+  min-width: 3em;
+  text-align: center;
+  flex-shrink: 0;
+}
+/* "B + ▲▼" hint — hold B, then ▲/▼ nudges prompt_blend by ±0.05
+   (±0.025 with shift). Shortcut is wired in useKeyboardShortcuts.ts;
+   this kbd is purely the visual hint. Hidden by the operator's
+   global "hide kbd hints" toggle via .mixer-rack--no-kbd-hints. */
+.prompt-deck-crossfader-kbd {
+  font-family: var(--font-mono);
+  font-size: 0.55em;
+  color: var(--text-dim);
+  padding: 2px 6px;
+  border: 1px solid var(--frame-line);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+  line-height: 1;
+}
+.mixer-rack--no-kbd-hints .prompt-deck-crossfader-kbd { display: none; }
 
 /* ============================================================================
    MIDI badge + diag — operator-only, lives in the operator strip at the
