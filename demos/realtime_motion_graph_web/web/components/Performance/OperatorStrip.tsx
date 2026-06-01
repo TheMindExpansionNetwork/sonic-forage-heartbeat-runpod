@@ -21,6 +21,7 @@ import { confirm } from "@/store/useConfirmStore";
 import { useLoraStore } from "@/store/useLoraStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
+import { useUiStore } from "@/store/useUiStore";
 import {
   TIME_SIGNATURE_LABELS,
   VALID_KEYSCALES,
@@ -59,6 +60,7 @@ export function OperatorStrip() {
   const smoothMs = usePerformanceStore((s) => s.smoothMs);
   const lufsOn = usePerformanceStore((s) => s.lufsOn);
   const loopOn = usePerformanceStore((s) => s.loopOn);
+  const graphDisplay = useUiStore((s) => s.graphDisplay);
   const setKey = usePerformanceStore((s) => s.setKey);
   const setTimeSignature = usePerformanceStore((s) => s.setTimeSignature);
   const toggleKiosk = usePerformanceStore((s) => s.toggleKiosk);
@@ -67,6 +69,7 @@ export function OperatorStrip() {
   const setSmoothMs = usePerformanceStore((s) => s.setSmoothMs);
   const toggleLufs = usePerformanceStore((s) => s.toggleLufs);
   const toggleLoop = usePerformanceStore((s) => s.toggleLoop);
+  const toggleGraphDisplay = useUiStore((s) => s.toggleGraphDisplay);
 
   const configFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -376,6 +379,15 @@ export function OperatorStrip() {
             onClick={toggleKiosk}
           >
             KIOSK
+          </button>
+          <button
+            type="button"
+            className={`pause-btn${graphDisplay === "face" ? " active" : ""}`}
+            data-dd-tooltip="Toggle graph display between automation lines and the WebGPU face view. The face view may ask for camera permission."
+            aria-pressed={graphDisplay === "face"}
+            onClick={toggleGraphDisplay}
+          >
+            VIEW: {graphDisplay === "face" ? "FACE" : "LINES"}
           </button>
         </div>
       </section>

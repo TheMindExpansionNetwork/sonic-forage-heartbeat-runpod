@@ -706,6 +706,44 @@ body[data-mode="graph"].drawer-open #install-stage {
    vertical feather (`--graph-feather-y`) still softens the top/bottom
    canvas edges. The `data-graph-layout` attribute is set by
    <GraphLaneLabels/>'s 20 Hz poll from the renderer's layoutMode. */
+.mrdoob-face-display {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  border: 0;
+  background:
+    radial-gradient(circle at 50% 45%, rgba(240, 138, 72, calc(0.08 + var(--bloom-amount, 0) * 0.14)), transparent 42%),
+    rgba(6, 6, 12, 0.74);
+  box-shadow:
+    inset 0 0 0 1px rgba(240, 138, 72, 0.2),
+    inset 0 0 calc(22px + var(--bloom-amount, 0) * 28px) rgba(61, 182, 190, 0.16),
+    0 0 calc(10px + var(--bloom-amount, 0) * 18px) rgba(240, 138, 72, 0.18);
+  z-index: 2;
+  -webkit-mask-image:
+    linear-gradient(to right, transparent 0, black clamp(18px, 4vw, 64px), black calc(100% - clamp(18px, 4vw, 64px)), transparent 100%),
+    linear-gradient(to bottom, transparent 0, black clamp(14px, 3vw, 46px), black calc(100% - clamp(14px, 3vw, 46px)), transparent 100%);
+          mask-image:
+    linear-gradient(to right, transparent 0, black clamp(18px, 4vw, 64px), black calc(100% - clamp(18px, 4vw, 64px)), transparent 100%),
+    linear-gradient(to bottom, transparent 0, black clamp(14px, 3vw, 46px), black calc(100% - clamp(14px, 3vw, 46px)), transparent 100%);
+  -webkit-mask-composite: source-in;
+          mask-composite: intersect;
+}
+#install-video-area #graph-wrap:has(.mrdoob-face-display) #graph,
+#install-video-area #graph-wrap:has(.mrdoob-face-display) .graph-lane-labels {
+  visibility: hidden;
+}
+/* The face view has no bloom-halo to clear (the lines graph does), so the
+   wrap's extra `--ribbon-bleed` allowance is just dead margin around the
+   head. Drop it for the face so the box fills a touch more of the stage —
+   most noticeable in the narrow spread-drawer remainder. */
+#install-video-area #graph-wrap:has(.mrdoob-face-display) {
+  inset: calc(var(--hud-thickness) * 2);
+}
+#install-video-area #graph-wrap:has(.mrdoob-face-display) .graph-pause-overlay {
+  pointer-events: none;
+}
 #install-video-area #graph-wrap[data-graph-layout="lanes"] #graph {
   --graph-feather-x: 0px;
 }
@@ -2111,8 +2149,15 @@ body[data-mode="graph"]::before {
 body.drawer-open {
   --drawer-l-open: var(--drawer-w);
 }
+/* Spread (all-controls) layout — the panel widens to the spread width
+   (matches `.install-sheet--spread` below), so the stage must shrink by
+   that same width to keep the graph/face display fully to its right. */
+body.drawer-open.drawer-spread {
+  --drawer-l-open: min(1400px, calc(100vw - 2 * (var(--hud-thickness) + 24px)));
+}
 @media (max-width: 768px) {
-  body.drawer-open {
+  body.drawer-open,
+  body.drawer-open.drawer-spread {
     --drawer-l-open: 0px;
   }
 }

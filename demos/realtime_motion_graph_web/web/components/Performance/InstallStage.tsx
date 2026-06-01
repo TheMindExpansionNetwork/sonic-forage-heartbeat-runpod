@@ -4,6 +4,7 @@ import { forwardRef } from "react";
 
 import { GraphLaneLabels } from "./GraphLaneLabels";
 import { GraphPauseOverlay } from "./GraphPauseOverlay";
+import { MrdoobFaceDisplay } from "./MrdoobFaceDisplay";
 import { ScheduleCurvesOverlay } from "./ScheduleCurvesOverlay";
 
 // Stage shell: ambient video back-layer, focal video pair (A/B crossfade),
@@ -60,6 +61,7 @@ export const InstallStage = forwardRef<HTMLDivElement, Props>(
           <div id="graph-wrap">
             <canvas ref={refs.graphCanvas} id="graph" />
             <GraphLaneLabels />
+            <MrdoobFaceDisplay />
             <GraphPauseOverlay />
             <ScheduleCurvesOverlay />
           </div>

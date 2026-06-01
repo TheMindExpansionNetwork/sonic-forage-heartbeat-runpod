@@ -119,12 +119,17 @@ export function AdvancedDrawer({ savedTab, unsavedDot }: Props = {}) {
 
   // Mirror desktop open state to body.drawer-open so other chrome
   // (graph stage shrink, hero bay style adjustments) can react.
+  // drawer-spread additionally signals the wide all-controls layout so
+  // the stage shrinks by the spread width (not just the narrow tabbed
+  // width), letting the graph/face display reframe to the panel.
   useEffect(() => {
     document.body.classList.toggle("drawer-open", open);
+    document.body.classList.toggle("drawer-spread", open && spread);
     return () => {
       document.body.classList.remove("drawer-open");
+      document.body.classList.remove("drawer-spread");
     };
-  }, [open]);
+  }, [open, spread]);
 
   // ─── Mobile branch ───────────────────────────────────────────────
   // Always-visible LiteControls strip + on-demand full sheet.
