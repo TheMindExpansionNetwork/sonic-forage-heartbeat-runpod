@@ -695,6 +695,20 @@ body[data-mode="graph"].drawer-open #install-stage {
   -webkit-mask-composite: source-in;
           mask-composite: intersect;
 }
+/* Lanes mode (Concept A) — kill the horizontal mask feather. The mask
+   above was tuned for polyline mode (old samples drift left and fade
+   out aggressively). In lanes mode the LEFT feather zone overlaps the
+   "track header" gutter (occluding labels + color tags) and the RIGHT
+   feather zone overlaps the playhead area (vanishing anchor dots + the
+   freshest portion of every contour). Setting `--graph-feather-x: 0`
+   collapses the transparent stops of the horizontal gradient onto
+   x = 0 / x = 100% — the mask becomes a no-op horizontally while the
+   vertical feather (`--graph-feather-y`) still softens the top/bottom
+   canvas edges. The `data-graph-layout` attribute is set by
+   <GraphLaneLabels/>'s 20 Hz poll from the renderer's layoutMode. */
+#install-video-area #graph-wrap[data-graph-layout="lanes"] #graph {
+  --graph-feather-x: 0px;
+}
 body:not([data-mode="graph"]) #install-video-area #graph-wrap { display: none; }
 /* Title-screen guard: before the user clicks Play, session is idle and
    the graph + playhead would draw through the start overlay. Hide the
@@ -752,7 +766,12 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
 }
 .graph-lane-label {
   position: absolute;
-  /* Anchor pill's vertical center at top:Ny, x just past the playhead. */
+  /* Anchor pill's vertical center at top:Ny.
+     Polylines mode: pill placed 8px to the right of the playhead at the
+       polyline's y intersection.
+     Lanes mode (Concept A): pill placed 8px from the canvas left edge
+       at the lane band's vertical center. Same transform works for
+       both — only the renderer-supplied left coordinate differs. */
   transform: translate(8px, -50%);
   padding: 1px 6px 2px;
   font-family: var(--font-mono);
@@ -770,6 +789,38 @@ body[data-mode="graph"] #install-video-area .focal-side-blur { display: none; }
      pill in jarringly. Position transitions are off — the pill needs
      to track its lane sample-for-sample, not lerp behind it. */
   animation: graph-lane-label-fade-in 200ms ease-out both;
+}
+/* Idle lane (no movement in the last LANE_IDLE_MS) — pill dims to
+   match the renderer's envelope dim factor (LANE_IDLE_ALPHA = 0.4).
+   Opacity transition is gentle enough that touching the slider fades
+   the pill back in without flicker. */
+.graph-lane-label--idle {
+  opacity: 0.4;
+  transition: opacity 200ms cubic-bezier(.2, .8, .2, 1);
+}
+/* Lanes-mode safety net for label overflow. The gutter is 168 px;
+   pills are inset 8 px from the canvas left and have ~12 px of
+   horizontal padding + border, so ~148 px of text room. Cap max-width
+   slightly tighter so very long labels (long LoRA names that the
+   lora_str_ prefix strip didn't fully fix) clip with an ellipsis
+   instead of bleeding past the gutter divider into the envelope. */
+.graph-lane-labels--lanes .graph-lane-label {
+  max-width: 144px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* "+N more" overflow chip — rendered below the stack when more lanes
+   qualify than MAX_LANES (10). Neutral palette: no param-color border
+   or text, because this isn't a lane, it's a continuation marker. The
+   render component intentionally omits inline color/borderColor for
+   this variant so these CSS rules win. */
+.graph-lane-label--more {
+  color: var(--text-dim);
+  border-color: var(--frame-line);
+  background: rgba(6, 6, 12, 0.78);
+  font-size: 9px;
+  /* Slightly tighter than lane labels — secondary information. */
+  letter-spacing: 0.25em;
 }
 @keyframes graph-lane-label-fade-in {
   from { opacity: 0; }
@@ -2180,7 +2231,8 @@ body.drawer-open {
 /* Tiny square toggle pinned to the bottom of the edge handle. Switches
    the drawer between tabbed and spread (all-controls) layouts. Sits
    inside the 32px handle column so it reads as part of the handle, not
-   a floating chip. Only shown when the drawer is open. */
+   a floating chip. Always visible (even when closed) so the operator can
+   open directly into the expanded layout. */
 .install-sheet-spread-toggle {
   position: absolute;
   right: 5px;
@@ -2904,6 +2956,126 @@ body.drawer-open .hud-help-readout {
 }
 .knob-dcw {
   margin-top: 4px;
+}
+
+/* CORE-tab stem layers — the same panners as the HeroMacros bay, stacked
+   under the reference-track pickers. Own wrapper class (not
+   .hero-macros-stems) so the `body.drawer-open .hero-macros-stems` hide
+   rule doesn't catch this copy: it must stay visible precisely when the
+   drawer is open. Reuses the .hero-stem-panner* widget styling. */
+.core-stems {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* Same frame-line section divider the MOD / CONFIG / Voice tabs use to
+     separate stacked control groups — sets the stems apart from the
+     reference-track pickers above. */
+  border-top: 1px solid var(--frame-line);
+  padding-top: 12px;
+}
+.core-stems-label {
+  font-family: var(--font-mono);
+  font-size: 0.55em;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.core-stems-status {
+  font-family: var(--font-mono);
+  font-size: 0.48em;
+  font-style: italic;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+/* Descendant selector (not the bare .core-stem-panners class) so this
+   wins over the later `.hero-stem-panners { width: 160px }` rule at equal
+   specificity. Wider than the bay's 160px so the longer track gives
+   finer control in the roomier drawer. */
+.core-stems .hero-stem-panners {
+  margin-top: 4px;
+  width: min(280px, 100%);
+}
+/* The bay right-aligns the stem name against the track to hug it; in the
+   drawer the section header + status are left-aligned, so left-align the
+   panner labels too — their left edge then lines up with the text above. */
+.core-stems .hero-stem-panner-label {
+  text-align: left;
+}
+
+/* Inference-source hotswap — a compact 3-cell segmented control (full /
+   instruments / vocals) sharing the drawer-tab recessed-active idiom but
+   shrunk to fit under the status line. Active cell carves in with the
+   teal stem accent so it ties to the stem-layers block it lives in;
+   while a swap is in flight every cell is disabled and the strip dims. */
+.source-mode-switch {
+  display: flex;
+  gap: 1px;
+  margin-top: 2px;
+  width: min(280px, 100%);
+}
+.source-mode-option {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 4px 2px;
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.04) 0%,
+    rgba(255, 255, 255, 0.01) 50%,
+    rgba(0, 0, 0, 0.15) 100%
+  );
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text-dim);
+  cursor: pointer;
+  -webkit-appearance: none;
+          appearance: none;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1;
+  transition:
+    color 140ms ease-out,
+    background 140ms ease-out,
+    box-shadow 140ms ease-out,
+    opacity 140ms ease-out;
+}
+.source-mode-option:hover:not(:disabled):not(.is-active) {
+  color: var(--text);
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.06) 0%,
+    rgba(255, 255, 255, 0.02) 50%,
+    rgba(0, 0, 0, 0.1) 100%
+  );
+}
+.source-mode-option.is-active {
+  color: var(--dd-1);
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.35) 0%,
+    rgba(0, 0, 0, 0.15) 50%,
+    rgba(255, 255, 255, 0.04) 100%
+  );
+  border-color: color-mix(in srgb, var(--dd-1) 35%, transparent);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+  cursor: default;
+}
+/* Mid-swap: non-active cells are disabled — dim them so the strip reads
+   as locked rather than merely unhovered. */
+.source-mode-option:disabled:not(.is-active) {
+  opacity: 0.4;
+  cursor: default;
+}
+.source-mode-option:focus-visible {
+  outline: 1px solid var(--dd-1);
+  outline-offset: 1px;
 }
 
 /* ── Knob component ────────────────────────────────────────────────
@@ -6635,6 +6807,19 @@ body.curve-open #install-video-area #graph {
 .audio-source-upload-btn {
   border-radius: 0;
 }
+/* Wrapper around the placard + upload-btn pair — the two ways to
+ * swap input audio. Serves as the positioning context for the
+ * UploadOnboardingHint so its arrow centers above the combined
+ * affordance area (not just one button). Mic stays outside this
+ * wrapper because it's a separate input mode, not a track-swap.
+ * Transparent to layout: inline-flex + align-items: stretch so the
+ * inner buttons still fill the dock body vertically. */
+.audio-source-track-controls {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+}
 .audio-source-mic-btn {
   border-radius: 0 var(--radius-md) var(--radius-md) 0;
 }
@@ -7085,6 +7270,101 @@ body.curve-open #install-video-area #graph {
   body.drawer-open .audio-source-dock,
   body.drawer-open .audio-source-fan {
     display: none !important;
+  }
+}
+
+/* ─── UploadOnboardingHint ────────────────────────────────────────────
+ *  Sequel to StrengthOnboardingHint — surfaces once the user has moved
+ *  Strength, pointing at the bottom-right Upload button (Issue #156).
+ *  Same vocabulary as the Strength hint: white italic caption + hand-
+ *  drawn arrow gif.
+ *
+ *  Positioning context: .audio-source-track-controls (a relative-
+ *  positioned span wrapping placard + upload). Anchoring above the
+ *  pair (not just upload-btn) matches the copy — "Select another
+ *  track or upload your own" covers both buttons, so the arrow head
+ *  lands at their seam rather than picking one and ignoring the
+ *  other.
+ *
+ *  Layout: hint sits ABOVE the placard/upload pair, horizontally
+ *  centered, with text on top and a downward-pointing arrow below
+ *  tapping at the seam. ``bottom: 100%`` rests the hint on the
+ *  pair's top edge; ``left: 50%`` + ``translate(-50%, -8px)``
+ *  centers + lifts. The arrow gif points right by default;
+ *  ``rotate: 90deg`` (CSS individual transform — doesn't conflict
+ *  with the animated ``transform: translate``) flips it to point
+ *  down.
+ *
+ *  Desktop only — the mobile Lite drawer already surfaces Upload
+ *  inline via LiteTrackCarousel; no need for a tutorial overlay.
+ *  Also hidden when the dock is collapsed-to-bubble: pointing at an
+ *  empty patch of screen reads as broken. (AudioSourceCrate folds
+ *  uploadHint.visible into dockActive so this case only fires if the
+ *  visibility flag races the collapse animation.) */
+.upload-onboarding-hint {
+  position: absolute;
+  /* Same z-index as the Strength hint — above knob/dock chrome but
+   * below the modal stack (.almost-ready-* at 100+). */
+  z-index: 6;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* Real gap so the arrow's resting position (top of its downward
+   * bob arc) never collides with the text. The bob translates the
+   * arrow DOWN only, so the closest text/arrow approach is at rest. */
+  gap: 4px;
+  bottom: 100%;
+  left: 50%;
+  transform: translate(-50%, -8px);
+  white-space: nowrap;
+  animation: upload-onboarding-hint-in 280ms ease-out;
+}
+@keyframes upload-onboarding-hint-in {
+  from { opacity: 0; transform: translate(-50%, -2px); }
+  to   { opacity: 1; transform: translate(-50%, -8px); }
+}
+@keyframes upload-onboarding-hint-bob {
+  0%, 100% { transform: translate(0, 0); }
+  /* Bob DOWN toward the button instead of sideways — the arrow is
+   * now vertical, so the tap-tap motion follows its axis. */
+  50%      { transform: translate(0, 3px); }
+}
+.upload-onboarding-hint-text {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.05em;
+  font-style: italic;
+  white-space: nowrap;
+  color: #fff;
+  text-shadow: 0 0 6px rgba(0, 0, 0, 0.55);
+  animation: upload-onboarding-hint-bob 2200ms ease-in-out infinite;
+}
+.upload-onboarding-hint-arrow {
+  flex: 0 0 auto;
+  width: 48px;
+  height: 48px;
+  /* Rotate the right-pointing arrow gif so the head points down at
+   * the Upload button below. ``rotate`` is the individual transform
+   * property, kept separate from the animated ``transform: translate``
+   * so the two compose without overriding each other. */
+  rotate: 90deg;
+  animation: upload-onboarding-hint-bob 2200ms ease-in-out infinite;
+  user-select: none;
+  pointer-events: none;
+}
+/* Hide on touch-only devices — mobile already surfaces Upload via the
+ * Lite drawer's track carousel and doesn't need a tutorial overlay. */
+@media (hover: none) and (pointer: coarse) {
+  .upload-onboarding-hint { display: none; }
+}
+/* Hide while the dock has collapsed to a bubble — see comment above. */
+.audio-source-dock[data-collapsed] .upload-onboarding-hint { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .upload-onboarding-hint,
+  .upload-onboarding-hint-text,
+  .upload-onboarding-hint-arrow {
+    animation: none;
   }
 }
 
@@ -8486,17 +8766,22 @@ body.curve-open #install-video-area #graph {
   cursor: progress;
 }
 .ref-control-menu {
-  /* Absolute so option content never feeds .mixer-tile's intrinsic
-     width. Opens upward — these controls live at the bottom of MainTile
-     so up keeps the menu from being clipped by anything below the
-     mixer rack. Min-width 100% so it's at least as wide as the closed
-     button; max-width caps growth so an extreme filename still fits
-     on screen, with internal scroll for very long lists. */
-  position: absolute;
-  bottom: calc(100% + 4px);
-  left: 0;
-  z-index: 9;
-  min-width: 100%;
+  /* Portaled to document.body and positioned `fixed` by RefSelect.tsx
+     (left / top|bottom / min-width / max-height come in as inline
+     styles computed from the button's getBoundingClientRect at open
+     time). The pickers live inside several nested scroll containers —
+     `.mixer-rack` (overflow-y:auto) in the tabbed drawer, the small
+     `.spread-section` grid cells, and the mobile sheet track — every
+     one of which would clip an in-flow `position:absolute` menu. A
+     body-level `fixed` element escapes all of them (no overflow or
+     transform ancestor between it and the viewport), so the list is
+     never cut off whichever way it opens. max-width caps growth so an
+     extreme filename still fits on screen, with internal scroll for
+     very long lists; max-height here is a fallback ceiling that the
+     inline computed value tightens to the available side. */
+  position: fixed;
+  z-index: 120;
+  min-width: 0;
   max-width: min(360px, 90vw);
   max-height: min(50vh, 320px);
   overflow-y: auto;

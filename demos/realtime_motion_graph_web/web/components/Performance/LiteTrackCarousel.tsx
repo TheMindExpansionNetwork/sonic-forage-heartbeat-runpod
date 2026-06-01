@@ -9,6 +9,8 @@ import {
   type DecodedFixture,
   type StemSourceMode,
 } from "@/engine/audio/loadFixture";
+import { useSeedUserUploads } from "@/hooks/useSeedUserUploads";
+import { commitUploadedTrack } from "@/lib/audio/commitUploadedTrack";
 import { trimAudioBuffer } from "@/lib/audio/trimAudioBuffer";
 import { useConfig } from "@/lib/config";
 import { LOCAL_MODE } from "@/lib/runtime";
@@ -73,6 +75,7 @@ export function LiteTrackCarousel() {
   const trimCapS =
     useConfig().engine.max_source_duration_s ?? DEFAULT_TRIM_CAP_S;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  useSeedUserUploads();
 
   // Daydream-webapp queue-admit gate: standalone DEMON has no queue
   // (LOCAL_MODE), so we skip the wait there.
@@ -130,29 +133,22 @@ export function LiteTrackCarousel() {
     setTrimming(null);
   }
 
-  function commitPending(
+  async function commitPending(
     keyOverride: string | null,
     timeSignatureOverride: TimeSignature | null,
     sourceMode: StemSourceMode,
   ) {
     if (!pending) return;
-    const { decoded, fileName, originalFile, trimStartS, trimEndS } = pending;
-    addCustomTrack(fileName, decoded, originalFile, sourceMode, {
-      originalFileName: originalFile.name,
-      trimStartS,
-      trimEndS,
+    await commitUploadedTrack({
+      pending,
+      keyOverride,
+      timeSignatureOverride,
+      sourceMode,
+      addCustomTrack,
+      setFixture,
+      setPending,
+      setUploading,
     });
-    const perf = usePerformanceStore.getState();
-    if (keyOverride) {
-      perf.setPendingKeyOverride(keyOverride);
-      perf.setKey(keyOverride);
-    }
-    if (timeSignatureOverride) {
-      perf.setPendingTimeSignatureOverride(timeSignatureOverride);
-      perf.setTimeSignature(timeSignatureOverride);
-    }
-    setFixture(fileName);
-    setPending(null);
   }
 
   const totalTracks = fixtures.length + customNames.length;

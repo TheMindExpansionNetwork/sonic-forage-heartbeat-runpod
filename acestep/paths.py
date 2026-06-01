@@ -8,6 +8,8 @@ Directory layout under MODELS_DIR:
     trt_engines/          TensorRT engines and ONNX exports
     loras/                LoRA .safetensors files (flat — id is filename stem)
     MelBandRoFormer/      Mel-Band RoFormer stem-separation checkpoint
+    fixtures/             Test fixtures and their precomputed sidecars
+    user_uploads/         User-uploaded audio and their precomputed sidecars
 
 Resolution order for MODELS_DIR:
     1. ACESTEP_MODELS_DIR environment variable
@@ -150,6 +152,16 @@ def melband_roformer_model_path(
 ) -> Path:
     """Full path to the Mel-Band RoFormer checkpoint file."""
     return melband_roformer_dir() / filename
+
+
+def fixtures_dir() -> Path:
+    """Directory containing test fixture audio and precomputed sidecars."""
+    return models_dir() / "fixtures"
+
+
+def user_uploads_dir() -> Path:
+    """Directory containing user-uploaded audio and precomputed sidecars."""
+    return models_dir() / "user_uploads"
 
 
 def discover_loras(directory: Path | None = None) -> list[Path]:
@@ -612,28 +624,44 @@ def available_dreamvae_decode_engine(duration_s: float) -> Path | None:
 
 
 # ------------------------------------------------------------------
-# Windowed VAE decode (single shared profile across both decoder
-# variants). The profile is small enough that it costs ~1.5 GB of
-# workspace at TRT context-creation time vs ~9 GB for the canonical
-# 240 s engine — see scripts/benchmarks/bench_vae_decode_profiles.py.
+# Windowed VAE decode — a FIXED 1-second engine (min == opt == max ==
+# 25 frames). Selected by the runtime whenever ``vae_window > 0``.
 #
-# Profile shape (in latent frames at 25 fps):
-#     min = 75   (3 s)
-#     opt = 125  (5 s)
-#     max = 750  (30 s)
+# Every streaming decode feeds this engine exactly 25 latent frames
+# (1.0 s): the kept "wire slice" is the middle ``vae_window`` seconds,
+# and the leftover frames on each side are the receptive-field margin
+# that StreamVAEDecode trims off. Because the profile is fixed, the
+# node ALWAYS hands it a 25-frame span and derives the margin from
+# ``25 - keep`` (see StreamVAEDecode) — the ``vae_overlap`` knob is
+# ignored in this mode so live demo controls can never feed an
+# out-of-profile shape.
 #
-# The ``StreamVAEDecode`` window+overlap chunks fit comfortably inside
-# this range for any user-facing window in [3, 30] seconds, which is
-# the range Session enforces when ``vae_window > 0``. The lower bound
-# matches the engine profile's ``min_frames=75`` (3 s at 25 fps); the
-# previous defensive clamp at 5.0 silently rounded smaller user-set
-# windows up to 5 s and inflated every wire slice by ~67 % for nothing.
+# Why fixed 1 s rather than a 0.32-30 s range:
+#   * Speed is identical at the 1 s operating point (~2.2 ms either way).
+#   * A ranged (…, max=750) engine reserves TRT activation workspace for
+#     its 30 s max — ~1.58 GB committed at context creation — even though
+#     it only ever decodes 1 s. The fixed engine reserves ~81 MB. That's
+#     ~1.5 GB of VRAM saved for zero speed cost. See
+#     scripts/benchmarks/bench_vae_decode_profiles.py.
+#
+# Margin sizing: 8 frames (0.32 s) of context each side already puts the
+# kept center below the fp16 decode noise; 10 frames (0.4 s) is bit-
+# identical to a full-context decode. With a 25-frame decode, a 9-frame
+# (0.36 s) keep leaves 8 frames of margin each side — safely converged.
+# See scripts/benchmarks/vae_window_convergence.py and the project memory
+# "VAE decoder receptive field".
+#
+# The profile is recorded in each engine's .metadata.json (PR #152), so
+# changing these frames invalidates the sidecar and forces a rebuild.
 # ------------------------------------------------------------------
 
-WINDOWED_VAE_DECODE_NAME = "vae_decode_fp16_3to30s"
-WINDOWED_DREAMVAE_DECODE_NAME = "dreamvae_decode_fp16_3to30s"
-WINDOWED_VAE_PROFILE_FRAMES: tuple[int, int, int] = (75, 125, 750)
-WINDOWED_VAE_WINDOW_RANGE_S: tuple[float, float] = (3.0, 30.0)
+WINDOWED_VAE_DECODE_NAME = "vae_decode_fp16_1s_fixed"
+WINDOWED_DREAMVAE_DECODE_NAME = "dreamvae_decode_fp16_1s_fixed"
+WINDOWED_VAE_PROFILE_FRAMES: tuple[int, int, int] = (25, 25, 25)
+# Keep ("wire slice") range in seconds. The decode is always 1 s; this
+# bounds how much of the middle we emit. Upper bound 0.36 s (9 frames)
+# keeps the per-side margin at >= 8 frames (0.32 s), the converged floor.
+WINDOWED_VAE_WINDOW_RANGE_S: tuple[float, float] = (0.04, 0.36)
 
 
 def windowed_vae_decode_engine_name(*, dreamvae: bool = False) -> str:

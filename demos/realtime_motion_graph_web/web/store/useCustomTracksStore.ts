@@ -8,6 +8,7 @@ import type {
   StemOverlayKind,
   StemSourceMode,
 } from "@/engine/audio/loadFixture";
+import { defaultSwapSourceMode } from "@/lib/config";
 
 // In-memory cache for active user-uploaded tracks. Local saved sessions mirror
 // the decoded PCM, original upload File, and MelFormer stems into IndexedDB;
@@ -38,7 +39,7 @@ export interface HydratedCustomTrack {
 }
 
 export interface CustomTrack {
-  decoded: DecodedFixture;
+  decoded?: DecodedFixture;
   /** Original encoded upload, when available from the file-picker path. */
   originalFile?: File;
   /** Stable key for the trimmed PCM stored in IndexedDB. */
@@ -60,7 +61,23 @@ export interface CustomTrack {
   skipStemExtraction?: boolean;
   stemStatus: StemStatus;
   stemError?: string;
+  /**
+   * True once the track's audio + sidecars + stems exist on the pod's
+   * disk (seeded from the server, or persisted by a successful
+   * uploadTrackToServer). Lets a swap to this track load by name on the
+   * server instead of re-uploading PCM and re-ripping stems. Tracks that
+   * only ever lived in browser memory (no-pod fallback, MCP mirror) stay
+   * false and keep the client-supplied-PCM swap path.
+   */
+  persisted: boolean;
 }
+
+type CustomTrackMetadata = Partial<
+  Pick<
+    CustomTrack,
+    "assetId" | "originalFileName" | "trimStartS" | "trimEndS" | "addedAt"
+  >
+>;
 
 interface CustomTracksState {
   /** Names in upload order. Reactive — components subscribe to this. */
@@ -73,13 +90,10 @@ interface CustomTracksState {
     decoded: DecodedFixture,
     file?: File,
     sourceMode?: StemSourceMode,
-    metadata?: Partial<
-      Pick<
-        CustomTrack,
-        "assetId" | "originalFileName" | "trimStartS" | "trimEndS" | "addedAt"
-      >
-    >,
+    metadataOrPersisted?: CustomTrackMetadata | boolean,
+    persisted?: boolean,
   ) => void;
+  addPersisted: (name: string, sourceMode?: StemSourceMode) => void;
   setStemStatus: (
     name: string,
     status: StemStatus,
@@ -93,6 +107,13 @@ interface CustomTracksState {
   exportMetadata: () => CustomTrackAssetMetadata[];
   hydrateSavedTracks: (tracks: HydratedCustomTrack[]) => void;
   has: (name: string) => boolean;
+  /**
+   * Is this track loadable by name on the server? True for built-in
+   * fixtures (everything the dropdown shows that isn't a custom track is
+   * a pod-resident fixture) and for persisted uploads. Drives the
+   * server-side swap fast path.
+   */
+  isServerResident: (name: string) => boolean;
 }
 
 function createAssetId(name: string): string {
@@ -112,8 +133,21 @@ export const useCustomTracksStore = create<CustomTracksState>((set, get) => ({
   names: [],
   tracks: new Map(),
 
-  add: (name, decoded, file, sourceMode = "full", metadata = {}) =>
+  add: (
+    name,
+    decoded,
+    file,
+    sourceMode = defaultSwapSourceMode(),
+    metadataOrPersisted = {},
+    persistedArg = false,
+  ) =>
     set((s) => {
+      const metadata =
+        typeof metadataOrPersisted === "boolean" ? {} : metadataOrPersisted;
+      const persisted =
+        typeof metadataOrPersisted === "boolean"
+          ? metadataOrPersisted
+          : persistedArg;
       const nextTracks = new Map(s.tracks);
       nextTracks.set(name, {
         decoded,
@@ -129,6 +163,25 @@ export const useCustomTracksStore = create<CustomTracksState>((set, get) => ({
         addedAt: metadata.addedAt ?? Date.now(),
         sourceMode,
         stemStatus: "idle",
+        persisted,
+      });
+      const nextNames = s.names.includes(name) ? s.names : [...s.names, name];
+      return {
+        names: nextNames,
+        tracks: nextTracks,
+      };
+    }),
+
+  addPersisted: (name, sourceMode = defaultSwapSourceMode()) =>
+    set((s) => {
+      if (s.tracks.has(name)) return {};
+      const nextTracks = new Map(s.tracks);
+      nextTracks.set(name, {
+        assetId: createAssetId(name),
+        addedAt: Date.now(),
+        sourceMode,
+        stemStatus: "idle",
+        persisted: true,
       });
       const nextNames = s.names.includes(name) ? s.names : [...s.names, name];
       return {
@@ -192,19 +245,30 @@ export const useCustomTracksStore = create<CustomTracksState>((set, get) => ({
   },
 
   exportMetadata: () => {
-    return Array.from(get().tracks.entries()).map(([name, track]) => ({
-      name,
-      assetId: track.assetId,
-      ...(track.stemAssetIds ? { stemAssetIds: track.stemAssetIds } : {}),
-      sourceMode: track.sourceMode,
-      ...(track.originalFileName ? { originalFileName: track.originalFileName } : {}),
-      ...(typeof track.trimStartS === "number" ? { trimStartS: track.trimStartS } : {}),
-      ...(typeof track.trimEndS === "number" ? { trimEndS: track.trimEndS } : {}),
-      frames: track.decoded.frames,
-      channels: track.decoded.channels,
-      sampleRate: track.decoded.sampleRate,
-      addedAt: track.addedAt,
-    }));
+    const out: CustomTrackAssetMetadata[] = [];
+    for (const [name, track] of get().tracks.entries()) {
+      if (!track.decoded) continue;
+      out.push({
+        name,
+        assetId: track.assetId,
+        ...(track.stemAssetIds ? { stemAssetIds: track.stemAssetIds } : {}),
+        sourceMode: track.sourceMode,
+        ...(track.originalFileName
+          ? { originalFileName: track.originalFileName }
+          : {}),
+        ...(typeof track.trimStartS === "number"
+          ? { trimStartS: track.trimStartS }
+          : {}),
+        ...(typeof track.trimEndS === "number"
+          ? { trimEndS: track.trimEndS }
+          : {}),
+        frames: track.decoded.frames,
+        channels: track.decoded.channels,
+        sampleRate: track.decoded.sampleRate,
+        addedAt: track.addedAt,
+      });
+    }
+    return out;
   },
 
   hydrateSavedTracks: (tracks) =>
@@ -231,6 +295,7 @@ export const useCustomTracksStore = create<CustomTracksState>((set, get) => ({
           ...(stems ? { stems } : {}),
           skipStemExtraction,
           stemStatus: stems ? "ready" : "idle",
+          persisted: false,
         });
         if (!nextNames.includes(metadata.name)) nextNames.push(metadata.name);
       }
@@ -241,4 +306,12 @@ export const useCustomTracksStore = create<CustomTracksState>((set, get) => ({
     }),
 
   has: (name) => get().tracks.has(name),
+
+  isServerResident: (name) => {
+    const track = get().tracks.get(name);
+    // Not a custom track → it's a built-in fixture, which always lives on
+    // the pod. A custom track is server-loadable only once persisted.
+    if (!track) return true;
+    return track.persisted;
+  },
 }));
