@@ -83,16 +83,20 @@ export function AlmostReadyDialog({
   const [keyChoice, setKeyChoice] = useState<string>(AUTO);
   const [tsChoice, setTsChoice] = useState<string>(AUTO);
   const primaryRef = useRef<HTMLButtonElement | null>(null);
+  const submittedRef = useRef(false);
 
   useEffect(() => setMounted(true), []);
 
   function finish() {
+    if (submittedRef.current) return;
+    submittedRef.current = true;
     onContinue({
       keyOverride: keyChoice === AUTO ? null : keyChoice,
       timeSignatureOverride:
         tsChoice !== AUTO && isTimeSignature(tsChoice) ? tsChoice : null,
       sourceMode,
     });
+    onClose();
   }
 
   // Esc closes; Enter advances (step 1 → next, step 2 → start) unless
