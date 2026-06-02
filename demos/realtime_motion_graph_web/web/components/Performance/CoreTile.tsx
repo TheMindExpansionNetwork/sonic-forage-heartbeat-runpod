@@ -4,12 +4,10 @@ import { useCustomTracksStore } from "@/store/useCustomTracksStore";
 import { usePerformanceStore } from "@/store/usePerformanceStore";
 
 import { Knob } from "./Knob";
-import { RefControl } from "./RefControl";
 import { SeedKnob } from "./SeedKnob";
 import { defaultLabelFor, kbdHintFor } from "./SliderTile";
 import { SourceModeSwitch } from "./SourceModeSwitch";
 import { StemPanner } from "./StemPanner";
-import { TrackPicker } from "./TrackPicker";
 
 // CORE tab — dial-it-and-go macros every musician knows, drawn as
 // rotary knobs (matches the inShaper / GrainDust visual vocabulary for
@@ -45,11 +43,6 @@ export function CoreTile() {
           kbd={kbdHintFor("timbre_strength")}
         />
         <SeedKnob />
-      </div>
-      <div className="knob-ref-row">
-        <TrackPicker />
-        <RefControl kind="timbre" />
-        <RefControl kind="structure" />
       </div>
       <CoreStems />
     </div>

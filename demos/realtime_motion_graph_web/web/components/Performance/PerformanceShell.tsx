@@ -18,6 +18,7 @@ import { usePromptBlendSync } from "@/hooks/usePromptBlendSync";
 import { useRecording } from "@/hooks/useRecording";
 import { useRenderLoop } from "@/hooks/useRenderLoop";
 import { useScheduledCurves } from "@/hooks/useScheduledCurves";
+import { useSeedDecks } from "@/hooks/useSeedDecks";
 import { useRefSourceAcks } from "@/hooks/useRefSourceAcks";
 import { useStartSession } from "@/hooks/useStartSession";
 import { useStemOverlaySync } from "@/hooks/useStemOverlaySync";
@@ -29,7 +30,6 @@ import { usePerformanceStore } from "@/store/usePerformanceStore";
 import { useSessionStore } from "@/store/useSessionStore";
 
 import { AdvancedDrawer } from "./AdvancedDrawer";
-import { AudioSourceCrate } from "./AudioSourceCrate";
 import { ConfigModal } from "./ConfigModal";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { DemonBrandMark } from "./DemonBrandMark";
@@ -73,6 +73,7 @@ export function PerformanceShell() {
   useMidi();
   useKeyboardShortcuts();
   useRecording();
+  useSeedDecks();
   useFixtureSwap();
   useEdgeLoraBinding();
   useTimbreSync();
@@ -110,7 +111,6 @@ export function PerformanceShell() {
   return (
     <>
     <div id="performance" className="screen">
-      {status === "ready" && <AudioSourceCrate />}
       {/* Permanent 3-knob row above the drawer handle — performance
           palette (DENOISE / STRUCTURE / FEEDBACK / SEED). The component
           handles its own visibility internally; mount it unconditionally

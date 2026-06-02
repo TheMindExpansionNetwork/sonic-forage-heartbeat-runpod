@@ -9,6 +9,7 @@ import { useSessionStore } from "@/store/useSessionStore";
 
 import { CollapsibleTile } from "./CollapsibleTile";
 import { CoreTile } from "./CoreTile";
+import { DecksPanel } from "./DecksPanel";
 import { DrawerHelpBar } from "./DrawerHelpBar";
 import { DrawerTabs, useDrawerTab, type DrawerTab } from "./DrawerTabs";
 import { LibraryTile } from "./LibraryTile";
@@ -236,6 +237,7 @@ export function AdvancedDrawer({ savedTab, unsavedDot }: Props = {}) {
 // two columns (14 channel faders don't fit in a 1/3 column).
 const SPREAD_SECTIONS: Array<{ id: DrawerTab; label: string }> = [
   { id: "core", label: "Core" },
+  { id: "decks", label: "Decks" },
   { id: "styles", label: "Styles" },
   { id: "mod", label: "Mod" },
   { id: "voice", label: "Channels" },
@@ -259,6 +261,8 @@ function renderTabBody(tab: DrawerTab, savedTab?: ReactNode, spread = false) {
   switch (tab) {
     case "core":
       return <CoreTile />;
+    case "decks":
+      return <DecksPanel />;
     case "mod":
       return <ModTile />;
     case "voice":
