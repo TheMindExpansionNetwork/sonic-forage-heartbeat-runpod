@@ -463,6 +463,9 @@ class StreamingSession:
             walk_window=self.walk_window,
             walk_window_s=self.walk_window_s,
             neg_conditioning=self.cond_negative,
+            lead_floor_s=self.config.lead_floor_s,
+            lead_ceiling_s=self.config.lead_ceiling_s,
+            lead_release_tau_s=self.config.lead_release_tau_s,
         )
         self.runner_holder[0] = runner
 

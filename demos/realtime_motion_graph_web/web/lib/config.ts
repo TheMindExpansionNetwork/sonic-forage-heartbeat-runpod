@@ -53,6 +53,19 @@ export interface RtmgConfigEngine {
    * parameter-update latency. Backend ignores when source ≤ window. */
   walk_window?: boolean;
   walk_window_s?: number;
+  /** Playback-lead tuning (server-side PipelineRunner). The lead is the
+   *  adaptive audio buffer placed ahead of the live playhead; these bound
+   *  how far it self-sizes. Raise the floor for more robustness to GPU
+   *  contention (screen capture, a co-resident visualizer, a second
+   *  process) at the cost of latency; the ceiling caps how far contention
+   *  can inflate it; the release tau sets how fast a contention spike
+   *  decays back out. Defaults are the "midway" profile. The server clamps
+   *  ``lead_release_tau_s`` up to ``lead_ceiling_s`` if a config sets it
+   *  lower (monotonic-decode invariant). Omit any field to use the
+   *  server-side default. */
+  lead_floor_s?: number;
+  lead_ceiling_s?: number;
+  lead_release_tau_s?: number;
   key: string;
   /** Default meter numerator the operator dropdown starts on. Mirrors
    * `key` in posture: the server's session-init resolver still wins on
@@ -315,6 +328,9 @@ export const DEFAULT_CONFIG: RtmgConfig = {
     fast_vae: false,
     walk_window: false,
     walk_window_s: 60,
+    lead_floor_s: 0.25,
+    lead_ceiling_s: 1.35,
+    lead_release_tau_s: 1.5,
     max_source_duration_s: 120,
     key: "G# minor",
     time_signature: DEFAULT_TIME_SIGNATURE,
