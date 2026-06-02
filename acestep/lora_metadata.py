@@ -41,7 +41,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .paths import lora_trigger
+from .paths import lora_sidecar, lora_trigger
 
 logger = logging.getLogger(__name__)
 
@@ -152,11 +152,11 @@ def load_lora_metadata(lora_path: Path | str) -> LoraMetadata:
 def _metadata_sidecar(lora_path: Path) -> Path:
     """Resolve ``foo/bar.safetensors`` → ``foo/bar.metadata.json``.
 
-    Uses the same ``with_suffix("").with_suffix(...)`` trick as
-    :func:`acestep.paths.lora_trigger` so stems with dots in them
-    (e.g. ``my.cool.lora.safetensors``) resolve consistently.
+    Delegates to :func:`acestep.paths.lora_sidecar` so stems with dots in
+    them (e.g. ``alt_pop50-acestep1.5-dora-v2.safetensors``) resolve to
+    the right sibling instead of being truncated at the internal dot.
     """
-    return lora_path.with_suffix("").with_suffix(".metadata.json")
+    return lora_sidecar(lora_path, ".metadata.json")
 
 
 def _from_schema(raw: dict[str, Any], stem: str) -> LoraMetadata:

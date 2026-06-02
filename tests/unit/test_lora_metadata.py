@@ -120,6 +120,27 @@ def test_bare_safetensors(tmp_path):
     assert md.trigger_words == []
 
 
+def test_dotted_stem_resolves_sidecar(tmp_path):
+    """A filename with a dot in the stem (e.g. a version like
+    ``acestep1.5``) must still resolve its sibling sidecar. The old
+    ``with_suffix("").with_suffix(...)`` trick truncated at the internal
+    dot and silently dropped the metadata, so the UI showed the raw stem
+    instead of the display name."""
+    stem = "alt_pop50-acestep1.5-dora-v2"
+    weights = _weights(tmp_path, stem=stem)
+    (tmp_path / f"{stem}.metadata.json").write_text(
+        json.dumps(_full_metadata(stem)), encoding="utf-8"
+    )
+    (tmp_path / f"{stem}.trigger.txt").write_text("ignored", encoding="utf-8")
+
+    md = load_lora_metadata(weights)
+
+    assert md.has_metadata is True
+    assert md.id == stem
+    assert md.name == "Industrial"  # came from the sidecar, not the stem
+    assert md.primary_trigger_word == "roti-1ndstrl"
+
+
 def test_malformed_json_falls_back_to_trigger_txt(tmp_path, caplog):
     weights = _weights(tmp_path, stem="broken")
     (tmp_path / "broken.metadata.json").write_text("{not valid json", encoding="utf-8")

@@ -204,6 +204,26 @@ def discover_all_loras() -> list[Path]:
     return out
 
 
+def lora_sidecar(lora_path: Path | str, suffix: str) -> Path:
+    """Resolve a LoRA weight file to a sibling sidecar with ``suffix``.
+
+    ``…/loras/bptkno.safetensors`` + ``.metadata.json`` →
+    ``…/loras/bptkno.metadata.json``.
+
+    The naive ``with_suffix("").with_suffix(suffix)`` trick is wrong: it
+    strips a *second* suffix, so any dot inside the stem corrupts the
+    result (``acestep1.5-dora-v2.safetensors`` → ``acestep1.metadata.json``
+    instead of ``acestep1.5-dora-v2.metadata.json``). ``Path.stem`` strips
+    only the final extension, which is exactly the one real weight suffix,
+    so it handles arbitrary dotted stems.
+
+    ``suffix`` is appended verbatim and should include its leading dot
+    (e.g. ``".metadata.json"``, ``".trigger.txt"``).
+    """
+    p = Path(lora_path)
+    return p.with_name(p.stem + suffix)
+
+
 def lora_trigger(lora_path: Path | str) -> str:
     """Read the optional trigger-word sidecar for a LoRA.
 
@@ -226,11 +246,7 @@ def lora_trigger(lora_path: Path | str) -> str:
     escape; this is read every catalog broadcast and shouldn't crash
     the WS loop on a malformed sidecar.
     """
-    p = Path(lora_path)
-    # Strip the .safetensors suffix to land on the stem, then add .trigger.txt
-    # so we resolve siblings like:
-    #   /…/loras/bptkno.safetensors        → /…/loras/bptkno.trigger.txt
-    sidecar = p.with_suffix("").with_suffix(".trigger.txt")
+    sidecar = lora_sidecar(lora_path, ".trigger.txt")
     try:
         return sidecar.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
