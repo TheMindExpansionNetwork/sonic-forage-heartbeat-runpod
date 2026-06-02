@@ -17,6 +17,7 @@ export interface DeckMixInput {
   maxDurationS: number;
   nowMs?: number;
   normalizePeak?: number;
+  requirePlaying?: boolean;
 }
 
 export interface DeckMixResult {
@@ -40,17 +41,16 @@ function poolAlign(frames: number): number {
 
 function crossfadeGain(deck: DeckSlot, crossfade: number): number {
   const x = clamp01(crossfade);
-  return deck.crossfadeSide === "left"
-    ? Math.cos(x * Math.PI * 0.5)
-    : Math.sin(x * Math.PI * 0.5);
+  return deck.crossfadeSide === "left" ? 1 - x : x;
 }
 
 export function effectiveDeckGain(
   deck: DeckSlot,
   crossfade: number,
   anySolo: boolean,
+  requirePlaying = true,
 ): number {
-  if (!deck.playing || !deck.trackName || deck.muted) return 0;
+  if ((requirePlaying && !deck.playing) || !deck.trackName || deck.muted) return 0;
   if (anySolo && !deck.solo) return 0;
   return clamp01(deck.volume) * crossfadeGain(deck, crossfade);
 }
@@ -82,7 +82,12 @@ export function renderDeckMix(input: DeckMixInput): DeckMixResult | null {
     .map((deck) => {
       const assets = input.assets[deck.id];
       const source = deckAssetSource(assets, deck.sourcePart);
-      const gain = effectiveDeckGain(deck, input.crossfade, anySolo);
+      const gain = effectiveDeckGain(
+        deck,
+        input.crossfade,
+        anySolo,
+        input.requirePlaying ?? false,
+      );
       return source && gain > 0 ? { deck, source, gain } : null;
     })
     .filter((v): v is { deck: DeckSlot; source: DecodedFixture; gain: number } =>

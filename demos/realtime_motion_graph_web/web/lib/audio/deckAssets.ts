@@ -90,7 +90,10 @@ async function loadDeckTrackAssetsUncached(name: string): Promise<DeckTrackAsset
 export function loadDeckTrackAssets(name: string): Promise<DeckTrackAssets> {
   const cached = assetCache.get(name);
   if (cached) return cached;
-  const promise = loadDeckTrackAssetsUncached(name);
+  const promise = loadDeckTrackAssetsUncached(name).catch((error) => {
+    assetCache.delete(name);
+    throw error;
+  });
   assetCache.set(name, promise);
   return promise;
 }

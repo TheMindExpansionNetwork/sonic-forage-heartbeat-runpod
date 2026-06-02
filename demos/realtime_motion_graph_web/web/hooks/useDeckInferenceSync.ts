@@ -36,14 +36,19 @@ export function useDeckInferenceSync({
   const maxDurationS = useConfig().engine.max_source_duration_s ?? 120;
   const inFlightRef = useRef(false);
   const queuedRef = useRef(false);
+  const latestRef = useRef({ decks, assetsByDeck, crossfade, maxDurationS });
+
+  useEffect(() => {
+    latestRef.current = { decks, assetsByDeck, crossfade, maxDurationS };
+  }, [assetsByDeck, crossfade, decks, maxDurationS]);
 
   useEffect(() => {
     if (!enabled) return;
-    const hasPlayableDeck = DECK_IDS.some((id) => {
+    const hasLoadedDeck = DECK_IDS.some((id) => {
       const deck = decks[id];
-      return deck.trackName && deck.playing && assetsByDeck[id];
+      return deck.trackName && !deck.muted && assetsByDeck[id];
     });
-    if (!hasPlayableDeck) return;
+    if (!hasLoadedDeck) return;
 
     const timer = window.setTimeout(() => {
       const run = async () => {
@@ -55,11 +60,13 @@ export function useDeckInferenceSync({
           queuedRef.current = true;
           return;
         }
+        const latest = latestRef.current;
         const mix = renderDeckMix({
-          decks,
-          assets: assetsByDeck,
-          crossfade,
-          maxDurationS,
+          decks: latest.decks,
+          assets: latest.assetsByDeck,
+          crossfade: latest.crossfade,
+          maxDurationS: latest.maxDurationS,
+          requirePlaying: false,
         });
         if (!mix) return;
 
@@ -131,7 +138,8 @@ export function useDeckInferenceSync({
         if (queuedRef.current) {
           queuedRef.current = false;
           // Schedule one follow-up after an in-flight swap settles; the
-          // dependency-driven effect will cover further edits.
+          // follow-up reads latestRef so it does not replay the stale
+          // deck/crossfade snapshot that originally started the swap.
           window.setTimeout(run, DECK_SWAP_DEBOUNCE_MS);
         }
       };

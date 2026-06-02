@@ -10,8 +10,6 @@ import {
   type StemSourceMode,
 } from "@/engine/audio/loadFixture";
 import { useDeckAssets } from "@/hooks/useDeckAssets";
-import { useDeckInferenceSync } from "@/hooks/useDeckInferenceSync";
-import { useDeckMonitor } from "@/hooks/useDeckMonitor";
 import { useSeedUserUploads } from "@/hooks/useSeedUserUploads";
 import { commitUploadedTrack } from "@/lib/audio/commitUploadedTrack";
 import { deckAssetSource } from "@/lib/audio/deckAssets";
@@ -35,17 +33,16 @@ import { WaveformTrimDialog } from "./WaveformTrimDialog";
 
 const DEFAULT_TRIM_CAP_S = 120;
 const SOURCE_PARTS: StemSourceMode[] = ["full", "vocals", "instruments"];
+type UploadTarget = DeckId | "new";
 
 export function DecksPanel() {
   const decks = useDeckStore((s) => s.decks);
   const deckIds = useDeckStore((s) => s.deckIds);
-  const inputDeckId = useDeckStore((s) => s.inputDeckId);
   const timbreDeckId = useDeckStore((s) => s.timbreDeckId);
   const structureDeckId = useDeckStore((s) => s.structureDeckId);
   const crossfade = useDeckStore((s) => s.crossfade);
   const monitorEnabled = useDeckStore((s) => s.monitorEnabled);
   const inferenceEnabled = useDeckStore((s) => s.inferenceEnabled);
-  const revision = useDeckStore((s) => s.mixRevision);
   const sessionWsUrl = useSessionStore((s) => s.wsUrl);
   const activeFixture = usePerformanceStore((s) => s.fixture);
   const timbreName = usePerformanceStore((s) => s.timbreName);
@@ -57,30 +54,23 @@ export function DecksPanel() {
   const trimCapS =
     useConfig().engine.max_source_duration_s ?? DEFAULT_TRIM_CAP_S;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const uploadDeckRef = useRef<DeckId>("A");
-  const [uploadingDeckId, setUploadingDeckId] = useState<DeckId | null>(null);
+  const uploadTargetRef = useRef<UploadTarget>("A");
+  const [uploadingTarget, setUploadingTarget] = useState<UploadTarget | null>(null);
+  const [addDeckOpen, setAddDeckOpen] = useState(false);
   const [trimming, setTrimming] = useState<{
-    deckId: DeckId;
+    target: UploadTarget;
     decoded: DecodedFixture;
     fileName: string;
     originalFile: File;
   } | null>(null);
   const [pending, setPending] = useState<{
-    deckId: DeckId;
+    target: UploadTarget;
     decoded: DecodedFixture;
     fileName: string;
     originalFile: File;
   } | null>(null);
 
   useSeedUserUploads();
-  useDeckMonitor({ decks, assetsByDeck, crossfade, enabled: monitorEnabled });
-  useDeckInferenceSync({
-    decks,
-    assetsByDeck,
-    crossfade,
-    enabled: inferenceEnabled,
-    revision,
-  });
 
   useEffect(() => {
     if (!sessionWsUrl && !LOCAL_MODE) return;
@@ -103,9 +93,9 @@ export function DecksPanel() {
     }
   }, [activeFixture, customNames, fixtures]);
 
-  async function onFilePicked(deckId: DeckId, file: File) {
+  async function onFilePicked(target: UploadTarget, file: File) {
     const { setStatus } = useSessionStore.getState();
-    setUploadingDeckId(deckId);
+    setUploadingTarget(target);
     setStatus(useSessionStore.getState().status, "");
     try {
       const decoded = await decodeAudioFile(file);
@@ -115,13 +105,16 @@ export function DecksPanel() {
       while (useCustomTracksStore.getState().has(chosen)) {
         chosen = `${baseName} (${i++})`;
       }
-      setTrimming({ deckId, decoded, fileName: chosen, originalFile: file });
+      setTrimming({ target, decoded, fileName: chosen, originalFile: file });
       setStatus(useSessionStore.getState().status, "");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      setStatus(useSessionStore.getState().status, `Deck ${deckId}: ${msg}`);
+      setStatus(
+        useSessionStore.getState().status,
+        target === "new" ? `New deck: ${msg}` : `Deck ${target}: ${msg}`,
+      );
     } finally {
-      setUploadingDeckId(null);
+      setUploadingTarget(null);
     }
   }
 
@@ -129,7 +122,7 @@ export function DecksPanel() {
     if (!trimming) return;
     const trimmed = trimAudioBuffer(trimming.decoded, startS, endS);
     setPending({
-      deckId: trimming.deckId,
+      target: trimming.target,
       decoded: trimmed,
       fileName: trimming.fileName,
       originalFile: trimming.originalFile,
@@ -149,11 +142,17 @@ export function DecksPanel() {
       timeSignatureOverride,
       sourceMode,
       addCustomTrack,
-      setFixture: (name) =>
-        useDeckStore.getState().setTrack(pending.deckId, name),
+      setFixture: (name) => {
+        if (pending.target === "new") {
+          const added = useDeckStore.getState().addDeck(name);
+          if (added) setAddDeckOpen(false);
+          return;
+        }
+        setDeckTrack(pending.target, name);
+      },
       setPending: (next) =>
-        setPending(next ? { ...next, deckId: pending.deckId } : null),
-      setUploading: (next) => setUploadingDeckId(next ? pending.deckId : null),
+        setPending(next ? { ...next, target: pending.target } : null),
+      setUploading: (next) => setUploadingTarget(next ? pending.target : null),
     });
   }
 
@@ -164,7 +163,10 @@ export function DecksPanel() {
 
   function deckDurationLabel(id: DeckId): string {
     const assets = assetsByDeck[id];
-    if (!assets) return "asset pending";
+    const name = decks[id].trackName;
+    if (name && statuses[name] === "loading") return "loading assets";
+    if (name && statuses[name] === "failed") return "asset failed";
+    if (!assets) return "waiting for assets";
     const seconds = assets.full.frames / assets.full.sampleRate;
     const mins = Math.floor(seconds / 60);
     const secs = Math.round(seconds - mins * 60).toString().padStart(2, "0");
@@ -172,9 +174,8 @@ export function DecksPanel() {
     return `${mins}:${secs} · ${stemCount}/2 stems`;
   }
 
-  function roleSummary(input: boolean, timbre: boolean, structure: boolean): string {
+  function roleSummary(timbre: boolean, structure: boolean): string {
     const roles = [
-      input ? "input" : null,
       timbre ? "timbre" : null,
       structure ? "structure" : null,
     ].filter(Boolean);
@@ -183,16 +184,11 @@ export function DecksPanel() {
 
   function setDeckTrack(id: DeckId, name: string): void {
     useDeckStore.getState().setTrack(id, name);
-    if (useDeckStore.getState().inputDeckId === id) {
-      usePerformanceStore.getState().setFixture(name);
-    }
   }
 
-  function assignInputDeck(id: DeckId): void {
-    const name = useDeckStore.getState().decks[id].trackName;
-    if (!name) return;
-    useDeckStore.getState().setInputDeck(id);
-    usePerformanceStore.getState().setFixture(name);
+  function addDeckFromTrack(name: string): void {
+    const added = useDeckStore.getState().addDeck(name);
+    if (added) setAddDeckOpen(false);
   }
 
   function clearReference(kind: "timbre" | "structure"): void {
@@ -206,7 +202,7 @@ export function DecksPanel() {
       usePerformanceStore.getState().setStructRef(null);
       useDeckStore.getState().setStructureDeck(null);
     }
-    session.setStatus(session.status, `${kind} follows input`);
+    session.setStatus(session.status, `${kind} follows deck mix`);
   }
 
   function applyReferenceDeck(kind: "timbre" | "structure", id: DeckId): void {
@@ -280,13 +276,14 @@ export function DecksPanel() {
       options: customNames.map((name) => ({ value: name, label: name })),
     },
   ];
-  const defaultAddTrack = activeFixture || pickDefaultFixture(fixtures) || customNames[0];
   const leftDecks = DECK_IDS.filter(
     (id) => deckIds.includes(id) && decks[id].crossfadeSide === "left",
   );
   const rightDecks = DECK_IDS.filter(
     (id) => deckIds.includes(id) && decks[id].crossfadeSide === "right",
   );
+  const busAPct = Math.round((1 - crossfade) * 100);
+  const busBPct = Math.round(crossfade * 100);
 
   return (
     <section className="decks-panel" aria-label="Deck mixer">
@@ -318,11 +315,10 @@ export function DecksPanel() {
           </button>
           <button
             type="button"
-            disabled={deckIds.length >= MAX_DECKS || !defaultAddTrack}
-            data-dd-tooltip="Add another populated deck using the current/default track. You can switch its track immediately after adding."
-            onClick={() => {
-              if (defaultAddTrack) useDeckStore.getState().addDeck(defaultAddTrack);
-            }}
+            className={addDeckOpen ? "is-active" : ""}
+            disabled={deckIds.length >= MAX_DECKS}
+            data-dd-tooltip="Add a deck by choosing an existing track or uploading new audio. No deck is created until a track is selected."
+            onClick={() => setAddDeckOpen((v) => !v)}
           >
             Add deck
           </button>
@@ -330,35 +326,79 @@ export function DecksPanel() {
       </div>
 
       <div
-        className="decks-scene-crossfader"
-        data-dd-tooltip="Crossfade between the left and right deck buses. Assign any number of decks to either side, then move this fader like a DJ mixer."
+        className="deck-crossfader-card"
+        data-dd-tooltip="Inference input is the rendered mixer output. Decks assigned to bus A and bus B are blended here, then the mixed PCM is sent to inference."
         data-dd-tooltip-wide=""
-        data-dd-tooltip-title="Deck Crossfader"
+        data-dd-tooltip-title="Deck mix input"
+        style={{ "--deck-crossfade": `${crossfade * 100}%` } as CSSProperties}
       >
-        <div className="decks-scene-bus">
-          <span className="decks-scene-label">Left scene</span>
-          <span className="decks-scene-decks">
-            {leftDecks.length ? leftDecks.join(" ") : "empty"}
-          </span>
+        <div className="deck-bus-readout deck-bus-readout--a">
+          <span className="deck-bus-label">Bus A</span>
+          <strong>{busAPct}%</strong>
+          <span>{leftDecks.length ? leftDecks.join(" ") : "empty"}</span>
         </div>
-        <input
-          type="range"
-          min={0}
-          max={1}
-          step={0.001}
-          value={crossfade}
-          onChange={(e) =>
-            useDeckStore.getState().setCrossfade(Number(e.target.value))
-          }
-          aria-label="Deck crossfader"
-        />
-        <div className="decks-scene-bus decks-scene-bus--right">
-          <span className="decks-scene-label">Right scene</span>
-          <span className="decks-scene-decks">
-            {rightDecks.length ? rightDecks.join(" ") : "empty"}
-          </span>
+        <div className="deck-crossfade-control">
+          <div className="deck-crossfade-track" aria-hidden="true">
+            <span className="deck-crossfade-fill deck-crossfade-fill--a" />
+            <span className="deck-crossfade-fill deck-crossfade-fill--b" />
+            <span className="deck-crossfade-cap" />
+          </div>
+          <input
+            className="deck-crossfade-input"
+            type="range"
+            min={0}
+            max={1}
+            step={0.001}
+            value={crossfade}
+            onChange={(e) =>
+              useDeckStore.getState().setCrossfade(Number(e.target.value))
+            }
+            aria-label="Deck bus crossfader"
+          />
+          <span className="deck-crossfade-caption">mixed inference input</span>
+        </div>
+        <div className="deck-bus-readout deck-bus-readout--b">
+          <span className="deck-bus-label">Bus B</span>
+          <strong>{busBPct}%</strong>
+          <span>{rightDecks.length ? rightDecks.join(" ") : "empty"}</span>
         </div>
       </div>
+
+      {addDeckOpen && deckIds.length < MAX_DECKS && (
+        <div className="deck-add-card">
+          <div className="deck-add-copy">
+            <span className="decks-panel-kicker">Add deck</span>
+            <strong>Choose a track first</strong>
+            <span>No empty deck is created until you pick or upload audio.</span>
+          </div>
+          <RefSelect
+            label="track"
+            value=""
+            pinned={[{ value: "", label: "Select existing track" }]}
+            groups={trackGroups}
+            onSelect={(value) => {
+              if (value) addDeckFromTrack(value);
+            }}
+            disabled={uploadingTarget === "new"}
+            ariaLabel="Track for new deck"
+            onUpload={() => {
+              uploadTargetRef.current = "new";
+              fileInputRef.current?.click();
+            }}
+            uploadLabel={
+              uploadingTarget === "new" ? "Decoding…" : "Upload audio to new deck"
+            }
+            tooltip="Create a new deck from an existing library/user track, or upload a new track through the same trim and stem-rip flow."
+          />
+          <button
+            type="button"
+            className="deck-add-cancel"
+            onClick={() => setAddDeckOpen(false)}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
       <div className="deck-list">
         {deckIds.map((id) => {
@@ -369,9 +409,8 @@ export function DecksPanel() {
           const activeSource = deckAssetSource(assets, deck.sourcePart);
           const missingSelectedStem =
             deck.sourcePart !== "full" && assets && !activeSource;
-          const uploadingThisDeck = uploadingDeckId === id;
+          const uploadingThisDeck = uploadingTarget === id;
           const deckBusy = uploadingThisDeck || trackStatus === "loading";
-          const isInput = inputDeckId === id;
           const isTimbre = timbreDeckId === id || timbreName === deck.trackName;
           const isStructure =
             structureDeckId === id || structName === deck.trackName;
@@ -409,16 +448,16 @@ export function DecksPanel() {
                   pinned={[]}
                   groups={trackGroups}
                   onSelect={(value) => value && setDeckTrack(id, value)}
-                  disabled={deckBusy}
+                  disabled={uploadingThisDeck}
                   ariaLabel={`Deck ${id} track`}
                   onUpload={() => {
-                    uploadDeckRef.current = id;
+                    uploadTargetRef.current = id;
                     fileInputRef.current?.click();
                   }}
                   uploadLabel={
                     uploadingThisDeck ? "Decoding…" : `Upload audio to deck ${id}`
                   }
-                  tooltip="Replace this deck's track. If this deck owns the input role, the model input swaps to the new track as well."
+                  tooltip="Replace this deck's track. The next deck-mix snapshot uses the replacement as this deck's contribution."
                 />
               </div>
 
@@ -431,17 +470,9 @@ export function DecksPanel() {
               <div className="deck-role-row" aria-label={`Deck ${id} reference roles`}>
                 <button
                   type="button"
-                  className={isInput ? "is-active" : ""}
-                  data-dd-tooltip="Make this deck the primary input track. Replacing this deck replaces the model input."
-                  onClick={() => assignInputDeck(id)}
-                >
-                  Input
-                </button>
-                <button
-                  type="button"
                   className={isTimbre ? "is-active" : ""}
                   disabled={deckBusy}
-                  data-dd-tooltip="Use this deck's full track as the timbre reference. Click again to return timbre to input."
+                  data-dd-tooltip="Use this deck's full track as the timbre reference. Click again to return timbre to the deck mix."
                   onClick={() => applyReferenceDeck("timbre", id)}
                 >
                   Timbre
@@ -450,7 +481,7 @@ export function DecksPanel() {
                   type="button"
                   className={isStructure ? "is-active" : ""}
                   disabled={deckBusy}
-                  data-dd-tooltip="Use this deck's full track as the structure reference. Click again to return structure to input."
+                  data-dd-tooltip="Use this deck's full track as the structure reference. Click again to return structure to the deck mix."
                   onClick={() => applyReferenceDeck("structure", id)}
                 >
                   Structure
@@ -495,8 +526,8 @@ export function DecksPanel() {
                   disabled={!deck.trackName}
                   data-dd-tooltip={
                     deck.playing
-                      ? "Pause this deck's local transport. The deck mix updates inference after a short debounce."
-                      : "Start this deck from its current playhead."
+                      ? "Pause this deck's local monitor transport. The deck still contributes to inference while loaded and unmuted."
+                      : "Start local monitoring from this deck's current playhead."
                   }
                   onClick={() =>
                     useDeckStore.getState().setPlaying(id, !deck.playing)
@@ -507,7 +538,7 @@ export function DecksPanel() {
                 <button
                   type="button"
                   disabled={!deck.trackName}
-                  data-dd-tooltip="Jump this deck back to its cue point. The default cue is the start of the song."
+                  data-dd-tooltip="Jump this deck's monitor playhead back to its cue point. The default cue is the start of the song."
                   onClick={() => useDeckStore.getState().jumpToCue(id)}
                 >
                   Cue
@@ -532,12 +563,12 @@ export function DecksPanel() {
                       role="radio"
                       aria-checked={deck.crossfadeSide === side}
                       className={deck.crossfadeSide === side ? "is-active" : ""}
-                      data-dd-tooltip={`Assign deck ${id} to the ${side} scene. Multiple decks can share the same side.`}
+                      data-dd-tooltip={`Assign deck ${id} to mix bus ${side === "left" ? "A" : "B"}. Multiple decks can share a bus and are layered before the crossfader.`}
                       onClick={() =>
                         useDeckStore.getState().setCrossfadeSide(id, side)
                       }
                     >
-                      {side === "left" ? "L" : "R"}
+                      {side === "left" ? "A" : "B"}
                     </button>
                   ))}
                 </div>
@@ -573,7 +604,7 @@ export function DecksPanel() {
                     : missingSelectedStem
                       ? "Stem unavailable"
                       : deck.trackName
-                        ? `${deck.sourcePart} ready${roleSummary(isInput, isTimbre, isStructure)}`
+                        ? `${deck.sourcePart} ready${roleSummary(isTimbre, isStructure)}`
                         : "Loading library…"}
               </div>
             </article>
@@ -589,7 +620,7 @@ export function DecksPanel() {
         onChange={(e) => {
           const file = e.target.files?.[0];
           e.target.value = "";
-          if (file) void onFilePicked(uploadDeckRef.current, file);
+          if (file) void onFilePicked(uploadTargetRef.current, file);
         }}
       />
 

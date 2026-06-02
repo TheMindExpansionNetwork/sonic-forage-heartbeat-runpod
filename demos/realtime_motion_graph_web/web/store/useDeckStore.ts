@@ -25,7 +25,6 @@ export interface DeckSlot {
 interface DeckStoreState {
   decks: Record<DeckId, DeckSlot>;
   deckIds: DeckId[];
-  inputDeckId: DeckId;
   timbreDeckId: DeckId | null;
   structureDeckId: DeckId | null;
   crossfade: number;
@@ -35,7 +34,6 @@ interface DeckStoreState {
   ensureInitialDeck: (trackName: string) => void;
   addDeck: (trackName: string) => DeckId | null;
   removeDeck: (id: DeckId) => void;
-  setInputDeck: (id: DeckId) => void;
   setTimbreDeck: (id: DeckId | null) => void;
   setStructureDeck: (id: DeckId | null) => void;
   setTrack: (id: DeckId, trackName: string) => void;
@@ -126,7 +124,6 @@ export const useDeckStore = create<DeckStoreState>((set) => ({
     D: makeDeck("D", "right"),
   },
   deckIds: ["A"],
-  inputDeckId: "A",
   timbreDeckId: null,
   structureDeckId: null,
   crossfade: 0.5,
@@ -194,10 +191,8 @@ export const useDeckStore = create<DeckStoreState>((set) => ({
     set((state) => {
       if (state.deckIds.length <= 1 || !state.deckIds.includes(id)) return {};
       const nextDeckIds = state.deckIds.filter((deckId) => deckId !== id);
-      const fallbackInput = nextDeckIds[0] ?? "A";
       return {
         deckIds: nextDeckIds,
-        inputDeckId: state.inputDeckId === id ? fallbackInput : state.inputDeckId,
         timbreDeckId: state.timbreDeckId === id ? null : state.timbreDeckId,
         structureDeckId:
           state.structureDeckId === id ? null : state.structureDeckId,
@@ -217,11 +212,6 @@ export const useDeckStore = create<DeckStoreState>((set) => ({
         mixRevision: state.mixRevision + 1,
       };
     }),
-
-  setInputDeck: (id) =>
-    set((state) =>
-      state.deckIds.includes(id) ? { inputDeckId: id, mixRevision: state.mixRevision + 1 } : {},
-    ),
   setTimbreDeck: (id) =>
     set((state) =>
       id === null || state.deckIds.includes(id)

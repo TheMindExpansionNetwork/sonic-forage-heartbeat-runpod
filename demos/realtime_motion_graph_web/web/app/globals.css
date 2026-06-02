@@ -9246,48 +9246,190 @@ body.curve-open #install-video-area #graph {
   border-color: var(--accent-line);
   background: rgba(255, 111, 58, 0.12);
 }
-.decks-scene-crossfader {
+.deck-crossfader-card {
   display: grid;
-  grid-template-columns: minmax(72px, 0.8fr) minmax(120px, 1.4fr) minmax(72px, 0.8fr);
+  grid-template-columns: minmax(54px, 0.7fr) minmax(128px, 1.6fr) minmax(54px, 0.7fr);
   align-items: center;
-  gap: 8px;
-  padding: 8px 9px;
+  gap: 9px;
+  padding: 9px;
   margin-bottom: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: calc(var(--radius-sm) + 2px);
   background:
-    linear-gradient(90deg, rgba(240, 138, 72, 0.10), transparent 32%, transparent 68%, rgba(132, 96, 255, 0.10));
+    radial-gradient(circle at 18% 0%, rgba(240, 138, 72, 0.14), transparent 34%),
+    radial-gradient(circle at 82% 100%, rgba(132, 96, 255, 0.14), transparent 36%),
+    rgba(255, 255, 255, 0.025);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
 }
-.decks-scene-bus {
+.deck-bus-readout {
   display: flex;
+  min-width: 0;
   flex-direction: column;
   gap: 2px;
-  min-width: 0;
 }
-.decks-scene-bus--right {
+.deck-bus-readout--b {
   text-align: right;
 }
-.decks-scene-label {
+.deck-bus-label {
   color: var(--text-dim);
   font-size: 8px;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
 }
-.decks-scene-decks {
+.deck-bus-readout strong {
   color: var(--text-strong);
-  font-size: 12px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
 }
-.decks-scene-crossfader input {
-  width: 100%;
+.deck-bus-readout span:last-child {
+  min-height: 1em;
+  color: var(--text-dim);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.deck-crossfade-control {
+  position: relative;
   min-width: 0;
-  accent-color: var(--accent);
+  padding-top: 2px;
+}
+.deck-crossfade-track {
+  position: relative;
+  height: 24px;
+}
+.deck-crossfade-track::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 3px;
+  transform: translateY(-50%);
+  border-radius: 2px;
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0.6) 0%,
+    rgba(0, 0, 0, 0.42) 50%,
+    rgba(255, 255, 255, 0.05) 100%
+  );
+  box-shadow:
+    inset 0 1px 0 rgba(0, 0, 0, 0.75),
+    inset 0 -1px 1px rgba(255, 255, 255, 0.055);
+}
+.deck-crossfade-fill {
+  position: absolute;
+  top: 50%;
+  height: 3px;
+  transform: translateY(-50%);
+  border-radius: 2px;
+  pointer-events: none;
+  transition: width 70ms linear, left 70ms linear, right 70ms linear;
+}
+.deck-crossfade-fill--a {
+  left: 0;
+  right: 0;
+  background: linear-gradient(to right, rgba(240, 138, 72, 0.42), #f08a48);
+}
+.deck-crossfade-fill--b {
+  left: 0;
+  width: var(--deck-crossfade);
+  background: linear-gradient(to right, rgba(132, 96, 255, 0.42), #9a6cff);
+}
+.deck-crossfade-cap {
+  position: absolute;
+  top: 50%;
+  left: var(--deck-crossfade);
+  width: 9px;
+  height: 19px;
+  transform: translate(-50%, -50%);
+  border-radius: 2px;
+  background: linear-gradient(
+    to bottom,
+    rgb(80, 84, 94) 0%,
+    rgb(40, 43, 50) 48%,
+    rgb(16, 18, 22) 100%
+  );
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.65),
+    0 0 0 1px rgba(0, 0, 0, 0.55),
+    inset 1px 0 0 rgba(255, 255, 255, 0.16),
+    inset -1px 0 0 rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  transition: left 70ms linear;
+}
+.deck-crossfade-cap::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  border-radius: 1px;
+  background: color-mix(in srgb, #f08a48 calc(100% - var(--deck-crossfade)), #9a6cff var(--deck-crossfade));
+  box-shadow: 0 0 4px currentColor;
+}
+.deck-crossfade-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 24px;
+  cursor: ew-resize;
+  opacity: 0;
+}
+.deck-crossfade-caption {
+  display: block;
+  margin-top: -1px;
+  color: var(--text-dim);
+  font-size: 7.5px;
+  letter-spacing: 0.12em;
+  text-align: center;
+  text-transform: uppercase;
 }
 .deck-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+.deck-add-card {
+  display: grid;
+  grid-template-columns: minmax(96px, 0.9fr) minmax(0, 1.25fr) auto;
+  align-items: end;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 9px;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  border-radius: calc(var(--radius-sm) + 2px);
+  background: rgba(255, 255, 255, 0.025);
+}
+.deck-add-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.deck-add-copy strong {
+  color: var(--text-strong);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.deck-add-copy span:last-child {
+  color: var(--text-dim);
+  font-size: 8px;
+  letter-spacing: 0.04em;
+  line-height: 1.35;
+}
+.deck-add-card .ref-control {
+  min-width: 0;
+  font-size: 10px;
+}
+.deck-add-cancel {
+  align-self: end;
 }
 .deck-card {
   position: relative;
@@ -9371,7 +9513,7 @@ body.curve-open #install-video-area #graph {
 }
 .deck-role-row {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 5px;
   margin-top: 7px;
 }

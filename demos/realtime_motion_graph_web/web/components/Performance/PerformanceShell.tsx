@@ -18,6 +18,7 @@ import { usePromptBlendSync } from "@/hooks/usePromptBlendSync";
 import { useRecording } from "@/hooks/useRecording";
 import { useRenderLoop } from "@/hooks/useRenderLoop";
 import { useScheduledCurves } from "@/hooks/useScheduledCurves";
+import { useDeckRuntime } from "@/hooks/useDeckRuntime";
 import { useSeedDecks } from "@/hooks/useSeedDecks";
 import { useRefSourceAcks } from "@/hooks/useRefSourceAcks";
 import { useStartSession } from "@/hooks/useStartSession";
@@ -74,6 +75,7 @@ export function PerformanceShell() {
   useKeyboardShortcuts();
   useRecording();
   useSeedDecks();
+  useDeckRuntime();
   useFixtureSwap();
   useEdgeLoraBinding();
   useTimbreSync();
