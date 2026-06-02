@@ -363,7 +363,12 @@ function MidiTab() {
         <button
           type="button"
           className="config-midi-btn config-midi-btn--ghost"
-          onClick={() => resetMap()}
+          onClick={() => {
+            resetMap();
+            // Drop locally-remembered learn modes so a row's dropdown can't
+            // keep showing a stale mode after the binding reverts to default.
+            setLearnModes({});
+          }}
         >
           Reset to defaults
         </button>

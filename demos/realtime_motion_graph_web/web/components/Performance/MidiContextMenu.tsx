@@ -39,6 +39,10 @@ function labelFromElement(el: HTMLElement | null, target: string): string {
   if (!el) return midiTargetLabel(target);
   const explicit = el.getAttribute("data-dd-tooltip-title")?.trim();
   if (explicit) return explicit;
+  // A <select> (enum target) has no inner label element; its textContent is
+  // the whole concatenated option list. Use the curated registry label
+  // instead ("Musical key", "Time signature", …) rather than that blob.
+  if (el.tagName === "SELECT") return midiTargetLabel(target);
   const sliderLabel = el.querySelector<HTMLElement>(".slider-label")?.textContent?.trim();
   if (sliderLabel) return sliderLabel;
   const stemLabel = el.querySelector<HTMLElement>(".hero-stem-panner-label")?.textContent?.trim();
