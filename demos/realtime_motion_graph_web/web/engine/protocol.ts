@@ -667,6 +667,31 @@ export class RemoteBackend extends EventTarget {
     } catch {}
   }
 
+  /**
+   * Server-side deck mixer state. Unlike sendSwapSource, this does not
+   * upload rendered PCM or trigger a source swap. The backend resolves each
+   * named track/stem to cached prepared source artifacts and applies
+   * crossfade/volume/source-part edits by blending those tensors live.
+   */
+  sendDeckMixState(decks: Array<{
+    id: string;
+    track_name: string;
+    source_part: "full" | "vocals" | "instruments";
+    volume: number;
+    muted: boolean;
+    playing: boolean;
+    side: "left" | "right";
+  }>, crossfade: number): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({
+        type: "deck_mix_state",
+        decks,
+        crossfade: Math.max(0, Math.min(1, crossfade)),
+      }));
+    } catch {}
+  }
+
   sendEnableLora(id: string, strength?: number): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     try {

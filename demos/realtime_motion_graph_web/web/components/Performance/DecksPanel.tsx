@@ -306,7 +306,7 @@ export function DecksPanel() {
           <button
             type="button"
             className={inferenceEnabled ? "is-active" : ""}
-            data-dd-tooltip="Send debounced deck-mix snapshots to inference through the existing source-swap path."
+            data-dd-tooltip="Feed the deck mix to inference as live parameters. Loaded, unmuted decks contribute by volume and crossfader position, no source-swap or playback required."
             onClick={() =>
               useDeckStore.getState().setInferenceEnabled(!inferenceEnabled)
             }
