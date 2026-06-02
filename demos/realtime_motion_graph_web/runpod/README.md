@@ -5,6 +5,7 @@
 | Start here | |
 |------------|--|
 | New to this? | [SONIC_FORAGE.md](./SONIC_FORAGE.md) — lore + vibe |
+| Mythos | [LORE.md](./LORE.md) — short story |
 | Learning path | [LESSON.md](./LESSON.md) — step-by-step tutorial |
 | Ops / fixes | This file + [FIXES.md](./FIXES.md) |
 
