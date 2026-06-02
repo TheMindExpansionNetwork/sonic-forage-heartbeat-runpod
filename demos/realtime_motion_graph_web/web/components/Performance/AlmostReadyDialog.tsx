@@ -61,7 +61,7 @@ export interface AlmostReadyDialogProps {
     keyOverride: string | null;
     timeSignatureOverride: TimeSignature | null;
     sourceMode: StemSourceMode;
-  }) => void;
+  }) => void | Promise<void>;
   /** Only invoked when wasTrimmed is true; parent re-opens the file
    *  picker so the user can swap to a shorter source. */
   onPickAnother: () => void;
@@ -87,16 +87,26 @@ export function AlmostReadyDialog({
 
   useEffect(() => setMounted(true), []);
 
-  function finish() {
+  // Hand off to the parent's commit and let it own dismissal: a
+  // successful upload clears `pending` upstream (which unmounts this
+  // dialog), while a failed encode/upload keeps `pending` so the
+  // trimmed selection stays retryable. Closing here ourselves would
+  // throw that buffer away before the async upload resolves. The guard
+  // blocks double-submits while the commit is in flight, then resets so
+  // a failure that keeps us mounted can be retried with one more press.
+  async function finish() {
     if (submittedRef.current) return;
     submittedRef.current = true;
-    onContinue({
-      keyOverride: keyChoice === AUTO ? null : keyChoice,
-      timeSignatureOverride:
-        tsChoice !== AUTO && isTimeSignature(tsChoice) ? tsChoice : null,
-      sourceMode,
-    });
-    onClose();
+    try {
+      await onContinue({
+        keyOverride: keyChoice === AUTO ? null : keyChoice,
+        timeSignatureOverride:
+          tsChoice !== AUTO && isTimeSignature(tsChoice) ? tsChoice : null,
+        sourceMode,
+      });
+    } finally {
+      submittedRef.current = false;
+    }
   }
 
   // Esc closes; Enter advances (step 1 → next, step 2 → start) unless
