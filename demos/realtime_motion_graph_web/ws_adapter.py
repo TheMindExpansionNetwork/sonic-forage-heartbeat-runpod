@@ -402,6 +402,18 @@ def _handle_client_body(
             pass
         ws.close(1011, "stem extraction failed")
         return
+    except Exception as exc:
+        logger.exception("session_create_failed")
+        try:
+            ws.send(json.dumps({
+                "type": "error",
+                "code": "session_create_failed",
+                "message": str(exc),
+            }))
+        except Exception:
+            pass
+        ws.close(1011, "session create failed")
+        return
     _ms("resolve_source_done")
 
     state = streaming.state

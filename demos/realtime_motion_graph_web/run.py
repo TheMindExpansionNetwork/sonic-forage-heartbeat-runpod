@@ -90,6 +90,20 @@ def _local_backend_host(host: str) -> str:
     return "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
 
 
+def _runpod_backend_url(port: int) -> str | None:
+    pod_id = os.environ.get("RUNPOD_POD_ID", "").strip()
+    if not pod_id:
+        return None
+    return f"https://{pod_id}-{port}.proxy.runpod.net"
+
+
+def _public_pod_base_url(host: str, port: int) -> str:
+    runpod = _runpod_backend_url(port)
+    if runpod:
+        return runpod
+    return f"http://{_local_backend_host(host)}:{port}"
+
+
 def _wait_for_backend(
     host: str,
     port: int,
@@ -114,10 +128,11 @@ def main() -> int:
         ),
     )
     parser.add_argument("--port", type=int, default=1318, help="Backend port.")
+    default_host = "0.0.0.0" if os.environ.get("RUNPOD_POD_ID") else "127.0.0.1"
     parser.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="Backend bind host (default 127.0.0.1).",
+        default=default_host,
+        help=f"Backend bind host (default {default_host}).",
     )
     parser.add_argument(
         "--web-port",
@@ -135,6 +150,20 @@ def main() -> int:
     if backend_extras and backend_extras[0] == "--":
         backend_extras = backend_extras[1:]
 
+    # Drop duplicate launcher flags already applied above.
+    _launcher_flags = {"--host", "--port", "--http-port", "--ws-port"}
+    _skip_next = False
+    _filtered_extras: list[str] = []
+    for tok in backend_extras:
+        if _skip_next:
+            _skip_next = False
+            continue
+        if tok in _launcher_flags:
+            _skip_next = True
+            continue
+        _filtered_extras.append(tok)
+    backend_extras = _filtered_extras
+
     npm = _resolve_npm()
     if not args.no_install:
         _ensure_node_modules(npm)
@@ -150,10 +179,20 @@ def main() -> int:
         str(args.port),
         *backend_extras,
     ]
-    web_cmd = [npm, "run", "dev", "--", "-p", str(args.web_port)]
+    web_hostname = "0.0.0.0" if os.environ.get("RUNPOD_POD_ID") else "127.0.0.1"
+    web_cmd = [
+        npm,
+        "run",
+        "dev",
+        "--",
+        "-p",
+        str(args.web_port),
+        "-H",
+        web_hostname,
+    ]
 
     web_env = os.environ.copy()
-    backend_url = f"http://{_local_backend_host(args.host)}:{args.port}"
+    backend_url = _public_pod_base_url(args.host, args.port)
     web_env["NEXT_PUBLIC_POD_BASE_URL"] = backend_url
 
     print(f"{_PREFIXES['backend']} {' '.join(backend_cmd)}", flush=True)
@@ -172,8 +211,9 @@ def main() -> int:
     )
     backend_thread.start()
 
+    probe_url = f"http://{_local_backend_host(args.host)}:{args.port}"
     print(
-        f"{_PREFIXES['backend']} waiting for {backend_url} before starting web",
+        f"{_PREFIXES['backend']} waiting for {probe_url} before starting web",
         flush=True,
     )
     try:
@@ -197,10 +237,18 @@ def main() -> int:
         stderr=subprocess.STDOUT,
     )
     banner = _color("\x1b[1;32m")
-    print(
-        f"\n{banner}>>> Open http://localhost:{args.web_port}/{_RESET}\n",
-        flush=True,
+    runpod_web = (
+        f"https://{os.environ['RUNPOD_POD_ID']}-{args.web_port}.proxy.runpod.net/"
+        if os.environ.get("RUNPOD_POD_ID")
+        else None
     )
+    open_url = runpod_web or f"http://localhost:{args.web_port}/"
+    print(f"\n{banner}>>> Open {open_url}{_RESET}\n", flush=True)
+    if runpod_web:
+        print(
+            f"{_PREFIXES['web']} Engine WS/HTTP proxy: {backend_url}",
+            flush=True,
+        )
 
     threads = [
         backend_thread,

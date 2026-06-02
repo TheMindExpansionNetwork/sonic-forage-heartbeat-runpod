@@ -265,6 +265,14 @@ class ModelContext:
     def _resolve_checkpoint_dir(project_root: str) -> str:
         from pathlib import Path
         from acestep.model_downloader import check_main_model_exists
+        from acestep.paths import checkpoints_dir as canonical_checkpoints_dir
+
+        # Session() defaults project_root to checkpoints_dir(). Allow that
+        # path even when empty so _ensure_downloaded can auto-fetch weights.
+        canonical = str(canonical_checkpoints_dir())
+        if os.path.normpath(project_root) == os.path.normpath(canonical):
+            canonical_checkpoints_dir().mkdir(parents=True, exist_ok=True)
+            return canonical
 
         # Preferred layout: <project_root>/checkpoints/
         candidate = os.path.join(project_root, "checkpoints")

@@ -26,6 +26,11 @@ renders the live UI:
 
 ## Run
 
+**RunPod / Sonic Forage · Heartbeat:** see [runpod/LESSON.md](./runpod/LESSON.md)
+(tutorial), [runpod/README.md](./runpod/README.md) (ops), and the fork
+[sonic-forage-heartbeat-runpod](https://github.com/TheMindExpansionNetwork/sonic-forage-heartbeat-runpod).
+Root overview: [../../SONIC_FORAGE_HEARTBEAT_RUNPOD.md](../../SONIC_FORAGE_HEARTBEAT_RUNPOD.md).
+
 A single launcher starts the Python backend on `:1318` and a Next.js
 dev server on `:6660` with combined output:
 
@@ -349,6 +354,9 @@ no live session to attach to.
 
 ## Troubleshooting
 
+- **RunPod / proxy WebSocket errors**: the browser cannot use
+  `ws://127.0.0.1:1318` when the UI is opened via `*.proxy.runpod.net`.
+  See [runpod/FIXES.md](./runpod/FIXES.md).
 - **"WebSocket connection failed"**: verify the backend is reachable on
   `:1318` (firewall, reverse proxy). The launcher logs `[backend]`
   output if the Python side crashed.
