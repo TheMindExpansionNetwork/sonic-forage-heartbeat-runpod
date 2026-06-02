@@ -13,6 +13,7 @@ import {
 import {
   applyInputs,
   captureInputs,
+  captureTrackReference,
   hasInputs,
   anyInputPresent,
   type SerializedInputs,
@@ -172,13 +173,16 @@ export function OperatorStrip() {
 
       const inputs = parsed.inputs;
       if (hasInputs(inputs)) {
-        const { applied, needSession } = await applyInputs(
+        const { applied, needSession, missing } = await applyInputs(
           inputs as SerializedInputs,
         );
         let msg = `Imported ${file.name}`;
         if (applied.length) msg += ` + inputs (${applied.join(", ")})`;
         if (needSession.length) {
           msg += ` — press Play to apply ${needSession.join(", ")}`;
+        }
+        if (missing.length) {
+          msg += ` — ${missing.join(", ")}`;
         }
         flashStatus(msg);
       } else {
@@ -204,7 +208,12 @@ export function OperatorStrip() {
   async function runExport(serializeInputs: boolean): Promise<void> {
     setExportOpen(false);
     const snapshot: DemonExport = captureRtmgConfig();
-    const inputs = serializeInputs ? await captureInputs() : {};
+    // Serialize on → embed the full inputs (audio travels in the file).
+    // Serialize off → still record the active track by name so the export
+    // reopens the correct local upload, just without the embedded WAV.
+    const inputs = serializeInputs
+      ? await captureInputs()
+      : captureTrackReference();
     const includeInputs = hasInputs(inputs);
     if (includeInputs) snapshot.inputs = inputs;
     const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
@@ -219,7 +228,13 @@ export function OperatorStrip() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    flashStatus(includeInputs ? "Exported config + inputs" : "Exported config");
+    flashStatus(
+      !includeInputs
+        ? "Exported config"
+        : serializeInputs
+          ? "Exported config + inputs"
+          : "Exported config + track ref",
+    );
   }
 
   // The pod's WS URL is allocated by the queue and not user-editable.

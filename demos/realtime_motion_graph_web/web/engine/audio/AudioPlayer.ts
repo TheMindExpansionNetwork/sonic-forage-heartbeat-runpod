@@ -285,7 +285,16 @@ export class AudioPlayer {
       );
     } else {
       this._spBuffer = interleavedBuffer.slice();
-      this._spPosition = 0;
+      // Preserve playhead phase across the swap, mirroring the worklet
+      // `swap` handler (which leaves `this.position` untouched). Clamp into
+      // the new buffer so a shorter track can't read past its end. Whether
+      // a swap restarts from 0 is owned solely by the restart_song_on_swap
+      // gate in useFixtureSwap (which issues seek(0)); hard-zeroing here
+      // overrode that flag on the SP fallback path, so `false` never took.
+      this._spPosition = Math.max(
+        0,
+        Math.min(this.frameCount - 1, this._spPosition),
+      );
     }
     // Track changed: re-measure source loudness for the new buffer.
     this._sourceTarget = null;
