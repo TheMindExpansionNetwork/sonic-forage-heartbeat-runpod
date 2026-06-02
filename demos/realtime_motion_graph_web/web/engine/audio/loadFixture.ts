@@ -223,7 +223,13 @@ async function resolveUploadWsUrl(): Promise<string> {
   return url;
 }
 
-function pcmFrame(decoded: DecodedFixture): Uint8Array {
+// Returns Uint8Array<ArrayBuffer> (not the wider Uint8Array<ArrayBufferLike>
+// that's the default in TS 5.7+'s libdom) so ws.send accepts it without
+// a cast — BufferSource excludes SharedArrayBuffer-backed views, and
+// the `new Uint8Array(byteLength)` allocation here is always ArrayBuffer-
+// backed. Without the narrow return type, consumers compiling on TS
+// 5.7+ hit "Uint8Array<ArrayBufferLike> not assignable to BufferSource".
+function pcmFrame(decoded: DecodedFixture): Uint8Array<ArrayBuffer> {
   const hdr = new ArrayBuffer(8);
   const dv = new DataView(hdr);
   dv.setUint32(0, decoded.channels, true);
