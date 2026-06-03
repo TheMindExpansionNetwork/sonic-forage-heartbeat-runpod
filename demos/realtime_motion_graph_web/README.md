@@ -26,6 +26,8 @@ renders the live UI:
 
 ## Run
 
+**Jam lab (DEMON + AVTR video on 7860):** [../sonic_forage_jam/README.md](../sonic_forage_jam/README.md)
+
 **RunPod / Sonic Forage · Heartbeat:** see [runpod/LESSON.md](./runpod/LESSON.md)
 (tutorial), [runpod/README.md](./runpod/README.md) (ops), and the fork
 [sonic-forage-heartbeat-runpod](https://github.com/TheMindExpansionNetwork/sonic-forage-heartbeat-runpod).
