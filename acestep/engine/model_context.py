@@ -186,6 +186,7 @@ class ModelContext:
             )
 
         attn_impl = self._choose_attn_impl(use_flash_attention)
+        self._dit_path = dit_path
         self.model = self._load_dit(dit_path, attn_impl)
         self.config = self.model.config
 
@@ -381,20 +382,21 @@ class ModelContext:
         module_name, class_name = target
         ModelClass = getattr(importlib.import_module(module_name), class_name)
 
+        load_kwargs = dict(
+            attn_implementation=attn_impl,
+            torch_dtype=torch.bfloat16,
+            # Avoid meta-device init (transformers 4.5x + accelerate): .to(cuda)
+            # fails with "cannot copy out of meta tensor".
+            low_cpu_mem_usage=False,
+        )
         try:
             logger.info(f"Loading {class_name} from {module_name} with attention={attn_impl}")
-            model = ModelClass.from_pretrained(
-                path,
-                attn_implementation=attn_impl,
-                dtype="bfloat16",
-            )
+            model = ModelClass.from_pretrained(path, **load_kwargs)
         except Exception as exc:
             if attn_impl == "sdpa":
                 logger.info("Falling back to eager attention")
-                model = ModelClass.from_pretrained(
-                    path,
-                    attn_implementation="eager",
-                )
+                load_kwargs["attn_implementation"] = "eager"
+                model = ModelClass.from_pretrained(path, **load_kwargs)
                 attn_impl = "eager"
             else:
                 raise exc
@@ -403,14 +405,27 @@ class ModelContext:
         model.eval()
         return model
 
+    @staticmethod
+    def _has_meta_params(model: torch.nn.Module) -> bool:
+        return any(p.device.type == "meta" for p in model.parameters())
+
+    def _move_dit_to_device(self, device: str) -> torch.nn.Module:
+        """Place DiT on *device* (expects real tensors, not meta)."""
+        if self._has_meta_params(self.model):
+            raise NotImplementedError(
+                "Cannot copy DiT out of meta tensor. Reload with "
+                "low_cpu_mem_usage=False (see ModelContext._load_dit)."
+            )
+        return self.model.to(device).to(self.dtype)
+
     def _place_dit(self, skip_decoder: bool) -> None:
         if not self.offload_to_cpu:
-            self.model = self.model.to(self.device).to(self.dtype)
+            self.model = self._move_dit_to_device(self.device)
         elif not self.offload_dit_to_cpu:
             logger.info(f"Keeping main model on {self.device} (persistent)")
-            self.model = self.model.to(self.device).to(self.dtype)
+            self.model = self._move_dit_to_device(self.device)
         else:
-            self.model = self.model.to("cpu").to(self.dtype)
+            self.model = self._move_dit_to_device("cpu")
 
     def _apply_decoder_compile(self) -> None:
         torch._dynamo.config.allow_unspec_int_on_nn_module = True

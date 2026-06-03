@@ -153,6 +153,46 @@ FileNotFoundError: Cannot locate a populated checkpoints directory ...
 
 ---
 
+## 2026-06-03 — Storage, XL, meta tensor, Qwen corrupt file
+
+### Network volume layout
+
+| Path | Role |
+|------|------|
+| `/workspace/.daydream-scope` | All checkpoints (persistent) |
+| `/workspace/agent-world-workspace` | Scripts, logs, runbook |
+| `~/.daydream-scope` | Symlink → `/workspace/.daydream-scope` |
+
+Overlay `/` must stay empty of models (~30 GB limit).
+
+### `cannot copy out of meta tensor`
+
+**File:** `acestep/engine/model_context.py`
+
+**Fix:** `from_pretrained(..., torch_dtype=torch.bfloat16, low_cpu_mem_usage=False)` before `.to(cuda)`.
+
+### `header too small` while deserializing
+
+**Cause:** Truncated/0-byte `.safetensors` from interrupted download.
+
+**Example:** `checkpoints/Qwen3-Embedding-0.6B/model.safetensors` was 0 bytes.
+
+**Fix:**
+
+```bash
+/workspace/agent-world-workspace/scripts/repair_qwen_encoder.sh
+# or from repo copy:
+./demos/realtime_motion_graph_web/runpod/agent-world/scripts/repair_qwen_encoder.sh
+```
+
+### XL + compile launcher (nohup)
+
+Use `agent-world/scripts/start_demon_web_xl.sh` — survives shell exit; pid in `logs/demon_web_xl.pid`.
+
+Full reboot steps: `runpod/agent-world/docs/RUNBOOK.md`
+
+---
+
 ## Checklist after you edit anything
 
 ```bash

@@ -8,8 +8,20 @@
 | Mythos | [LORE.md](./LORE.md) — short story |
 | Learning path | [LESSON.md](./LESSON.md) — step-by-step tutorial |
 | Ops / fixes | This file + [FIXES.md](./FIXES.md) |
+| **Reboot runbook** | [agent-world/docs/RUNBOOK.md](./agent-world/docs/RUNBOOK.md) |
 
 This folder documents RunPod-specific fixes, scripts, and templates for the realtime motion-graph web demo on a GPU pod.
+
+### Agent World (network volume)
+
+On the persistent volume at `/workspace/agent-world-workspace` — same content is in git under **`runpod/agent-world/`**. After a pod reboot:
+
+```bash
+/workspace/agent-world-workspace/POD_BOOTSTRAP.sh
+/workspace/agent-world-workspace/scripts/start_demon_web_xl.sh
+```
+
+XL + `compile`, logs in `agent-world-workspace/logs/`. See **RUNBOOK** for meta-tensor and Qwen repair.
 
 ## Quick start
 
